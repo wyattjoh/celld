@@ -4727,10 +4727,16 @@ fn take_loader_entries_for_cell(
 pub(crate) async fn revoke_loader_capabilities_for_cell(slot: &Arc<crate::pool::Slot>, cell: &str) {
     let victims = {
         let mut registry = loader_registry().lock().unwrap();
-        take_loader_entries_for_cell(&mut registry, Arc::as_ptr(slot) as usize, cell)
+        let victims = take_loader_entries_for_cell(&mut registry, Arc::as_ptr(slot) as usize, cell);
+        // Dispose before releasing the registry lock. A caller that cloned an
+        // entry just before removal must fail its lifecycle check rather than
+        // enqueueing a new host call after revocation began.
+        for entry in &victims {
+            entry.lifecycle.dispose();
+        }
+        victims
     };
     for entry in victims {
-        entry.lifecycle.dispose();
         release_loader_entry(entry).await;
     }
 }
@@ -5135,9 +5141,12 @@ fn op_loader_load(
             let name = name.to_rust_string_lossy(scope);
             let kind_name = kind_value.to_rust_string_lossy(scope);
             let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
-                return loader_throw(
+                let message = format!("worker loader: unsupported capability kind {kind_name:?}");
+                return loader_throw_code(
                     scope,
-                    &format!("worker loader: unsupported capability kind {kind_name:?}"),
+                    celld_logic::code_mode::ErrorKind::CapabilityKindMismatch.code(),
+                    false,
+                    &message,
                 );
             };
             if !matches!(
@@ -5147,9 +5156,13 @@ fn op_loader_load(
                     | celld_logic::capability::CapabilityKind::Fetcher
                     | celld_logic::capability::CapabilityKind::Tools
             ) {
-                return loader_throw(
+                let message =
+                    format!("worker loader: capability kind {kind_name:?} is not enabled");
+                return loader_throw_code(
                     scope,
-                    &format!("worker loader: capability kind {kind_name:?} is not enabled"),
+                    celld_logic::code_mode::ErrorKind::CapabilityKindMismatch.code(),
+                    false,
+                    &message,
                 );
             }
             if !target.is_object()
@@ -6085,11 +6098,17 @@ fn op_loader_capability_drop(
     let token = args.get(1).to_rust_string_lossy(scope);
     let kind_name = args.get(2).to_rust_string_lossy(scope);
     let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
-        return loader_throw(scope, "worker loader: unsupported capability kind");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::KindMismatch,
+        );
     };
     let state = actor_runtime_state(scope);
     if state.loader_worker_id != Some(worker) {
-        return loader_throw(scope, "worker loader: capability worker mismatch");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::WorkerMismatch,
+        );
     }
     let entry = loader_registry()
         .lock()
@@ -6097,8 +6116,10 @@ fn op_loader_capability_drop(
         .get(&worker)
         .cloned();
     let Some(entry) = entry else {
-        return loader_throw(
+        return loader_throw_code(
             scope,
+            celld_logic::code_mode::ErrorKind::HostLost.code(),
+            true,
             &loader_interruption(
                 celld_logic::capability::InterruptionClass::WorkerDisposed,
                 "unknown worker",
@@ -6181,7 +6202,10 @@ fn op_loader_capability_target(
     let token = args.get(1).to_rust_string_lossy(scope);
     let kind_name = args.get(2).to_rust_string_lossy(scope);
     let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
-        return loader_throw(scope, "worker loader: unsupported capability kind");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::KindMismatch,
+        );
     };
     let state = actor_runtime_state(scope);
     if state.loader_worker_id.is_some() {
@@ -6191,7 +6215,10 @@ fn op_loader_capability_target(
         );
     }
     if state.owner_id != owner {
-        return loader_throw(scope, "worker loader: capability owner mismatch");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::OwnerMismatch,
+        );
     }
     let capabilities = state
         .capabilities
