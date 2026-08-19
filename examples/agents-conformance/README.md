@@ -14,6 +14,9 @@ and one SQL row per name at `/conformance/state/<name>`; the response exposes
 both surfaces so deterministic checks can verify that `alpha` and `beta` never
 share rows.
 
+Full bucket restore, ownership-transfer, and output-gate coverage belongs to
+the live-fleet runtime harness.
+
 The Agent also exercises the pinned hibernating `Server` surface. A text
 message received on `/agents/agents/<name>` increments durable session state
 and an event row in the owning Agent's SQL database, so a cell can be evicted
@@ -23,10 +26,26 @@ numeric-delay form of `Agent.schedule()`; its `recordScheduledWork` callback
 updates durable state and the schedule-run table. This deliberately uses
 celld's Durable Object alarm path, not a Worker cron trigger.
 
-The commands below are a deployed conformance procedure. The npm tests are
-contract checks and the storage test proves alarm persistence after close and
-reopen; they do not claim a live multi-node eviction, takeover, or restart run
-without the operator supplying a bucket and fleet.
+The Agent also uses the pinned filesystem-only Computer seam:
+`withWorkspace(Agent, (self) => ({ storage: self.ctx.storage }))`. The
+Workspace has no execution backend, and its `fs` surface is exercised through
+`POST /conformance/workspace/<name>` with an operation of `create`, `read`,
+`update`, `list`, `search`, or `delete`. The package's VFS tables therefore
+live in the owning Agent cell's authoritative SQLite database, not in a second
+store. With the default `CELLD_OUTPUT_GATE=1`, the host withholds a successful
+mutating response until the cell's configured durability path proves the
+SQLite write position; `CELLD_OUTPUT_GATE=0` explicitly opts out of that
+acknowledgment guarantee.
+
+The focused package/runtime fixture test covers all six operations, reopen
+persistence, and alpha/beta isolation. It does not claim a live bucket restore,
+ownership-transfer, or multi-node fleet result; those remain live-fleet
+coverage rather than evidence inferred from this local seam.
+
+The commands below are deployed conformance procedures. The npm tests are
+contract checks and the storage tests prove alarm and Workspace persistence
+after close and reopen; they do not claim a live multi-node takeover or
+output-gate timing run without the operator supplying a bucket and fleet.
 
 ## Verify the target
 

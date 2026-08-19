@@ -67,6 +67,23 @@ test("the deployed fixture keeps its Agent namespace binding addressable", async
   assert.equal(wrangler.durable_objects.bindings[0].class_name, "ConformanceAgent");
 });
 
+test("the fixture wires a filesystem-only Workspace to each Agent cell", async () => {
+  const source = await readFile(join(ROOT, "index.js"), "utf8");
+  assert.match(source, /getWorkspace, withWorkspace/);
+  assert.match(source, /export class ConformanceAgent extends withWorkspace\(/);
+  assert.match(source, /storage: self\.ctx\.storage/);
+  for (const operation of ["create", "read", "update", "list", "search", "delete"]) {
+    assert.match(source, new RegExp(`\\\"${operation}\\\"`));
+  }
+  assert.match(source, /workspace\.fs\.writeFile/);
+  assert.match(source, /workspace\.fs\.readFile/);
+  assert.match(source, /workspace\.fs\.ls/);
+  assert.match(source, /workspace\.fs\.grep/);
+  assert.match(source, /workspace\.fs\.rm/);
+  assert.ok(source.includes("/conformance/workspace/alpha"));
+  assert.doesNotMatch(source, /WorkerShellBackend|WorkerJavaScriptBackend/);
+});
+
 test("a direct upstream version change fails with a stable error", async () => {
   const root = await copyFixture();
   const path = join(root, "package.json");

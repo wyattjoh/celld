@@ -32,6 +32,15 @@ Tests. Before a release, we also replay scenarios through the full
 `celld` binary in each deployment mode: storage, SQL, alarms, streams,
 WebSockets, and lifecycle.
 
+The pinned Agents fixture's filesystem-only Computer test is deliberately
+narrow. It runs the package's `Workspace` against a Durable-Object-shaped SQL
+adapter and asserts create/read/update/list/search/delete, reopening the same
+SQLite database, and isolation between two Agent databases. The Rust storage
+fixture separately asserts that the file-row mutations advance the same cell
+write position used by the output gate. These focused tests establish the seam;
+without a live bucket evidence bundle they do not claim eviction, restart, or
+ownership-transfer behavior on a fleet.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is also specified in TLA+. Heyang Zhou wrote
@@ -77,7 +86,6 @@ protocol, and a delta ledger records what the model does not yet
 describe, including places where the model is weaker than the code
 rather than wrong. Simulation remains the per-commit ratchet; the
 model is its exhaustive small-configuration complement.
-
 ## Simulation: the protocol under adversarial schedules
 
 The dangerous bugs live in the coordination: a crash during an ownership

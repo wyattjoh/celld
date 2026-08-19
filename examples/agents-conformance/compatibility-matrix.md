@@ -1,6 +1,6 @@
 # Agents compatibility target
 
-This fixture is the pinned, source-unmodified compatibility seam extended through ticket 03.
+This fixture is the pinned, source-unmodified compatibility seam extended through tickets 02, 03, and 05.
 The package versions, lockfile integrity values, and lockfile digest are checked
 by `npm run check:compatibility`; changing an upstream version without a
 reviewed target update fails before deployment.
@@ -36,7 +36,7 @@ The status describes the celld contract at this fixture seam:
 | `@cloudflare/agents@0.0.16` state and embedded SQL | `/conformance/state/alpha` and `/conformance/state/beta` write/read independently | adapted | the fixture uses celld's private per-cell SQLite path; deterministic reopen coverage is present, while bucket restore, ownership-transfer, and output-gate evidence remain runtime-test work |
 | `@cloudflare/agents@0.0.16` hibernating WebSockets and durable session state | `/agents/agents/<name>` `onConnect`/`onMessage`, `/conformance/session/<name>`, deployed eviction procedure | adapted | celld keeps the host socket and attachment metadata while the named cell is inactive; session state and event rows remain in that Agent cell's SQLite database |
 | `@cloudflare/agents@0.0.16` delayed `schedule()` and alarm callback | `/conformance/schedule/<name>` plus deployed eviction procedure | adapted | numeric-delay schedules call `storage.setAlarm()` and wake the inactive named cell; Worker cron is not implied |
-| `@cloudflare/computer@0.2.1` filesystem-only Workspace | not exercised by this ticket | unsupported | durable Workspace integration is ticket 05 |
+| `@cloudflare/computer@0.2.1` filesystem-only Workspace | `ConformanceAgent.workspace` exercises create/read/update/list/search/delete | adapted | `withWorkspace` passes the owning Agent's `ctx.storage`; focused package/runtime tests cover reopen persistence and alpha/beta isolation; live bucket lifecycle is not claimed |
 | `@cloudflare/computer@0.2.1` Worker JavaScript backend | not exercised by this ticket | unsupported | loader capability integration is ticket 08 |
 | `@cloudflare/computer@0.2.1` Worker Shell backend | not exercised by this ticket | unsupported | loader capability integration is ticket 09 |
 | `@cloudflare/computer@0.2.1` container backend, R2, and Artifacts | not exercised by this ticket | unsupported | no Linux/container or object-store emulation is implied |

@@ -21,6 +21,7 @@ gaps have marks below.
 | --- | --- |
 | **Workers** | Module Workers: `fetch`, JS RPC, service bindings, Durable Object bindings, `vars`. Cron triggers run the `scheduled` handler on celld's own alarms, one time for each occurrence in the whole fleet; see [Cron triggers](#cron-triggers). |
 | **Durable Objects** | The stateful core. SQLite storage, alarms, inbound hibernatable WebSockets, outbound `ws:`/`wss:` WebSocket clients (constructor and `fetch()` upgrade), one writer for each cell, names as addresses, RPC methods on stubs. |
+| **Computer filesystem-only Workspace** | **Adapted** for pinned `@cloudflare/computer@0.2.1`: a Workspace can use the owning cell's `ctx.storage` for durable `fs` operations. Worker Shell, Worker JavaScript, containers, R2 mounts, and Artifacts are not implied. |
 | **Static assets** | Immutable files, served from the fleet bucket: `assets.directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first`, plus `_headers` and `_redirects`. An asset-only project deploys without a Worker. |
 | **Worker Loader (Code Mode)** | Experimental. Bind a loader with `CELLD_WORKER_LOADER`. A Worker can then start sandboxed isolates at runtime. See [Dynamic Worker loading](#dynamic-worker-loading-code-mode). |
 | **D1** | Partial. `d1_databases` bindings give `prepare`, `bind`, `all`, `first`, `run`, `raw` and `exec`. The `celld d1` command runs SQL and migrations. See [D1](#d1). |
@@ -230,6 +231,41 @@ apply: 64 MiB of code and 1 MiB of env, plus the
 `CELLD_MAX_LOADED_WORKERS` limit. A loaded worker serves `fetch()` and
 single RPC method calls. Not yet available: `globalOutbound` as a
 Fetcher, capability stubs in `env`, awaitable or pipelined properties.
+
+## Computer filesystem-only Workspace
+
+The pinned filesystem-only Computer surface is the smallest supported Computer
+seam. An Agent may use the package's source-unmodified mixin with its own cell
+storage:
+
+```js
+import { withWorkspace, getWorkspace } from "@cloudflare/computer";
+import { Agent } from "@cloudflare/agents";
+
+export class MyAgent extends withWorkspace(
+  Agent,
+  (self) => ({ storage: self.ctx.storage }),
+) {
+  async readNote() {
+    const workspace = await getWorkspace(this);
+    return workspace.fs.readFile("/notes.md", "utf8");
+  }
+}
+```
+
+The VFS tables are ordinary application tables in that Agent cell's
+authoritative SQLite database. Activation, inactivity, eviction, restart, and
+ownership restore therefore use the cell's existing storage and replication
+path; there is no second Workspace database. A filesystem mutation advances the
+cell write position, so the existing output gate withholds the response until
+configured durability is proved. `CELLD_OUTPUT_GATE=0` explicitly disables that
+wait and must not be described as RPO=0.
+
+The pinned fixture exercises create, read, update, list, search, and delete,
+plus local reopen and per-Agent isolation. It does not provide Worker Shell or
+Worker JavaScript backends: those require later loaded-worker capability work.
+The fixture's local tests are not evidence of a live multi-node restore or
+ownership-transfer run.
 
 ## node: imports
 

@@ -3,6 +3,7 @@ import {
   getAgentByName,
   routeAgentRequest,
 } from "@cloudflare/agents";
+import { getWorkspace, withWorkspace } from "@cloudflare/computer";
 
 const AGENT_NAMES = new Set(["alpha", "beta"]);
 const SESSION_STATE_ID = "default";
@@ -19,6 +20,15 @@ function initialSessionState(name) {
   };
 }
 
+const WORKSPACE_OPERATIONS = new Set([
+  "create",
+  "read",
+  "update",
+  "list",
+  "search",
+  "delete",
+]);
+
 function agentNameFromPath(pathname) {
   const name = pathname.slice("/conformance/call/".length);
   return AGENT_NAMES.has(name) ? name : null;
@@ -30,10 +40,16 @@ function json(value, init) {
 
 /**
  * Smallest source-unmodified Agent used by the celld compatibility fixture.
- * The callable method deliberately returns nested cloneable data rather than
- * a class, function, stream, or other live RPC capability.
+ *
+ * The mixin deliberately supplies no execution backend: this is the pinned
+ * filesystem-only Computer seam. Its Workspace receives this Agent cell's
+ * storage object, so the package's VFS tables share the cell's authoritative
+ * SQLite database with Agent state and SQL.
  */
-export class ConformanceAgent extends Agent {
+export class ConformanceAgent extends withWorkspace(
+  Agent,
+  (self) => ({ storage: self.ctx.storage }),
+) {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql`
@@ -323,6 +339,96 @@ export class ConformanceAgent extends Agent {
     };
   }
 
+  /**
+   * Exercise the pinned filesystem-only Computer surface from the owning
+   * Agent cell. No Worker Loader, shell, or JavaScript backend is configured.
+   * Mutating calls return only after the host's normal cell output gate sees
+   * the SQLite write position advance.
+   */
+  async workspace(input) {
+    const name = input?.name;
+    if (typeof name !== "string" || !AGENT_NAMES.has(name)) {
+      throw new TypeError("workspace requires one of the pinned agent names");
+    }
+    const operation = input?.operation;
+    if (typeof operation !== "string" || !WORKSPACE_OPERATIONS.has(operation)) {
+      throw new TypeError(
+        "workspace operation must be create, read, update, list, search, or delete",
+      );
+    }
+    await this.setName(name);
+
+    const workspace = await getWorkspace(this);
+    const path = input?.path;
+    const requirePath = () => {
+      if (typeof path !== "string" || !path.startsWith("/")) {
+        throw new TypeError("workspace paths must be absolute strings");
+      }
+      return path;
+    };
+
+    if (operation === "create" || operation === "update") {
+      const content = input?.content;
+      if (typeof content !== "string") {
+        throw new TypeError("workspace writes require string content");
+      }
+      const target = requirePath();
+      await workspace.fs.writeFile(target, content, {
+        exclusive: operation === "create",
+      });
+      return {
+        agent: this.name,
+        operation,
+        path: target,
+        stat: await workspace.fs.stat(target),
+      };
+    }
+
+    if (operation === "read") {
+      const target = requirePath();
+      return {
+        agent: this.name,
+        operation,
+        path: target,
+        content: await workspace.fs.readFile(target, "utf8"),
+      };
+    }
+
+    if (operation === "list") {
+      const prefix = path === undefined ? "/" : requirePath();
+      return {
+        agent: this.name,
+        operation,
+        path: prefix,
+        files: await workspace.fs.ls(prefix),
+      };
+    }
+
+    if (operation === "search") {
+      const query = input?.query;
+      if (typeof query !== "string") {
+        throw new TypeError("workspace search requires a string query");
+      }
+      const prefix = path === undefined ? "/" : requirePath();
+      return {
+        agent: this.name,
+        operation,
+        path: prefix,
+        query,
+        hits: await workspace.fs.grep(query, prefix, {
+          ignoreCase: input?.ignoreCase === true,
+        }),
+      };
+    }
+
+    const target = requirePath();
+    await workspace.fs.rm(target, {
+      recursive: input?.recursive === true,
+      force: input?.force === true,
+    });
+    return { agent: this.name, operation, path: target, deleted: true };
+  }
+
   onRequest(request) {
     return json({
       agent: this.name,
@@ -397,6 +503,23 @@ export default {
       return json(await agent.scheduleStatus({ name: stateName }));
     }
 
+    const workspaceMatch = url.pathname.match(/^\/conformance\/workspace\/([^/]+)$/);
+    if (workspaceMatch) {
+      const workspaceName = AGENT_NAMES.has(workspaceMatch[1])
+        ? workspaceMatch[1]
+        : null;
+      if (!workspaceName) return json({ error: "unknown_agent" }, { status: 404 });
+      if (request.method !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      const agent = await getAgentByName(env.agents, workspaceName);
+      const body = await request.json();
+      const input = body && typeof body === "object" && !Array.isArray(body)
+        ? body
+        : {};
+      return json(await agent.workspace({ ...input, name: workspaceName }));
+    }
+
     const routed = await routeAgentRequest(request, env);
     if (routed) return routed;
 
@@ -412,6 +535,8 @@ export default {
         "/conformance/session/beta",
         "/conformance/schedule/alpha",
         "/conformance/schedule/beta",
+        "/conformance/workspace/alpha",
+        "/conformance/workspace/beta",
         "/agents/agents/alpha",
         "/agents/agents/beta",
       ],

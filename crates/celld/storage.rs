@@ -3906,4 +3906,77 @@ mod named_agent_lifecycle {
         close(scope);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn workspace_file_mutations_advance_authoritative_write_position() {
+        install_for_test();
+        let root = std::env::temp_dir().join(format!(
+            "celld-agent-workspace-{}-{}",
+            std::process::id(),
+            NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let scope = "ConformanceAgent:workspace";
+        let path = root.join("workspace.sqlite");
+
+        open(scope, path.to_str().unwrap()).expect("open workspace cell");
+        sql_exec(
+            scope,
+            "CREATE TABLE workspace_files (path TEXT PRIMARY KEY, content BLOB NOT NULL)",
+            &[],
+        )
+        .expect("create workspace table");
+
+        let before_create = write_position(scope).expect("write position before create");
+        sql_exec(
+            scope,
+            "INSERT INTO workspace_files (path, content) VALUES (?1, ?2)",
+            &[
+                serde_json::json!("/notes.md"),
+                serde_json::json!({ "__celld_bytes": [97, 108, 112, 104, 97] }),
+            ],
+        )
+        .expect("create workspace file");
+        let after_create = write_position(scope).expect("write position after create");
+        assert!(after_create > before_create);
+
+        let read_position = write_position(scope).expect("read position before read");
+        let (_, rows, _) = sql_exec(
+            scope,
+            "SELECT path, content FROM workspace_files ORDER BY path",
+            &[],
+        )
+        .expect("read workspace file");
+        assert_eq!(write_position(scope), Some(read_position));
+        assert_eq!(rows.len(), 1);
+
+        sql_exec(
+            scope,
+            "UPDATE workspace_files SET content = ?2 WHERE path = ?1",
+            &[
+                serde_json::json!("/notes.md"),
+                serde_json::json!({ "__celld_bytes": [98, 101, 116, 97] }),
+            ],
+        )
+        .expect("update workspace file");
+        let after_update = write_position(scope).expect("write position after update");
+        assert!(after_update > after_create);
+
+        sql_exec(
+            scope,
+            "DELETE FROM workspace_files WHERE path = ?1",
+            &[serde_json::json!("/notes.md")],
+        )
+        .expect("delete workspace file");
+        let after_delete = write_position(scope).expect("write position after delete");
+        assert!(after_delete > after_update);
+
+        close(scope);
+        open(scope, path.to_str().unwrap()).expect("reopen workspace cell");
+        let (_, rows, _) = sql_exec(scope, "SELECT path, content FROM workspace_files", &[])
+            .expect("read reopened workspace");
+        assert!(rows.is_empty());
+        close(scope);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
