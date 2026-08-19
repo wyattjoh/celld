@@ -156,7 +156,20 @@ test("Agent eviction invalidates named loader workers before reactivation", asyn
   context.__testLoader.get("named", () => code);
   await Promise.resolve();
   await Promise.resolve();
+  let resolveLate;
+  const lateStub = context.__testLoader.get(
+    "late",
+    () => new Promise((resolve) => { resolveLate = resolve; }),
+  );
+  await Promise.resolve();
   context.__clearLoaderAgent("Agent:alpha");
+  resolveLate(code);
+  await Promise.resolve();
+  await Promise.resolve();
+  await assert.rejects(
+    lateStub.getEntrypoint().fetch("https://late.example"),
+    /Agent scope was evicted/,
+  );
   context.__testLoader.get("named", () => code);
   await Promise.resolve();
   await Promise.resolve();
@@ -235,6 +248,8 @@ test("host env injection materializes only opaque loaded-worker proxies", async 
   assert.match(bootstrap, /loader_capabilities/);
   assert.match(harness, /__clearLoaderAgent/);
   assert.match(harness, /byName.delete/);
+  assert.match(harness, /agentGenerations/);
+  assert.match(harness, /Agent scope was evicted/);
   assert.match(runtime, /clear_loader_agent/);
   assert.match(runtime, /worker loader: host internal operation is unavailable/);
   assert.match(runtime, /CapabilityKind::Tools/);

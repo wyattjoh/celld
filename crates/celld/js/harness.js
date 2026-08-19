@@ -1946,7 +1946,11 @@ globalThis.__makeLoader = () => {
   // A stub holds a Promise<handle> so `getCode` may be async and load lazily.
   // The handle's random control token is never exposed on the stub surface.
   const byName = new Map();
+  const agentGenerations = new Map();
   __loaderClearers.push((agentScope) => {
+    agentGenerations.set(
+      agentScope, (agentGenerations.get(agentScope) ?? 0) + 1,
+    );
     const prefix = `${agentScope}\u0000`;
     for (const key of byName.keys())
       if (key.startsWith(prefix)) byName.delete(key);
@@ -2231,9 +2235,12 @@ globalThis.__makeLoader = () => {
   // surfaces as a rejection when the worker is first used, not at get()/load().
   const loaderAgentScope = () =>
     __actorEventStack[__actorEventStack.length - 1] || "";
-  const loadFrom = (getCode, agentScope) =>
-    Promise.resolve().then(getCode)
+  const loadFrom = (getCode, agentScope) => {
+    const generation = agentGenerations.get(agentScope) ?? 0;
+    return Promise.resolve().then(getCode)
       .then((c) => {
+        if ((agentGenerations.get(agentScope) ?? 0) !== generation)
+          throw new Error("worker loader: Agent scope was evicted");
         const { config: modulesConfig, wasm } = encodeModules(c);
         const { config, capabilities, outbound } = encodeEnvironment(modulesConfig);
         return __loader_load(
@@ -2243,6 +2250,7 @@ globalThis.__makeLoader = () => {
           agentScope,
         );
       });
+  };
   return {
     // Explicit form for a host object in WorkerCode.env. The target never
     // enters JSON; encodeEnvironment moves it to the capability sideband.
