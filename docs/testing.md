@@ -38,8 +38,11 @@ SQL adapter and asserts create/read/update/list/search/delete, reopening the
 same SQLite database, and isolation between two Agent databases. The Worker
 Shell fixture pins `@cloudflare/computer@0.2.1` and `just-bash@3.4.0`, checks the
 loaded-worker source seam, the Workspace capability allowlist, no-egress
-policy, unsupported-command result, and timeout/interruption wording. It does
-not add native process, host filesystem, TCP, or an alternate Workspace store.
+policy, unsupported-command result, and timeout/interruption wording. The
+Worker JavaScript seam adds focused contract checks for a fresh loaded worker,
+structured input/output, explicit Workspace sibling and file capabilities,
+drained stdio, cancellation, and unsupported result shapes. Neither backend
+adds native process, host filesystem, TCP, or an alternate Workspace store.
 The Rust storage fixture separately asserts that file-row mutations advance
 the same cell write position used by the output gate. These focused tests
 establish the seam; without a live bucket evidence bundle they do not claim

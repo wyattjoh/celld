@@ -19,6 +19,8 @@ pub enum CapabilityKind {
     Workspace,
     /// An explicitly brokered outbound Fetcher.
     Fetcher,
+    /// A host-owned library with a deliberately small method surface.
+    Library,
 }
 
 impl CapabilityKind {
@@ -27,6 +29,7 @@ impl CapabilityKind {
         match value {
             "workspace" => Some(Self::Workspace),
             "fetcher" => Some(Self::Fetcher),
+            "library" => Some(Self::Library),
             _ => None,
         }
     }
@@ -36,6 +39,7 @@ impl CapabilityKind {
         match self {
             Self::Workspace => "workspace",
             Self::Fetcher => "fetcher",
+            Self::Library => "library",
         }
     }
 }
@@ -186,6 +190,19 @@ mod tests {
         worker: 11,
         kind: CapabilityKind::Workspace,
     };
+
+    #[test]
+    fn wire_kinds_include_library_without_enabling_fetcher() {
+        assert_eq!(
+            CapabilityKind::parse("library"),
+            Some(CapabilityKind::Library)
+        );
+        assert_eq!(CapabilityKind::Library.as_str(), "library");
+        assert_eq!(
+            CapabilityKind::parse("fetcher"),
+            Some(CapabilityKind::Fetcher)
+        );
+    }
 
     #[test]
     fn authorization_is_scoped_to_owner_worker_and_kind() {

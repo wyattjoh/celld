@@ -85,9 +85,13 @@ test("the fixture wires a filesystem-only Workspace to each Agent cell", async (
   assert.match(source, /workspace\.fs\.rm/);
   assert.ok(source.includes("/conformance/workspace/alpha"));
   assert.match(source, /WorkerShellBackend/);
+  assert.match(source, /WorkerJavaScriptBackend/);
   assert.match(source, /egress: \{ mode: "none" \}/);
+  assert.match(source, /loader: computerLoader\(loader\)/);
+  assert.match(source, /globalOutbound: null/);
+  assert.match(source, /loader\.capability\("library", library\)/);
   assert.match(source, /\/conformance\/shell\/alpha/);
-  assert.doesNotMatch(source, /WorkerJavaScriptBackend/);
+  assert.match(source, /\/conformance\/javascript\/alpha/);
 });
 
 test("the source-unmodified AIChatAgent seam persists complete HTTP streams", async () => {

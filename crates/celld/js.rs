@@ -3648,6 +3648,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
         "__loader_capability_call" => op_loader_capability_call,
+        "__loader_capability_grant" => op_loader_capability_grant,
         "__loader_capability_drop" => op_loader_capability_drop,
         "__loader_capability_target" => op_loader_capability_target,
         "__loader_drop" => op_loader_drop,
@@ -4082,7 +4083,7 @@ struct LoadedWorkerEntry {
     /// The cell event that minted this worker, when one exists. Ownership
     /// loss revokes entries by this scope even when the host isolate is shared.
     host_scope: Option<String>,
-    capabilities: HashMap<String, Arc<LoadedCapability>>,
+    capabilities: Mutex<HashMap<String, Arc<LoadedCapability>>>,
     lifecycle: Arc<CapabilityLifecycle>,
 }
 
@@ -4417,7 +4418,11 @@ fn op_loader_load(
                     &format!("worker loader: unsupported capability kind {kind_name:?}"),
                 );
             };
-            if kind != celld_logic::capability::CapabilityKind::Workspace {
+            if !matches!(
+                kind,
+                celld_logic::capability::CapabilityKind::Workspace
+                    | celld_logic::capability::CapabilityKind::Library
+            ) {
                 return loader_throw(
                     scope,
                     &format!("worker loader: capability kind {kind_name:?} is not enabled yet"),
@@ -4499,7 +4504,7 @@ fn op_loader_load(
         control_token: control_token.clone(),
         host_slot,
         host_scope,
-        capabilities: loaded_capabilities,
+        capabilities: Mutex::new(loaded_capabilities),
         lifecycle: lifecycle.clone(),
     });
     loader_registry().lock().unwrap().insert(id, entry);
@@ -4674,7 +4679,14 @@ fn op_loader_rpc(
 
 async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
     if !entry.lifecycle.wait_idle_bounded().await {
-        for capability in entry.capabilities.values() {
+        let capabilities = entry
+            .capabilities
+            .lock()
+            .expect("loaded-worker capability registry poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for capability in capabilities {
             capability.lifecycle.cancel_in_flight();
         }
         if !entry.lifecycle.wait_idle_bounded().await {
@@ -4686,8 +4698,15 @@ async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
             return;
         }
     }
-    let mut tokens = Vec::with_capacity(entry.capabilities.len());
-    for (token, capability) in &entry.capabilities {
+    let capabilities = entry
+        .capabilities
+        .lock()
+        .expect("loaded-worker capability registry poisoned")
+        .iter()
+        .map(|(token, capability)| (token.clone(), capability.clone()))
+        .collect::<Vec<_>>();
+    let mut tokens = Vec::with_capacity(capabilities.len());
+    for (token, capability) in capabilities {
         capability.lifecycle.dispose();
         if !capability.lifecycle.wait_idle_bounded().await {
             capability.lifecycle.cancel_in_flight();
@@ -4700,7 +4719,7 @@ async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
                 return;
             }
         }
-        tokens.push(token.clone());
+        tokens.push(token);
     }
     let Some(slot) = entry.host_slot.upgrade() else {
         return;
@@ -4775,6 +4794,78 @@ async fn release_loader_entry_by_id(id: u64) {
     release_loader_entry(entry).await;
 }
 
+/// Grant a capability to an already-created loaded worker for one explicit
+/// RPC argument. The target is rooted in the host isolate and only its opaque
+/// worker/token/kind marker crosses the isolate boundary.
+fn op_loader_capability_grant(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let worker = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let kind_name = args.get(1).to_rust_string_lossy(scope);
+    let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+        return loader_throw(scope, "worker loader: unsupported capability kind");
+    };
+    if !matches!(
+        kind,
+        celld_logic::capability::CapabilityKind::Workspace
+            | celld_logic::capability::CapabilityKind::Library
+    ) {
+        return loader_throw(
+            scope,
+            &format!("worker loader: capability kind {kind_name:?} is not enabled yet"),
+        );
+    }
+    let target = args.get(2);
+    if !target.is_object() {
+        return loader_throw(scope, "worker loader: capability target must be an object");
+    }
+    let state = actor_runtime_state(scope);
+    if state.loader_worker_id.is_some() {
+        return loader_throw(
+            scope,
+            "worker loader: capability grants require a host isolate",
+        );
+    }
+    let Some(entry) = loader_registry().lock().unwrap().get(&worker).cloned() else {
+        return loader_throw(scope, "worker loader: unknown worker");
+    };
+    if entry.owner != state.owner_id {
+        return loader_throw(scope, "worker loader: capability owner mismatch");
+    }
+    let _grant_call = match entry.lifecycle.acquire("worker") {
+        Ok(call) => call,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let token = next_capability_token();
+    let lifecycle = Arc::new(CapabilityLifecycle::live());
+    let grant = celld_logic::capability::CapabilityGrant {
+        owner: entry.owner,
+        worker,
+        kind,
+    };
+    let capability = Arc::new(LoadedCapability { grant, lifecycle });
+    entry
+        .capabilities
+        .lock()
+        .expect("loaded-worker capability registry poisoned")
+        .insert(token.clone(), capability);
+    state
+        .capabilities
+        .lock()
+        .expect("capability registry poisoned")
+        .insert(
+            token.clone(),
+            HostCapability {
+                owner: entry.owner,
+                kind,
+                target: v8::Global::new(scope, target),
+            },
+        );
+    rv.set(v8::String::new(scope, &token).unwrap().into());
+}
+
 /// `__loader_capability_call(workerId, token, kind, pathJson, argsSc)` ->
 /// Promise<Uint8Array>. The loaded worker's opaque proxy enters here; the
 /// registry checks identity and liveness before a job re-enters its host
@@ -4822,7 +4913,13 @@ fn op_loader_capability_call(
             ),
         );
     };
-    let Some(capability) = entry.capabilities.get(&token).cloned() else {
+    let Some(capability) = entry
+        .capabilities
+        .lock()
+        .expect("loaded-worker capability registry poisoned")
+        .get(&token)
+        .cloned()
+    else {
         return loader_throw(
             scope,
             &capability_error(celld_logic::capability::AuthorizationError::Unknown),
@@ -4946,7 +5043,13 @@ fn op_loader_capability_drop(
             ),
         );
     };
-    let Some(capability) = entry.capabilities.get(&token).cloned() else {
+    let Some(capability) = entry
+        .capabilities
+        .lock()
+        .expect("loaded-worker capability registry poisoned")
+        .get(&token)
+        .cloned()
+    else {
         return loader_throw(scope, "worker loader: unknown capability");
     };
     if let Err(error) = celld_logic::capability::authorize(

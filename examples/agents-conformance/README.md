@@ -30,9 +30,10 @@ updates durable state and the schedule-run table. This deliberately uses
 celld's Durable Object alarm path, not a Worker cron trigger.
 
 The Agent uses the pinned filesystem-only Computer seam and its Worker Shell
-backend. `withWorkspace(Agent, ...)` passes `self.ctx.storage` to the VFS and
-registers `WorkerShellBackend` only when the explicit `LOADER` binding is
-present. The Workspace's `fs` surface is exercised through
+and Worker JavaScript backends. `withWorkspace(Agent, ...)` passes
+`self.ctx.storage` to the VFS and registers the source-unmodified backends only
+when the explicit `LOADER` binding is present. The Workspace's `fs` surface is
+exercised through
 `POST /conformance/workspace/<name>` with an operation of `create`, `read`,
 `update`, `list`, `search`, or `delete`; shell commands use
 `POST /conformance/shell/<name>`. Both surfaces use the owning Agent cell's
@@ -85,6 +86,19 @@ The focused package/runtime fixture test covers all six operations, reopen
 persistence, and alpha/beta isolation. It does not claim a live bucket restore,
 ownership-transfer, or multi-node fleet result; those remain live-fleet
 coverage rather than evidence inferred from this local seam.
+
+When the node starts with `CELLD_WORKER_LOADER=LOADER`, the same Agent also
+registers the pinned `WorkerJavaScriptBackend`. `POST
+/conformance/javascript/<name>` runs a module in a fresh loaded worker. The
+default module imports a sibling Workspace file, reads a Workspace file through
+`node:fs/promises`, and returns structured input/output. The host grants only
+an opaque `library` capability for the backend bridge; generated code has no
+ambient network access and cannot see the Agent, Workspace, or host objects.
+celld drains the backend's stdio stream in the loaded isolate for this first
+no-stdio integration. Use `{"operation":"cancel"}` to verify a bounded
+`cancelled` result. Invalid imports, isolate termination, and non-JSON result
+values return bounded backend failures rather than host objects or partial
+capability references.
 
 The commands below are deployed conformance procedures. The npm tests are
 contract checks and the storage tests prove alarm and Workspace persistence
@@ -140,6 +154,7 @@ node scripts/model-provider.mjs --port 8788
 CELLD_WORKER_LOADER=LOADER \
 CELLD_VAR_MODEL_PROVIDER_URL=http://127.0.0.1:8788/v1/chat \
 CELLD_AI_URL=http://127.0.0.1:8788/v1/ai \
+CELLD_WORKER_LOADER=LOADER \
 celld --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
 ```
 
@@ -192,6 +207,27 @@ The final response must show `scheduledRuns` incremented and the payload in
 the fixture intentionally does not use a cron trigger. A bucket-backed
 restart or ownership-transfer run should additionally verify the same response
 on the replacement node; that fleet evidence is not produced by `npm test`.
+
+### Worker JavaScript procedure
+
+With `CELLD_WORKER_LOADER=LOADER`, run the default structured module and then
+exercise cancellation:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8080/conformance/javascript/alpha \
+  -H 'content-type: application/json' \
+  -d '{"input":{"value":7}}'
+curl -fsS -X POST http://127.0.0.1:8080/conformance/javascript/alpha \
+  -H 'content-type: application/json' \
+  -d '{"operation":"cancel"}'
+```
+
+The first result includes `suffix: ":sibling"`, the Workspace file contents,
+and the structured input. The second result has `status: "cancelled"` and an
+exit code of 130. This seam intentionally does not expose worker stdout; the
+runtime drains it so a live stream cannot become an implicit cross-isolate
+capability. Unsupported imports, ambient `fetch()`, and non-JSON values fail
+with bounded errors.
 
 The two callable responses contain `agent: "alpha"` and `agent: "beta"`
 respectively. State reads return the selected Agent state and only that Agent's

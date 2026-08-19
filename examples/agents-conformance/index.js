@@ -8,6 +8,7 @@ import {
   WorkspaceServiceProxy,
 } from "@cloudflare/computer";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
 import { AIChatAgent } from "@cloudflare/agents/ai-chat-agent";
 import { appendResponseMessages } from "ai";
 
@@ -43,6 +44,54 @@ const WORKSPACE_OPERATIONS = new Set([
 
 const MODEL = "celld-deterministic-test";
 const CHAT_CONTENT_TYPE = "text/plain; charset=utf-8";
+const DEFAULT_JAVASCRIPT_SOURCE = `
+import { suffix } from "./helper.js";
+import { readFile } from "node:fs/promises";
+
+export default async function (input) {
+  const content = await readFile("/workspace/javascript-input.txt", "utf8");
+  return { input, suffix, content };
+}
+`;
+
+/**
+ * Adapt the pinned Computer loader contract to celld's explicit capability
+ * sideband. The backend receives no host object: only this small library
+ * target is granted to the loaded worker. Output is intentionally drained by
+ * celld's no-stdio loader path for this first integration.
+ */
+function computerLoader(loader) {
+  return {
+    load(code) {
+      const worker = loader.load(code);
+      return {
+        getEntrypoint(name, options) {
+          const entrypoint = worker.getEntrypoint(name, options);
+          return {
+            evaluate(input, host, context) {
+              const library = Object.freeze({
+                call: (...args) => host.call(...args),
+                assertResult: (...args) => host.assertResult(...args),
+                attachOutput: async () => {},
+              });
+              return entrypoint.evaluate(
+                input,
+                loader.capability("library", library),
+                context,
+              );
+            },
+          };
+        },
+        dispose() {
+          worker.dispose();
+        },
+        [Symbol.dispose]() {
+          worker.dispose();
+        },
+      };
+    },
+  };
+}
 
 class InvalidChatRequestError extends Error {
   constructor(message) {
@@ -157,10 +206,22 @@ function shellBackends(self) {
  */
 export class ConformanceAgent extends withWorkspace(
   AIChatAgent,
-  (self) => ({
-    storage: self.ctx.storage,
-    backends: shellBackends(self),
-  }),
+  (self) => {
+    const loader = self.env?.LOADER;
+    const javascriptBackends = loader === undefined
+      ? []
+      : [new WorkerJavaScriptBackend({
+          id: "worker-javascript",
+          loader: computerLoader(loader),
+          globalOutbound: null,
+          compatibilityDate: "2026-01-01",
+          compatibilityFlags: ["nodejs_compat", "experimental"],
+        })];
+    return {
+      storage: self.ctx.storage,
+      backends: [...javascriptBackends, ...shellBackends(self)],
+    };
+  },
 ) {
   constructor(ctx, env) {
     super(ctx, env);
@@ -624,6 +685,76 @@ export class ConformanceAgent extends withWorkspace(
       exitCode: result.exitCode,
       stdout: result.stdout,
       stderr,
+    };
+  }
+
+  /**
+   * Execute the pinned Computer Worker JavaScript backend in a fresh loaded
+   * worker. The default module exercises a Workspace-backed sibling import,
+   * structured input/output, and the explicit library capability sideband.
+   * This fixture intentionally drains stdio rather than exporting a stream.
+   */
+  async javascript(input) {
+    const name = input?.name;
+    if (typeof name !== "string" || !AGENT_NAMES.has(name)) {
+      throw new TypeError("javascript requires one of the pinned agent names");
+    }
+    const operation = input?.operation ?? "run";
+    if (operation !== "run" && operation !== "cancel") {
+      throw new TypeError("javascript operation must be run or cancel");
+    }
+    await this.setName(name);
+
+    const workspace = await getWorkspace(this);
+    if (!workspace.runtime.isCallable("worker-javascript")) {
+      throw new Error(
+        "Worker JavaScript backend is unavailable; set CELLD_WORKER_LOADER=LOADER",
+      );
+    }
+    const id = typeof input?.id === "string" && input.id.length > 0
+      ? input.id
+      : `conformance-javascript-${crypto.randomUUID()}`;
+    const source = typeof input?.source === "string"
+      ? input.source
+      : operation === "cancel"
+        ? "export default async () => { await new Promise(() => {}); }"
+        : DEFAULT_JAVASCRIPT_SOURCE;
+
+    if (input?.source === undefined) {
+      await workspace.fs.mkdir("/workspace", { recursive: true });
+      await workspace.fs.writeFile(
+        "/workspace/helper.js",
+        "export const suffix = \":sibling\";\\n",
+      );
+      await workspace.fs.writeFile(
+        "/workspace/javascript-input.txt",
+        "workspace\\n",
+      );
+    }
+
+    const execution = await workspace.runtime.exec(source, {
+      id,
+      backend: "worker-javascript",
+      cwd: "/workspace",
+      encoding: "utf8",
+      input: input?.input ?? { name, sequence: [1, 2, 3] },
+      timeoutMs: input?.timeoutMs,
+    });
+    if (operation === "cancel") {
+      await workspace.runtime.killExec(id, {
+        backend: "worker-javascript",
+        signal: "SIGTERM",
+      });
+    }
+    const result = await execution.result();
+    return {
+      agent: this.name,
+      id,
+      status: result.status,
+      exitCode: result.exitCode,
+      value: result.value ?? null,
+      stdout: result.stdout,
+      stderr: result.stderr,
     };
   }
 
@@ -1157,6 +1288,30 @@ export default {
       }
     }
 
+    const javascriptMatch = url.pathname.match(/^\/conformance\/javascript\/([^/]+)$/);
+    if (javascriptMatch) {
+      const javascriptName = AGENT_NAMES.has(javascriptMatch[1])
+        ? javascriptMatch[1]
+        : null;
+      if (!javascriptName) return json({ error: "unknown_agent" }, { status: 404 });
+      if (request.method !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      const agent = await getAgentByName(env.agents, javascriptName);
+      try {
+        const body = await request.json();
+        const input = body && typeof body === "object" && !Array.isArray(body)
+          ? body
+          : {};
+        return json(await agent.javascript({ ...input, name: javascriptName }));
+      } catch (error) {
+        return json({
+          error: "javascript_backend_error",
+          message: safeErrorMessage(error),
+        }, { status: 502 });
+      }
+    }
+
     for (const [prefix, suffix] of [
       ["/conformance/chat/", "chat"],
       ["/conformance/resume/", "resume"],
@@ -1188,6 +1343,8 @@ export default {
         "/conformance/workspace/beta",
         "/conformance/shell/alpha",
         "/conformance/shell/beta",
+        "/conformance/javascript/alpha",
+        "/conformance/javascript/beta",
         "/conformance/chat/alpha",
         "/conformance/resume/alpha?response=<id>&after=<cursor>",
         "/conformance/messages/alpha",

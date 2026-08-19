@@ -1621,6 +1621,22 @@ const __loaderCapabilityRevive = (value) => {
 const __loaderCapabilityDeserialize = (bytes) =>
   __loaderCapabilityRevive(__rpcDes(bytes));
 
+// The pinned Computer Worker JavaScript backend always attaches its output
+// stream before evaluating the user's module. celld deliberately keeps this
+// first integration no-stdio: drain the stream inside the loaded isolate
+// instead of crossing a live stream into the host capability. Structured
+// input/output and Workspace calls still use the explicit library sideband.
+const __discardLoaderOutput = (stream) => {
+  const reader = stream.getReader();
+  return (async () => {
+    try {
+      while (!(await reader.read()).done) {}
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+};
+
 globalThis.__makeLoaderCapability = (
   workerId, token, kind, initialPath = [],
 ) => {
@@ -1649,39 +1665,40 @@ globalThis.__makeLoaderCapability = (
       if (!String(error).includes("worker_disposed")) throw error;
     }
   };
-  const make = (path) => {
-    // A nested method proxy keeps the root alive. The root finalizer therefore
-    // cannot dispose a capability while `workspace.fs.readFile` is retained.
-    const keepRoot = root;
-    const proxy = new Proxy(function () {}, {
-      get: (_base, prop) => {
-        void keepRoot;
-        if (prop === "then") return undefined;
-        if (prop === "dispose" || prop === Symbol.dispose)
-          return path.length === 0 ? drop : () => {};
-        if (typeof prop !== "string") return undefined;
-        return make([...path, prop]);
-      },
-      apply: (_base, _this, args) => {
-        if (disposed)
-          return Promise.reject(new Error(
-            "worker loader: capability proxy is disposed"));
-        if (path.length === 0)
+  const make = (path) => new Proxy(function () {}, {
+    get: (_base, prop) => {
+      void root;
+      if (prop === "then") return undefined;
+      if (prop === "dispose" || prop === Symbol.dispose)
+        return path.length === 0 ? drop : () => {};
+      if (typeof prop !== "string") return undefined;
+      return make([...path, prop]);
+    },
+    apply: (_base, _this, args) => {
+      if (disposed)
+        return Promise.reject(new Error(
+          "worker loader: capability proxy is disposed"));
+      if (path.length === 0)
+        return Promise.reject(new TypeError(
+          "worker loader: capability root is not callable"));
+      if (kind === "library" && path.length === 1 &&
+          path[0] === "attachOutput") {
+        if (args.length !== 1 || !(args[0] instanceof ReadableStream))
           return Promise.reject(new TypeError(
-            "worker loader: capability root is not callable"));
-        let encoded;
-        try {
-          encoded = __rpcOut(args, false);
-        } catch (error) {
-          return Promise.reject(error);
-        }
-        return __loaderCapabilityCall(
-          workerId, token, kind, JSON.stringify(path), encoded,
-        ).then(__loaderCapabilityDeserialize);
-      },
-    });
-    return proxy;
-  };
+            "worker loader: library attachOutput requires a ReadableStream"));
+        return __discardLoaderOutput(args[0]);
+      }
+      let encoded;
+      try {
+        encoded = __rpcOut(args, false);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return __loaderCapabilityCall(
+        workerId, token, kind, JSON.stringify(path), encoded,
+      ).then(__loaderCapabilityDeserialize);
+    },
+  });
   root = make(initialPath);
   if (__loaderCapabilityFinalizer)
     __loaderCapabilityFinalizer.register(
@@ -1705,23 +1722,33 @@ globalThis.__dispatchLoaderCapability =
     const shellFsPath = path.length === 3 &&
       path[0] === "getWorkspace" && path[1] === "fs";
     const workspaceRootPath = path.length === 1 && path[0] === "getWorkspace";
-    if (kind !== "workspace" ||
-        (!workspaceRootPath && !directFsPath && !shellFsPath))
+    if (kind === "workspace") {
+      if (!workspaceRootPath && !directFsPath && !shellFsPath)
+        throw new TypeError(
+          "worker loader: Workspace capability only exposes getWorkspace and fs methods");
+      const methodName = directFsPath || shellFsPath
+        ? path[path.length - 1] : null;
+      if (methodName !== null && !new Set([
+        "readFile", "exists", "stat", "statOrNull", "lstat", "lstatOrNull",
+        "readdir", "find", "ls", "grep", "readlink", "writeFile", "mkdir",
+        "rm", "chmod", "symlink",
+      ]).has(methodName))
+        throw new TypeError(
+          "worker loader: Workspace capability method is unsupported");
+      if (workspaceRootPath) {
+        return {
+          "__celld$loaderCapability": { token, kind, path },
+        };
+      }
+    } else if (kind === "library") {
+      // Library targets are intentionally one-hop method surfaces. Nested
+      // property traversal would expose arbitrary host object graphs.
+      if (path.length !== 1)
+        throw new TypeError(
+          "worker loader: library capability paths must name one method");
+    } else {
       throw new TypeError(
-        "worker loader: Workspace capability only exposes getWorkspace and fs methods");
-    const methodName = directFsPath || shellFsPath
-      ? path[path.length - 1] : null;
-    if (methodName !== null && !new Set([
-      "readFile", "exists", "stat", "statOrNull", "lstat", "lstatOrNull",
-      "readdir", "find", "ls", "grep", "readlink", "writeFile", "mkdir",
-      "rm", "chmod", "symlink",
-    ]).has(methodName))
-      throw new TypeError(
-        "worker loader: Workspace capability method is unsupported");
-    if (path.length === 1) {
-      return {
-        "__celld$loaderCapability": { token, kind, path },
-      };
+        `worker loader: capability kind ${JSON.stringify(kind)} is not enabled`);
     }
     const target = __loader_capability_target(owner, token, kind);
     const targetPath = shellFsPath ? path.slice(1) : path;
@@ -1795,10 +1822,11 @@ globalThis.__makeLoader = () => {
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
         const handle = await handlePromise;
+        const encodedArgs = materializeCapabilities(args, handle.id);
         return __rpcDes(
           await __loader_rpc(
             handle.id, handle.token, entrypoint, path[0],
-            __rpcOut(args, false)));
+            __rpcOut(encodedArgs, false)));
       })(),
     };
     return new Proxy(target, {
@@ -1871,6 +1899,7 @@ globalThis.__makeLoader = () => {
       const bytes = toBytes(value) ?? toBytes(wrapped.wasm);
       if (bytes !== null) wasm.push([name, bytes]);
       else if (typeof wrapped.esModule === "string") modules[name] = wrapped.esModule;
+      else if (typeof wrapped.js === "string") modules[name] = wrapped.js;
       else modules[name] = value;
     }
     return { config: { ...c, modules }, wasm };
@@ -1895,6 +1924,48 @@ globalThis.__makeLoader = () => {
     if (marker !== null && typeof marker === "object")
       return { kind: marker.kind, target: marker.target ?? marker.value };
     return null;
+  };
+  // Loader capabilities can also be passed as one explicit RPC argument.
+  // Materialize each descriptor in the host isolate, then send only the
+  // opaque worker-bound token through structured clone. The target object
+  // never enters the JSON/clone envelope.
+  const materializeCapabilities = (value, workerId, seen = new WeakMap()) => {
+    const descriptor = capabilityDescriptor(value);
+    if (descriptor !== null) {
+      if (typeof descriptor.kind !== "string" ||
+          descriptor.target === null ||
+          (typeof descriptor.target !== "object" &&
+            typeof descriptor.target !== "function")) {
+        throw new TypeError(
+          "worker loader: capability descriptors require an object target");
+      }
+      const token = __loader_capability_grant(
+        workerId, descriptor.kind, descriptor.target);
+      return {
+        __celld$loaderCapability: {
+          worker: String(workerId),
+          token,
+          kind: descriptor.kind,
+        },
+      };
+    }
+    if (value === null || typeof value !== "object") return value;
+    const prior = seen.get(value);
+    if (prior !== undefined) return prior;
+    if (Array.isArray(value)) {
+      const copy = [];
+      seen.set(value, copy);
+      for (const item of value)
+        copy.push(materializeCapabilities(item, workerId, seen));
+      return copy;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return value;
+    const copy = {};
+    seen.set(value, copy);
+    for (const [key, child] of Object.entries(value))
+      copy[key] = materializeCapabilities(child, workerId, seen);
+    return copy;
   };
   // Keep capability targets out of JSON. The explicit marker is required so
   // an ordinary object in the legacy JSON env keeps its old by-value behavior.
@@ -3243,11 +3314,46 @@ const __rpcRun = async (body, lift) => {
     return __rpcErrOut(error);
   }
 };
+// Revive only the opaque token marker that the host-side loader encoder
+// created. The token is still checked by the native capability registry on
+// every call, so a user-forged marker cannot acquire another worker's target.
+const __reviveLoaderCapabilities = (value) => {
+  const seen = new Set();
+  const revive = (item) => {
+    if (item === null || typeof item !== "object") return item;
+    const marker = item["__celld$loaderCapability"];
+    if (marker !== undefined) {
+      if (marker === null || typeof marker !== "object" ||
+          typeof marker.worker !== "string" ||
+          typeof marker.token !== "string" ||
+          typeof marker.kind !== "string") {
+        throw new TypeError("worker loader: malformed capability value");
+      }
+      return __makeLoaderCapability(
+        marker.worker, marker.token, marker.kind);
+    }
+    if (seen.has(item)) return item;
+    seen.add(item);
+    if (Array.isArray(item)) {
+      for (let index = 0; index < item.length; index++)
+        item[index] = revive(item[index]);
+      return item;
+    }
+    const prototype = Object.getPrototypeOf(item);
+    if (prototype !== Object.prototype && prototype !== null) return item;
+    for (const key of Object.keys(item)) item[key] = revive(item[key]);
+    return item;
+  };
+  return revive(value);
+};
 const __rpcDesArgs = (bytes) => {
   if (bytes[0] === 0xff)
-    return { args: __sc_decode(bytes), received: [] };
+    return { args: __reviveLoaderCapabilities(__sc_decode(bytes)), received: [] };
   const revived = __stubRevive(__sc_decode(bytes.subarray(1)));
-  return { args: revived.value, received: revived.handles };
+  return {
+    args: __reviveLoaderCapabilities(revived.value),
+    received: revived.handles,
+  };
 };
 // The caller half: decode a reply, rebuilding stubs and rethrowing
 // callee exceptions as real Errors with the callee's own

@@ -21,7 +21,7 @@ gaps have marks below.
 | --- | --- |
 | **Workers** | Module Workers: `fetch`, JS RPC, service bindings, Durable Object bindings, `vars`. Cron triggers run the `scheduled` handler on celld's own alarms, one time for each occurrence in the whole fleet; see [Cron triggers](#cron-triggers). |
 | **Durable Objects** | The stateful core. SQLite storage, alarms, inbound hibernatable WebSockets, outbound `ws:`/`wss:` WebSocket clients (constructor and `fetch()` upgrade), one writer for each cell, names as addresses, RPC methods on stubs. |
-| **Computer filesystem-only Workspace** | **Adapted** for pinned `@cloudflare/computer@0.2.1`: a Workspace can use the owning cell's `ctx.storage` for durable `fs` operations. The pinned Worker Shell backend is adapted through an explicit loaded-worker Workspace capability; Worker JavaScript, containers, R2 mounts, and Artifacts are not implied. |
+| **Computer filesystem-only Workspace** | **Adapted** for pinned `@cloudflare/computer@0.2.1`: a Workspace can use the owning cell's `ctx.storage` for durable `fs` operations. The pinned Worker Shell and Worker JavaScript backends are adapted through explicit loaded-worker capabilities when `CELLD_WORKER_LOADER` is configured; containers, R2 mounts, and Artifacts are not implied. |
 | **Static assets** | Immutable files, served from the fleet bucket: `assets.directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first`, plus `_headers` and `_redirects`. An asset-only project deploys without a Worker. |
 | **Worker Loader (Code Mode)** | Experimental. Bind a loader with `CELLD_WORKER_LOADER`. A Worker can then start sandboxed isolates at runtime. See [Dynamic Worker loading](#dynamic-worker-loading-code-mode). |
 | **D1** | Partial. `d1_databases` bindings give `prepare`, `bind`, `all`, `first`, `run`, `raw` and `exec`. The `celld d1` command runs SQL and migrations. See [D1](#d1). |
@@ -230,12 +230,16 @@ new isolate for each loaded worker. These inputs are honored:
 apply: 64 MiB of code and 1 MiB of env, plus the
 `CELLD_MAX_LOADED_WORKERS` limit. A loaded worker serves `fetch()` and
 single RPC method calls. An explicit capability sideband is available for
-the pinned Workspace filesystem surface:
+the pinned Workspace and library surfaces:
 
 ```js
 const worker = env.LOADER.load({
   mainModule: "worker.js",
-  modules: { "worker.js": workerSource },
+  modules: {
+    "worker.js": workerSource,
+    "helper.js": { js: helperSource },
+    "add.wasm": { wasm: wasmBytes },
+  },
   env: {
     WORKSPACE: env.LOADER.capability("workspace", workspace),
     plainConfig: { mode: "safe" },
@@ -244,31 +248,27 @@ const worker = env.LOADER.load({
 });
 ```
 
-`WORKSPACE` is an opaque proxy; host objects and credentials never cross the
-isolate. Calls are single structured-clone method calls such as
-`WORKSPACE.fs.readFile(path, "utf8")`. celld checks the host owner, loaded
-worker, capability kind, and liveness before every call. Capability and worker
-handles use process-random control values; numeric worker ids, copied proxy
-shapes, and stale tokens are not authority. A host cell losing ownership
-revokes the workers it minted before its storage closes, and node shutdown
-drains the remaining registry. `dispose()` on the worker or capability is
-idempotent, rejects new calls, and releases host references after in-flight
-calls settle. Loaded-worker cleanup is bounded by the normal handler budget;
-interruption errors identify `cancelled`, `timed_out`, `isolate_failure`,
-`capability_failure`, `host_cell_lost`, or `worker_disposed` where applicable.
-Capability arguments and results are clone-only: streams, stream handles,
-backpressure, and disposable result graphs are deliberately unsupported here,
-so there is no hidden stream reference that needs a close/cancel handshake.
-Ordinary JSON `env` values and normal Worker `fetch()` behavior remain
-unchanged. A non-null `globalOutbound` Fetcher, awaitable properties, and
-pipelined capability calls remain unsupported.
-A returned Workspace view is another opaque path on the same grant, not a
-cross-isolate RPC stub; only explicitly allowlisted Workspace fs paths are
-available to Worker Shell. `dispose()` on the worker or capability rejects
-new calls and releases host references after in-flight calls settle. Ordinary
+`WORKSPACE` and library arguments are opaque proxies; host objects and
+credentials never cross the isolate. Calls are single structured-clone method
+calls. Workspace calls are limited to the explicit `getWorkspace`/`fs`
+allowlist, while a library grant is limited to one method hop on the supplied
+target. celld checks the host owner, loaded worker, capability kind, and
+liveness before every call. Capability and worker handles use process-random
+control values; numeric worker ids, copied proxy shapes, and stale tokens are
+not authority. A host cell losing ownership revokes the workers it minted
+before its storage closes, and node shutdown drains the registry. `dispose()`
+on a worker or capability is idempotent, rejects new calls, and releases host
+references after in-flight calls settle. Loaded-worker cleanup is bounded by
+the normal handler budget; interruption errors identify `cancelled`,
+`timed_out`, `isolate_failure`, `capability_failure`, `host_cell_lost`, or
+`worker_disposed`. `{ js }` sibling modules and `{ wasm }` sideband modules are
+supported. Capability arguments and results are clone-only: streams, stream
+handles, backpressure, and disposable result graphs are unsupported. Ordinary
 JSON `env` values and normal Worker `fetch()` behavior remain unchanged. A
 non-null `globalOutbound` Fetcher, awaitable properties, and pipelined
-capability calls remain unsupported.
+capability calls remain unsupported; the Fetcher broker belongs to a later
+ticket. Unsupported values fail with `DataCloneError` rather than crossing as
+host objects.
 
 ## Computer filesystem-only Workspace
 
@@ -300,14 +300,16 @@ configured durability is proved. `CELLD_OUTPUT_GATE=0` explicitly disables that
 wait and must not be described as RPO=0.
 
 The pinned fixture exercises create, read, update, list, search, and delete,
-plus local reopen and per-Agent isolation. Its Worker Shell route runs the
-source-unmodified `WorkerShellBackend` with pinned `just-bash@3.4.0` in a
-loaded worker. Only core shell modules are bundled; no native process, host
-filesystem, arbitrary TCP, or ambient network access is granted. Unsupported
-commands and timeouts return explicit bounded outcomes, and acknowledged
-Workspace mutations are not rolled back. Worker JavaScript remains a separate
-unsupported surface. The fixture's local tests are not evidence of a live
-multi-node restore or ownership-transfer run.
+plus local reopen and per-Agent isolation. With `CELLD_WORKER_LOADER=LOADER`,
+it runs the pinned Worker Shell and Worker JavaScript backends in fresh loaded
+workers. Worker Shell uses only core `just-bash` modules and the explicit
+Workspace fs capability; Worker JavaScript uses a library capability, reads a
+sibling module and Workspace file, returns structured data, and drains stdio
+rather than exporting a cross-isolate stream. Neither backend grants native
+process, host filesystem, arbitrary TCP, or ambient network access; unsupported
+commands, cancellation, and timeouts return explicit bounded outcomes. The
+fixture's local tests are not evidence of a live multi-node restore or
+ownership-transfer run.
 
 ## node: imports
 

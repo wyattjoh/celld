@@ -415,7 +415,21 @@ fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str) {
     let registry = modreg(scope);
     let mut reg = registry.0.lock().unwrap();
     reg.insert(name.to_string(), g.clone());
-    reg.insert(format!("./{name}"), g);
+    reg.insert(format!("./{name}"), g.clone());
+    // Worker Loader module maps may carry a Workspace-relative directory
+    // prefix (for example `workspace/helper.js`). The V8 resolver gives this
+    // callback the authored relative specifier without the referrer, so keep
+    // the unambiguous basename aliases used by a single-directory module
+    // graph. Exact names remain available when two directories share a name.
+    if let Some((_, basename)) = name.rsplit_once('/') {
+        if !reg.contains_key(basename) {
+            reg.insert(basename.to_string(), g.clone());
+        }
+        let relative = format!("./{basename}");
+        if !reg.contains_key(&relative) {
+            reg.insert(relative, g);
+        }
+    }
 }
 
 /// Compiled-wasm modules shared process-wide: the first isolate to see a blob
