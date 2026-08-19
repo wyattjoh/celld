@@ -60,7 +60,7 @@ async function loadPinnedShellWorker() {
     stdin: {
       contents: [
         'export { Workspace } from "@cloudflare/computer";',
-        'export { ShellWorker } from "@cloudflare/computer/backends/worker-shell";',
+        'export { ShellWorker, WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";',
       ].join("\n"),
       resolveDir: FIXTURE_ROOT,
       sourcefile: "worker-shell-entry.mjs",
@@ -99,6 +99,16 @@ async function collectEvents(stream) {
   return text.split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
+async function collectDecodedEvents(stream) {
+  const reader = stream.getReader();
+  const events = [];
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return events;
+    events.push(value);
+  }
+}
+
 function hostFor(workspace) {
   return workspace.stub();
 }
@@ -119,11 +129,89 @@ test("Worker Shell source is pinned, loaded, capability-scoped, and no-egress", 
   assert.match(sourceText, /timed_out/);
   assert.match(sourceText, /WorkspaceServiceProxy/);
   assert.match(harness, /__celld\$loaderCapability/);
+  assert.match(harness, /service\?\.name === "WorkspaceServiceProxy"/);
+  assert.match(harness, /capabilityDescriptor\(value, name\)/);
   assert.match(harness, /Workspace capability only exposes getWorkspace and fs methods/);
   assert.match(harness, /globalThis\.\__loaderWorkerId/);
   assert.match(matrix, /just-bash@3\.4\.0/);
   assert.match(matrix, /Worker Shell backend.*adapted/);
   assert.doesNotMatch(sourceText, /shell\/(?:curl|python|sqlite|js-exec)/);
+});
+
+test("WorkerShellBackend loads ShellWorker with its WorkspaceServiceProxy capability", async () => {
+  const { Workspace, ShellWorker, WorkerShellBackend, close } =
+    await loadPinnedShellWorker();
+  const root = await mkdtemp(join(tmpdir(), "celld-worker-shell-loader-"));
+  const database = new DatabaseSync(join(root, "agent.sqlite"));
+  let connection;
+  try {
+    const workspace = new Workspace({ storage: storageFor(database) });
+    let loadedCode;
+    const hostService = function WorkspaceServiceProxyStub() {};
+    hostService.getWorkspace = async () => workspace.stub();
+    const loader = {
+      get(name, getCode) {
+        loadedCode = getCode();
+        assert.equal(name, "workspace-shell:ConformanceAgent:alpha:egress-none");
+        return {
+          getEntrypoint(entrypoint) {
+            assert.equal(entrypoint, "ShellWorker");
+            const shell = new ShellWorker();
+            shell.env = {
+              HOST: {
+                getWorkspace: async () => loadedCode.env.HOST.getWorkspace(),
+              },
+            };
+            return {
+              exec: ({ command, ...input }) =>
+                shell.exec({ ...input, command }),
+              getExec: (input) => shell.getExec(input),
+              killExec: (input) => shell.killExec(input),
+              [Symbol.dispose]() {},
+            };
+          },
+          [Symbol.dispose]() {},
+        };
+      },
+    };
+    const ctx = {
+      exports: {
+        WorkspaceServiceProxy({ props }) {
+          assert.deepEqual(props, {
+            binding: "agents",
+            id: "ConformanceAgent:alpha",
+          });
+          return hostService;
+        },
+      },
+    };
+    const backend = new WorkerShellBackend({
+      id: "worker-shell",
+      loader,
+      workspace: { binding: "agents", id: "ConformanceAgent:alpha" },
+      ctx,
+      egress: { mode: "none" },
+    });
+    connection = await backend.connect();
+    assert.equal(loadedCode.globalOutbound, null);
+    assert.equal(loadedCode.env.HOST, hostService);
+    const envelope = await connection.rpc.shell.exec({
+      source: 'mkdir -p /notes && printf "loaded\\n" > /notes/todo.md && cat /notes/todo.md',
+    });
+    const events = await collectDecodedEvents(envelope.events);
+    assert.equal(events.at(-1).name, "exit");
+    assert.equal(events.at(-1).code, 0);
+    assert.equal(
+      new TextDecoder().decode(events.find((event) => event.name === "stdout").value),
+      "loaded\n",
+    );
+    assert.equal(await workspace.fs.readFile("/notes/todo.md", "utf8"), "loaded\n");
+  } finally {
+    await connection?.close();
+    database.close();
+    await rm(root, { recursive: true, force: true });
+    await close();
+  }
 });
 
 test("pinned Worker Shell mutates the same Workspace and reports unsupported commands", async () => {

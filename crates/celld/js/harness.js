@@ -1723,13 +1723,23 @@ globalThis.__dispatchLoaderCapability =
       };
     }
     const target = __loader_capability_target(owner, token, kind);
+    const targetPath = shellFsPath ? path.slice(1) : path;
     let receiver = target;
-    for (let i = 0; i < path.length - 1; i++) {
-      receiver = receiver[path[i]];
+    if (shellFsPath) {
+      const getWorkspace = receiver.getWorkspace;
+      if (typeof getWorkspace !== "function")
+        throw new TypeError(
+          "worker loader: WorkspaceServiceProxy does not expose getWorkspace");
+      receiver = await getWorkspace();
+      if (receiver === null || receiver === undefined)
+        throw new TypeError("worker loader: getWorkspace returned no Workspace");
+    }
+    for (let i = 0; i < targetPath.length - 1; i++) {
+      receiver = receiver[targetPath[i]];
       if (receiver === null || receiver === undefined)
         throw new TypeError("worker loader: capability path is not present");
     }
-    const method = receiver[path[path.length - 1]];
+    const method = receiver[targetPath[targetPath.length - 1]];
     if (typeof method !== "function")
       throw new TypeError(
         "worker loader: capability path does not name a method");
@@ -1857,7 +1867,18 @@ globalThis.__makeLoader = () => {
     }
     return { config: { ...c, modules }, wasm };
   };
-  const capabilityDescriptor = (value) => {
+  const capabilityDescriptor = (value, envName = null) => {
+    const service = value !== null && typeof value === "function"
+      ? __svcMeta.get(value) : undefined;
+    if (envName === "HOST" && service?.name === "WorkspaceServiceProxy") {
+      // @cloudflare/computer's source-unmodified WorkerShellBackend passes
+      // ctx.exports.WorkspaceServiceProxy({ props }) directly as env.HOST.
+      // It is already an opaque same-isolate service stub, so sideband it as
+      // the Workspace capability instead of letting JSON.stringify drop the
+      // function. Ordinary functions and other service stubs remain by-value
+      // env data and are not granted authority.
+      return { kind: "workspace", target: value };
+    }
     if (value === null || typeof value !== "object" ||
         !Object.hasOwn(value, "__celldCapability")) return null;
     const marker = value.__celldCapability;
@@ -1877,7 +1898,7 @@ globalThis.__makeLoader = () => {
     if (c.env !== null && typeof c.env === "object" && !Array.isArray(c.env)) {
       const env = {};
       for (const [name, value] of Object.entries(c.env)) {
-        const descriptor = capabilityDescriptor(value);
+        const descriptor = capabilityDescriptor(value, name);
         if (descriptor !== null) {
           capabilities.push([name, descriptor.kind, descriptor.target]);
         } else {
