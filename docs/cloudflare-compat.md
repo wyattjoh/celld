@@ -226,13 +226,26 @@ Loader](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-l
 `loader.get(name, getCode)` (memoized) and `loader.load(code)` start a
 new isolate for each loaded worker. These inputs are honored:
 `mainModule`, sibling `modules`, `compatibilityDate`/`Flags`, plain-JSON
-`env`, and `globalOutbound: null` (no egress). The limits of workerd
-apply: 64 MiB of code and 1 MiB of env, plus the
-`CELLD_MAX_LOADED_WORKERS` limit. A loaded worker serves `fetch()` and
-single RPC method calls. An explicit capability sideband is available for
-the pinned Workspace and library surfaces:
+`env`, `globalOutbound: null` (no egress), and an explicit Fetcher broker.
+The limits of workerd apply: 64 MiB of code and 1 MiB of env, plus the
+`CELLD_MAX_LOADED_WORKERS` limit. A loaded worker serves `fetch()` and single
+RPC method calls. Capability values use an opaque sideband; host objects and
+credentials never enter the loaded Worker's JSON environment. The sideband
+supports the pinned Workspace, Library, Tools, and Fetcher proxy surfaces.
 
 ```js
+const outbound = env.LOADER.fetcher(env.HTTP_GATEWAY, {
+  // Origins and path prefixes are checked before gateway.fetch() runs.
+  allow: ["https://api.example.com/v1"],
+});
+const tools = env.LOADER.tools([
+  {
+    name: "search",
+    description: "Search approved documents",
+    inputSchema: { type: "object" },
+  },
+], env.TOOL_BROKER);
+
 const worker = env.LOADER.load({
   mainModule: "worker.js",
   modules: {
@@ -242,33 +255,43 @@ const worker = env.LOADER.load({
   },
   env: {
     WORKSPACE: env.LOADER.capability("workspace", workspace),
+    TOOLS: tools,
     plainConfig: { mode: "safe" },
   },
-  globalOutbound: null,
+  globalOutbound: outbound,
 });
 ```
 
-`WORKSPACE` and library arguments are opaque proxies; host objects and
-credentials never cross the isolate. Calls are single structured-clone method
-calls. Workspace calls are limited to the explicit `getWorkspace`/`fs`
-allowlist, while a library grant is limited to one method hop on the supplied
-target. celld checks the host owner, loaded worker, capability kind, and
-liveness before every call. Capability and worker handles use process-random
-control values; numeric worker ids, copied proxy shapes, and stale tokens are
-not authority. A host cell losing ownership revokes the workers it minted
-before its storage closes, and node shutdown drains the registry. `dispose()`
-on a worker or capability is idempotent, rejects new calls, and releases host
-references after in-flight calls settle. Loaded-worker cleanup is bounded by
-the normal handler budget; interruption errors identify `cancelled`,
-`timed_out`, `isolate_failure`, `capability_failure`, `host_cell_lost`, or
-`worker_disposed`. `{ js }` sibling modules and `{ wasm }` sideband modules are
-supported. Capability arguments and results are clone-only: streams, stream
-handles, backpressure, and disposable result graphs are unsupported. Ordinary
-JSON `env` values and normal Worker `fetch()` behavior remain unchanged. A
-non-null `globalOutbound` Fetcher, awaitable properties, and pipelined
-capability calls remain unsupported; the Fetcher broker belongs to a later
-ticket. Unsupported values fail with `DataCloneError` rather than crossing as
-host objects.
+`WORKSPACE`, `LIBRARY`, and `TOOLS` are opaque proxies; host objects and
+credentials never cross the isolate. `WORKSPACE.fs.readFile(path, "utf8")` and
+`TOOLS.invoke(name, input)` are the supported Workspace and Tools calls;
+`TOOLS.catalog` is a frozen copy of the host-approved metadata. A Library
+grant is limited to one method hop on its supplied target. A Fetcher
+capability exposes only `fetch()`, and its non-empty allowlist is checked by
+origin and path before the host target is called. Responses cross back as
+bounded structured-clone data/streams, while arbitrary capability arguments
+and results remain clone-only: streams, stream handles, backpressure, and
+disposable result graphs are unsupported. The target stays rooted in the
+owning Agent isolate, so provider credentials and fleet bindings remain
+host-side.
+
+celld checks the host owner, Agent-loaded-worker identity, capability kind,
+allowlist, and liveness before every call. Capability and worker handles use
+process-random control values; numeric worker ids, copied proxy shapes, and
+stale tokens are not authority. A host cell losing ownership revokes the
+workers it minted before its storage closes, and node shutdown drains the
+registry. `dispose()` on a worker or capability is idempotent, rejects new
+calls, and releases host references after in-flight calls settle. Loaded-worker
+cleanup is bounded by the normal handler budget; interruption errors identify
+`cancelled`, `timed_out`, `isolate_failure`, `capability_failure`,
+`host_cell_lost`, or `worker_disposed`. `{ js }` sibling modules and `{ wasm }`
+sideband modules are supported. Ordinary JSON `env` values and normal Worker
+`fetch()` behavior remain unchanged. `globalOutbound: null` always denies
+ambient `fetch()`; omitting `globalOutbound` preserves the existing
+parent/normal-Worker outbound policy. A non-null ordinary object is rejected
+instead of being serialized or treated as unrestricted networking. Awaitable
+properties and pipelined capability calls remain unsupported. Unsupported
+values fail with `DataCloneError` rather than crossing as host objects.
 
 ## Computer filesystem-only Workspace
 

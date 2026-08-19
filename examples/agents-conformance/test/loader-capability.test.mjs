@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import vm from "node:vm";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -18,7 +19,8 @@ test("Worker Loader uses an explicit capability sideband and opaque proxy", asyn
   assert.match(harness, /__loader_capability_revoke/);
   assert.match(harness, /__loader_capability_drop/);
   assert.match(harness, /__loader_capability_target/);
-  assert.match(harness, /__loader_load\(JSON\.stringify\(config\), wasm, capabilities\)/);
+  assert.match(harness, /__loader_capability_allowlist/);
+  assert.match(harness, /__loader_load\(\n?\s*JSON\.stringify\(config\), wasm, capabilities,/);
   assert.match(harness, /if \(prop === "then"\) return undefined/);
   assert.match(harness, /Workspace capability only exposes getWorkspace and fs methods/);
   assert.match(harness, /__loaderCapabilityFinalizer/);
@@ -39,6 +41,53 @@ test("Ticket 06 direct Workspace paths remain compatible with Worker Shell views
   assert.match(harness, /bounded transport size/);
   assert.match(harness, /__celld\$loaderCapability/);
   assert.match(harness, /typeof wrapped\.js === "string"/);
+});
+
+test("Fetcher broker allowlists are origin-and-path scoped", async () => {
+  const harness = await source("crates/celld/js/harness.js");
+  const start = harness.indexOf("const __loaderFetcherAllowed =");
+  const end = harness.indexOf("\n\nglobalThis.__makeLoaderCapability", start);
+  assert.ok(start >= 0 && end > start, "Fetcher policy helper is present");
+  const policy = vm.runInNewContext(
+    `${harness.slice(start, end)}; __loaderFetcherAllowed`,
+    { URL },
+  );
+  const allow = ["https://approved.example/api"];
+  assert.equal(policy("https://approved.example/api", allow), true);
+  assert.equal(policy("https://approved.example/api/v1", allow), true);
+  assert.equal(policy("https://approved.example/apix", allow), false);
+  assert.equal(policy("https://other.example/api", allow), false);
+  assert.equal(policy("ftp://approved.example/api", allow), false);
+  assert.equal(policy("not a URL", allow), false);
+  assert.equal(policy("https://approved.example/api", []), false);
+});
+
+test("tool catalogs are normalized to host-approved metadata", async () => {
+  const harness = await source("crates/celld/js/harness.js");
+  const safeStart = harness.indexOf("const __loaderCapabilitySafe =");
+  const safeEnd = harness.indexOf("\n\nglobalThis.__makeLoaderCapability", safeStart);
+  const catalogStart = harness.indexOf("  const catalogForLoader =", safeEnd);
+  const catalogEnd = harness.indexOf("\n  const encodeCapability", catalogStart);
+  assert.ok(catalogStart >= 0 && catalogEnd > catalogStart, "catalog helper is present");
+  const sourceCode = `${harness.slice(safeStart, safeEnd)}\n${harness.slice(catalogStart, catalogEnd)}; catalogForLoader`;
+  const catalogForLoader = vm.runInNewContext(sourceCode, { Set, Object, JSON });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(catalogForLoader([{
+      name: "search",
+      description: "Search approved documents",
+      inputSchema: { type: "object" },
+      secret: "must not be copied",
+    }]))),
+    [{
+      name: "search",
+      description: "Search approved documents",
+      inputSchema: { type: "object" },
+    }],
+  );
+  assert.throws(
+    () => catalogForLoader([{ name: "__proto__" }]),
+    /safe name/,
+  );
 });
 
 test("runtime checks capability identity and denies ambient loaded-worker egress", async () => {
@@ -64,15 +113,31 @@ test("runtime checks capability identity and denies ambient loaded-worker egress
   assert.match(runtime, /shutdown_loader_registry/);
   assert.match(runtime, /capability grants require a host isolate/);
   assert.match(runtime, /CapabilityKind::Library/);
+  assert.match(runtime, /CapabilityKind::Fetcher/);
+  assert.match(runtime, /CapabilityKind::Tools/);
   assert.match(runtime, /with_main_module\(main\.to_string\(\)\)/);
   assert.match(runtime, /register_main_module/);
+  assert.match(runtime, /Fetcher brokers require a non-empty allowlist/);
+  assert.match(runtime, /globalOutbound must be an explicit Fetcher broker/);
+  assert.match(runtime, /loader_capability_allowlist/);
+});
+
+test("normal Workers retain inherited outbound behavior while brokers stay explicit", async () => {
+  const harness = await source("crates/celld/js/harness.js");
+  const runtime = await source("crates/celld/js.rs");
+  assert.match(harness, /config\.globalOutbound !== undefined && config\.globalOutbound !== null/);
+  assert.match(harness, /delete config\.globalOutbound/);
+  assert.match(harness, /__loaderOutbound !== null/);
+  assert.match(runtime, /None => actor_runtime_state\(scope\)\.egress/);
 });
 
 test("host env injection materializes only opaque loaded-worker proxies", async () => {
   const bootstrap = await source("crates/celld/js/bootstrap.rs");
   const runtime = await source("crates/celld/js.rs");
   assert.match(bootstrap, /__makeLoaderCapability/);
+  assert.match(bootstrap, /__setLoaderOutbound/);
   assert.match(bootstrap, /loader_capabilities/);
+  assert.match(runtime, /CapabilityKind::Tools/);
   assert.match(runtime, /release_loader_capabilities/);
   assert.match(runtime, /release_loader_entry/);
   assert.match(runtime, /in-flight calls settle/);

@@ -484,8 +484,14 @@ globalThis.console = {
 };
 
 // async-op shims: outbound fetch + timers, driven by the host event loop.
+// A loaded worker with an explicit globalOutbound broker is routed through
+// this closure. The broker token never enters user env; the host dispatcher
+// still authenticates it and enforces its URL policy before calling a target.
+let __loaderOutbound = null;
 globalThis.fetch = async (input, init) => {
   const req = new Request(input, init);
+  if (__loaderOutbound !== null)
+    return await __loaderOutbound(req);
   // `fetch(url, { headers: { Upgrade: "websocket" } })` is the other way
   // Cloudflare opens an outbound socket, and the one most examples use.
   if ((req.headers.get("upgrade") ?? "").toLowerCase() === "websocket") {
@@ -1659,9 +1665,55 @@ const __forwardLoaderOutput = (stream, workerId, token, kind) => {
   })();
 };
 
+const __loaderDeepFreeze = (value, seen = new Set()) => {
+  if (value === null || typeof value !== "object" || seen.has(value))
+    return value;
+  seen.add(value);
+  for (const child of Object.values(value)) __loaderDeepFreeze(child, seen);
+  return Object.freeze(value);
+};
+
+const __loaderResponse = (value) => {
+  if (value === null || typeof value !== "object")
+    throw new TypeError("worker loader: Fetcher broker returned an invalid response");
+  const headers = typeof value.headersJson === "string"
+    ? JSON.parse(value.headersJson) : value.headers ?? [];
+  const streamId = Number(value.bodyStreamId ?? value.streamId ?? 0);
+  const body = streamId > 0
+    ? new CelldHttpBodyStream(streamId)
+    : value.bodyBytes instanceof Uint8Array
+      ? value.bodyBytes : new Uint8Array(value.bodyBytes ?? []);
+  return new Response(body, {
+    status: Number(value.status ?? 200),
+    headers,
+  });
+};
+
+const __loaderFetcherAllowed = (url, allowlist) => {
+  if (!Array.isArray(allowlist) || allowlist.length === 0) return false;
+  let request;
+  try { request = new URL(url); } catch { return false; }
+  if (request.protocol !== "http:" && request.protocol !== "https:")
+    return false;
+  return allowlist.some((entry) => {
+    if (typeof entry !== "string") return false;
+    let approved;
+    try { approved = new URL(entry); } catch { return false; }
+    if (approved.username || approved.password || approved.search || approved.hash)
+      return false;
+    if (request.origin !== approved.origin) return false;
+    const path = approved.pathname === "/" ? "/" : approved.pathname;
+    const prefix = path.endsWith("/") ? path : `${path}/`;
+    return request.pathname === path || request.pathname.startsWith(prefix);
+  });
+};
+
 globalThis.__makeLoaderCapability = (
-  workerId, token, kind, initialPath = [],
+  workerId, token, kind, catalogOrPath = null, initialPath = [],
 ) => {
+  let catalogJson = null;
+  if (Array.isArray(catalogOrPath)) initialPath = catalogOrPath;
+  else catalogJson = catalogOrPath;
   // The loaded worker owns this identity. Capability-return markers omit it
   // from their host-visible payload and recover it here, so a marker copied
   // into another worker still fails the Rust owner/worker authorization check.
@@ -1676,6 +1728,8 @@ globalThis.__makeLoaderCapability = (
   let disposed = false;
   let root;
   const unregisterToken = {};
+  const catalog = kind === "tools"
+    ? __loaderDeepFreeze(JSON.parse(catalogJson ?? "[]")) : undefined;
   const drop = () => {
     if (disposed) return;
     disposed = true;
@@ -1689,10 +1743,14 @@ globalThis.__makeLoaderCapability = (
   };
   const make = (path) => new Proxy(function () {}, {
     get: (_base, prop) => {
+      // A nested method proxy keeps the root alive until the capability is
+      // explicitly disposed or finalized.
       void root;
       if (prop === "then") return undefined;
       if (prop === "dispose" || prop === Symbol.dispose)
         return path.length === 0 ? drop : () => {};
+      if (kind === "tools" && path.length === 0 && prop === "catalog")
+        return catalog;
       if (typeof prop !== "string") return undefined;
       return make([...path, prop]);
     },
@@ -1718,7 +1776,9 @@ globalThis.__makeLoaderCapability = (
       }
       return __loaderCapabilityCall(
         workerId, token, kind, JSON.stringify(path), encoded,
-      ).then(__loaderCapabilityDeserialize);
+      ).then(__loaderCapabilityDeserialize).then((value) =>
+        kind === "fetcher" && path.length === 1 && path[0] === "fetch"
+          ? __loaderResponse(value) : value);
     },
   });
   root = make(initialPath);
@@ -1727,6 +1787,26 @@ globalThis.__makeLoaderCapability = (
       root, [workerId, token, kind], unregisterToken,
     );
   return root;
+};
+
+globalThis.__makeLoaderOutbound = (workerId, token) => async (req) => {
+  const body = ["GET", "HEAD"].includes(req.method)
+    ? null : await req._consume();
+  const init = {
+    method: req.method,
+    headers: Array.from(req.headers),
+    body,
+    redirect: req.redirect,
+  };
+  const encoded = __sc_encode([req.url, init]);
+  const result = await __loader_capability_call(
+    workerId, token, "fetcher", JSON.stringify(["fetch"]), encoded,
+  );
+  return __loaderResponse(__rpcDes(result));
+};
+
+globalThis.__setLoaderOutbound = (workerId, token) => {
+  __loaderOutbound = globalThis.__makeLoaderOutbound(workerId, token);
 };
 
 globalThis.__dispatchLoaderCapability =
@@ -1768,11 +1848,52 @@ globalThis.__dispatchLoaderCapability =
       if (path.length !== 1)
         throw new TypeError(
           "worker loader: library capability paths must name one method");
+    } else if (kind === "fetcher") {
+      if (path.length !== 1 || path[0] !== "fetch")
+        throw new TypeError("worker loader: Fetcher brokers expose only fetch()");
+    } else if (kind === "tools") {
+      if (path.length !== 1 || path[0] !== "invoke")
+        throw new TypeError("worker loader: tool brokers expose only invoke()");
     } else {
       throw new TypeError(
         `worker loader: capability kind ${JSON.stringify(kind)} is not enabled`);
     }
+    const callArgs = __sc_decode(argsBytes);
+    if (!Array.isArray(callArgs))
+      throw new TypeError("worker loader: capability arguments must be an array");
     const target = __loader_capability_target(owner, token, kind);
+    if (kind === "fetcher") {
+      if (callArgs.length > 2)
+        throw new TypeError("worker loader: Fetcher brokers expose only fetch()");
+      const allowlist = JSON.parse(
+        __loader_capability_allowlist(owner, token, kind),
+      );
+      const request = new Request(callArgs[0], {
+        ...(callArgs[1] ?? {}),
+        // Do not let an approved gateway silently follow an unapproved
+        // redirect outside the broker's allowlist.
+        redirect: "manual",
+      });
+      if (!__loaderFetcherAllowed(request.url, allowlist))
+        throw new Error(
+          `worker loader: Fetcher broker denied URL ${request.url}`);
+      const method = target?.fetch;
+      if (typeof method !== "function")
+        throw new TypeError("worker loader: Fetcher broker has no fetch() method");
+      try {
+        return __readResponse(await Reflect.apply(method, target, [request]));
+      } catch {
+        // Broker implementation errors stay host-side; never copy gateway
+        // credentials or internal URLs into a loaded-worker exception.
+        throw new Error("worker loader: Fetcher broker request failed");
+      }
+    }
+    if (kind === "tools") {
+      const method = target?.invoke;
+      if (typeof method !== "function")
+        throw new TypeError("worker loader: tool broker has no invoke() method");
+      return Reflect.apply(method, target, callArgs);
+    }
     const targetPath = shellFsPath ? path.slice(1) : path;
     let receiver = target;
     let workspaceView;
@@ -1795,10 +1916,6 @@ globalThis.__dispatchLoaderCapability =
     if (typeof method !== "function")
       throw new TypeError(
         "worker loader: capability path does not name a method");
-    const callArgs = __sc_decode(argsBytes);
-    if (!Array.isArray(callArgs))
-      throw new TypeError("worker loader: capability arguments must be an array");
-    if (!shellFsPath) return Reflect.apply(method, receiver, callArgs);
     try {
       return await Reflect.apply(method, receiver, callArgs);
     } finally {
@@ -1954,7 +2071,12 @@ globalThis.__makeLoader = () => {
     if (typeof marker === "string")
       return { kind: marker, target: value.target ?? value.value };
     if (marker !== null && typeof marker === "object")
-      return { kind: marker.kind, target: marker.target ?? marker.value };
+      return {
+        kind: marker.kind,
+        target: marker.target ?? marker.value,
+        catalog: marker.catalog,
+        allowlist: marker.allowlist,
+      };
     return null;
   };
   // Loader capabilities can also be passed as one explicit RPC argument.
@@ -2006,11 +2128,40 @@ globalThis.__makeLoader = () => {
       copy[key] = materializeCapabilities(child, workerId, seen, grants);
     return copy;
   };
+  const catalogForLoader = (catalog) => {
+    if (!Array.isArray(catalog) || catalog.length > 128)
+      throw new TypeError("worker loader: tool catalog must contain at most 128 tools");
+    const normalized = catalog.map((entry) => {
+      if (entry === null || typeof entry !== "object" ||
+          !__loaderCapabilitySafe(entry.name))
+        throw new TypeError("worker loader: tool catalog entries need a safe name");
+      const result = { name: entry.name };
+      if (entry.description !== undefined) {
+        if (typeof entry.description !== "string" || entry.description.length > 4096)
+          throw new TypeError("worker loader: tool descriptions must be bounded strings");
+        result.description = entry.description;
+      }
+      if (entry.inputSchema !== undefined) result.inputSchema = entry.inputSchema;
+      return result;
+    });
+    const encoded = JSON.stringify(normalized);
+    if (encoded.length > 64 * 1024)
+      throw new TypeError("worker loader: tool catalog exceeds the 64 KiB limit");
+    return __loaderDeepFreeze(JSON.parse(encoded));
+  };
+  const encodeCapability = (name, descriptor) => {
+    const catalog = descriptor.catalog === undefined
+      ? null : JSON.stringify(descriptor.catalog);
+    const allowlist = descriptor.allowlist === undefined
+      ? null
+      : [...descriptor.allowlist];
+    return [name, descriptor.kind, descriptor.target, catalog, allowlist];
+  };
   // Keep capability targets out of JSON. The explicit marker is required so
   // an ordinary object in the legacy JSON env keeps its old by-value behavior.
   const encodeEnvironment = (c) => {
     if (c === null || typeof c !== "object")
-      return { config: c, capabilities: [] };
+      return { config: c, capabilities: [], outbound: null };
     const capabilities = [];
     const config = { ...c };
     if (c.env !== null && typeof c.env === "object" && !Array.isArray(c.env)) {
@@ -2018,7 +2169,7 @@ globalThis.__makeLoader = () => {
       for (const [name, value] of Object.entries(c.env)) {
         const descriptor = capabilityDescriptor(value, name);
         if (descriptor !== null) {
-          capabilities.push([name, descriptor.kind, descriptor.target]);
+          capabilities.push(encodeCapability(name, descriptor));
         } else {
           env[name] = value;
         }
@@ -2032,11 +2183,24 @@ globalThis.__makeLoader = () => {
         if (descriptor === null)
           throw new TypeError(
             "worker loader: capabilities must use the explicit capability form");
-        capabilities.push([name, descriptor.kind, descriptor.target]);
+        capabilities.push(encodeCapability(name, descriptor));
       }
       delete config.capabilities;
     }
-    return { config, capabilities };
+    let outbound = null;
+    if (config.globalOutbound !== undefined && config.globalOutbound !== null) {
+      const descriptor = capabilityDescriptor(config.globalOutbound);
+      if (descriptor === null || descriptor.kind !== "fetcher")
+        throw new TypeError(
+          "worker loader: globalOutbound must use an explicit Fetcher broker");
+      outbound = [
+        descriptor.kind,
+        descriptor.target,
+        descriptor.allowlist === undefined ? null : [...descriptor.allowlist],
+      ];
+      delete config.globalOutbound;
+    }
+    return { config, capabilities, outbound };
   };
   // getCode is deferred into a microtask so a throw (or async getCode)
   // surfaces as a rejection when the worker is first used, not at get()/load().
@@ -2044,10 +2208,13 @@ globalThis.__makeLoader = () => {
     Promise.resolve().then(getCode)
       .then((c) => {
         const { config: modulesConfig, wasm } = encodeModules(c);
-        const { config, capabilities } = encodeEnvironment(modulesConfig);
-        return capabilities.length === 0
+        const { config, capabilities, outbound } = encodeEnvironment(modulesConfig);
+        return capabilities.length === 0 && outbound === null
           ? __loader_load(JSON.stringify(config), wasm)
-          : __loader_load(JSON.stringify(config), wasm, capabilities);
+          : __loader_load(
+            JSON.stringify(config), wasm, capabilities,
+            outbound === null ? undefined : outbound,
+          );
       });
   return {
     // Explicit form for a host object in WorkerCode.env. The target never
@@ -2055,6 +2222,28 @@ globalThis.__makeLoader = () => {
     capability(kind, target) {
       return Object.freeze({
         __celldCapability: Object.freeze({ kind, target }),
+      });
+    },
+    // A Fetcher broker is explicit and deny-by-default: every URL must match
+    // one of the host-approved origin/path entries before target.fetch runs.
+    fetcher(target, options = {}) {
+      options = options ?? {};
+      const allowlist = options.allow ?? options.allowlist;
+      if (!Array.isArray(allowlist) || allowlist.length === 0)
+        throw new TypeError("worker loader: Fetcher brokers require an allowlist");
+      return Object.freeze({
+        __celldCapability: Object.freeze({
+          kind: "fetcher", target, allowlist: Object.freeze([...allowlist]),
+        }),
+      });
+    },
+    // Tool definitions are copied by value; only the host-owned invoke target
+    // remains behind the opaque proxy.
+    tools(catalog, target) {
+      return Object.freeze({
+        __celldCapability: Object.freeze({
+          kind: "tools", target, catalog: catalogForLoader(catalog),
+        }),
       });
     },
     load(code) { return makeStub(loadFrom(() => code), true); },

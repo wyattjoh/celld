@@ -99,6 +99,36 @@ pub(super) fn install_harness(scope: &mut v8::PinScope) -> Result<()> {
     run_bootstrap_script(scope, "crypto.js", include_str!("crypto.js"))
 }
 
+/// Install a loaded Worker's globalOutbound broker before module evaluation so
+/// top-level fetches obey the same explicit policy as request-time fetches.
+pub(super) fn inject_loader_outbound(
+    scope: &mut v8::PinScope,
+    config: &WorkerConfig,
+) -> Result<()> {
+    let (Some(worker_id), Some(outbound)) =
+        (config.loader_worker_id, config.loader_outbound.as_ref())
+    else {
+        return Ok(());
+    };
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "__setLoaderOutbound").unwrap();
+    let setter: v8::Local<v8::Function> = global
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow!("missing __setLoaderOutbound"))?
+        .try_into()
+        .map_err(|_| anyhow!("__setLoaderOutbound is not a function"))?;
+    let worker_id = v8::String::new(scope, &worker_id.to_string()).unwrap();
+    let token = v8::String::new(scope, &outbound.token).unwrap();
+    setter
+        .call(
+            scope,
+            v8::undefined(scope).into(),
+            &[worker_id.into(), token.into()],
+        )
+        .ok_or_else(|| anyhow!("__setLoaderOutbound threw"))?;
+    Ok(())
+}
+
 pub(super) fn register_class(
     scope: &mut v8::PinScope,
     name: &str,
@@ -349,11 +379,16 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         if let Some(worker_id) = config.loader_worker_id {
             for capability in &config.loader_capabilities {
                 lines.push_str(&format!(
-                    "e[{:?}] = __makeLoaderCapability({:?}, {:?}, {:?});\n",
+                    "e[{:?}] = __makeLoaderCapability({:?}, {:?}, {:?}, {});\n",
                     capability.name,
                     worker_id.to_string(),
                     capability.token,
                     capability.kind.as_str(),
+                    capability
+                        .catalog
+                        .as_deref()
+                        .map(|catalog| format!("{:?}", catalog))
+                        .unwrap_or_else(|| "undefined".to_string()),
                 ));
             }
             // The loaded module is untrusted. It receives the already-minted
@@ -363,6 +398,15 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 "delete globalThis.__makeLoaderCapability;\n\
                  delete globalThis.__makeLoader;\n",
             );
+        }
+        if let (Some(worker_id), Some(outbound)) =
+            (config.loader_worker_id, config.loader_outbound.as_ref())
+        {
+            lines.push_str(&format!(
+                "globalThis.__setLoaderOutbound({:?}, {:?});\n",
+                worker_id.to_string(),
+                outbound.token,
+            ));
         }
         lines.push_str("})();");
         lines

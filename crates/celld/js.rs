@@ -1292,6 +1292,9 @@ struct LoaderCapabilityBinding {
     name: String,
     token: String,
     kind: celld_logic::capability::CapabilityKind,
+    /// A host-approved tool catalog. It is copied by value into the loaded
+    /// worker; the broker target and any credentials stay in the host.
+    catalog: Option<String>,
 }
 
 pub struct WorkerConfig {
@@ -1330,6 +1333,9 @@ pub struct WorkerConfig {
     loader_worker_id: Option<u64>,
     /// Opaque capability bindings materialized after plain JSON env values.
     loader_capabilities: Vec<LoaderCapabilityBinding>,
+    /// The explicit globalOutbound Fetcher broker, if configured. Its token is
+    /// installed into the loaded worker's fetch implementation, not env.
+    loader_outbound: Option<LoaderCapabilityBinding>,
 }
 
 pub struct WorkerConfigOptions {
@@ -1382,6 +1388,7 @@ impl WorkerConfig {
             crons: Vec::new(),
             loader_worker_id: None,
             loader_capabilities: Vec::new(),
+            loader_outbound: None,
         }
     }
 
@@ -1420,9 +1427,11 @@ impl WorkerConfig {
         mut self,
         worker_id: u64,
         capabilities: Vec<LoaderCapabilityBinding>,
+        outbound: Option<LoaderCapabilityBinding>,
     ) -> Self {
         self.loader_worker_id = Some(worker_id);
         self.loader_capabilities = capabilities;
+        self.loader_outbound = outbound;
         self
     }
 
@@ -1658,6 +1667,10 @@ struct HostCapability {
     owner: celld_logic::capability::OwnerId,
     kind: celld_logic::capability::CapabilityKind,
     target: v8::Global<v8::Value>,
+    /// URL prefixes/origins approved by the host for a Fetcher broker.
+    /// Empty means deny all outbound URLs; a broker must opt into every
+    /// destination instead of inheriting ambient network access.
+    allowlist: Vec<String>,
 }
 
 #[derive(Default)]
@@ -3247,6 +3260,7 @@ impl Worker {
             install_ops(scope, context);
             install_prelude(scope)?; // Web Platform APIs
             install_harness(scope)?; // DO object model + minimal Response
+            inject_loader_outbound(scope, &config)?;
             install_lazy_globals(scope)?;
             // A global, so it must exist before the module evaluates: bundles
             // read Cloudflare.compatibilityFlags at module scope.
@@ -3662,6 +3676,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_capability_revoke" => op_loader_capability_revoke,
         "__loader_capability_drop" => op_loader_capability_drop,
         "__loader_capability_target" => op_loader_capability_target,
+        "__loader_capability_allowlist" => op_loader_capability_allowlist,
         "__loader_drop" => op_loader_drop,
         "__do_call" => op_do_call,
         "__writePosition" => op_write_position,
@@ -4169,6 +4184,29 @@ fn loader_throw(scope: &mut v8::PinScope, message: &str) {
     scope.throw_exception(exception);
 }
 
+fn loader_string_array(
+    scope: &mut v8::PinScope,
+    value: v8::Local<v8::Value>,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(Vec::new());
+    }
+    let array = v8::Local::<v8::Array>::try_from(value)
+        .map_err(|_| format!("worker loader: {label} must be an array"))?;
+    let mut values = Vec::with_capacity(array.length() as usize);
+    for index in 0..array.length() {
+        let value = array
+            .get_index(scope, index)
+            .ok_or_else(|| format!("worker loader: {label} entry is missing"))?;
+        if !value.is_string() {
+            return Err(format!("worker loader: {label} entries must be strings"));
+        }
+        values.push(value.to_rust_string_lossy(scope));
+    }
+    Ok(values)
+}
+
 async fn loaded_worker_slot(
     mut state: tokio::sync::watch::Receiver<LoaderState>,
 ) -> Result<Arc<crate::pool::Slot>, String> {
@@ -4345,8 +4383,9 @@ fn op_loader_load(
         }
     }
     let capability_sideband = args.get(2);
+    let outbound_sideband = args.get(3);
     let host_scope = current_context().cell_scope();
-    let host_slot = if capability_sideband.is_undefined() {
+    let host_slot = if capability_sideband.is_undefined() && outbound_sideband.is_undefined() {
         Weak::new()
     } else {
         let Some(slot) = current_slot() else {
@@ -4360,15 +4399,21 @@ fn op_loader_load(
     let owner = host_state.owner_id;
 
     // globalOutbound: absent inherits the caller's authority, null denies
-    // ambient egress, a Fetcher (broker) is not implemented yet.
-    let egress = match code.get("globalOutbound") {
-        None => actor_runtime_state(scope).egress,
-        Some(v) if v.is_null() => EgressPolicy::Deny,
-        Some(_) => {
-            return loader_throw(
-                scope,
-                "worker loader: globalOutbound broker is not implemented yet",
-            );
+    // ambient egress, and the explicit sideband is a host-owned Fetcher
+    // broker. The broker never becomes a JSON env value or a direct network
+    // client in the loaded isolate.
+    let egress = if !outbound_sideband.is_undefined() {
+        EgressPolicy::Deny
+    } else {
+        match code.get("globalOutbound") {
+            None => actor_runtime_state(scope).egress,
+            Some(v) if v.is_null() => EgressPolicy::Deny,
+            Some(_) => {
+                return loader_throw(
+                    scope,
+                    "worker loader: globalOutbound must be null or an explicit Fetcher broker",
+                );
+            }
         }
     };
     // Bound live loaded workers so a runaway agent loop cannot exhaust
@@ -4389,8 +4434,8 @@ fn op_loader_load(
     }));
     compat.js_rpc = true;
     let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mut loader_capabilities = Vec::new();
-    let mut loaded_capabilities = HashMap::new();
+    let mut loader_capabilities: Vec<LoaderCapabilityBinding> = Vec::new();
+    let mut loaded_capabilities: HashMap<String, Arc<LoadedCapability>> = HashMap::new();
     let mut host_capabilities = Vec::new();
     if !capability_sideband.is_undefined() {
         let Ok(entries) = v8::Local::<v8::Array>::try_from(capability_sideband) else {
@@ -4433,16 +4478,59 @@ fn op_loader_load(
                 kind,
                 celld_logic::capability::CapabilityKind::Workspace
                     | celld_logic::capability::CapabilityKind::Library
+                    | celld_logic::capability::CapabilityKind::Fetcher
+                    | celld_logic::capability::CapabilityKind::Tools
             ) {
                 return loader_throw(
                     scope,
-                    &format!("worker loader: capability kind {kind_name:?} is not enabled yet"),
+                    &format!("worker loader: capability kind {kind_name:?} is not enabled"),
                 );
             }
-            if !target.is_object() || loaded_capabilities.contains_key(&name) {
+            if !target.is_object()
+                || loader_capabilities
+                    .iter()
+                    .any(|capability| capability.name == name)
+            {
                 return loader_throw(
                     scope,
                     &format!("worker loader: invalid or duplicate capability {name:?}"),
+                );
+            }
+            let catalog = pair
+                .get_index(scope, 3)
+                .filter(|value| !value.is_undefined() && !value.is_null())
+                .map(|value| {
+                    if !value.is_string() {
+                        return Err("worker loader: tool catalog must be a JSON string".to_string());
+                    }
+                    let catalog = value.to_rust_string_lossy(scope);
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&catalog).map_err(|_| {
+                            "worker loader: tool catalog must be valid JSON".to_string()
+                        })?;
+                    if !parsed.is_array() {
+                        return Err("worker loader: tool catalog must be an array".to_string());
+                    }
+                    Ok(catalog)
+                })
+                .transpose();
+            let Ok(catalog) = catalog else {
+                return loader_throw(scope, "worker loader: malformed tool catalog");
+            };
+            if kind == celld_logic::capability::CapabilityKind::Tools && catalog.is_none() {
+                return loader_throw(scope, "worker loader: tools require an approved catalog");
+            }
+            let allowlist = match pair.get_index(scope, 4) {
+                Some(value) => match loader_string_array(scope, value, "Fetcher allowlist") {
+                    Ok(allowlist) => allowlist,
+                    Err(error) => return loader_throw(scope, &error),
+                },
+                None => Vec::new(),
+            };
+            if kind == celld_logic::capability::CapabilityKind::Fetcher && allowlist.is_empty() {
+                return loader_throw(
+                    scope,
+                    "worker loader: Fetcher brokers require a non-empty allowlist",
                 );
             }
             let token = next_capability_token();
@@ -4456,6 +4544,7 @@ fn op_loader_load(
                 name: name.clone(),
                 token: token.clone(),
                 kind,
+                catalog,
             });
             loaded_capabilities.insert(
                 token.clone(),
@@ -4470,9 +4559,83 @@ fn op_loader_load(
                     owner,
                     kind,
                     target: v8::Global::new(scope, target),
+                    allowlist,
                 },
             ));
         }
+    }
+    let mut loader_outbound = None;
+    if !outbound_sideband.is_undefined() {
+        let Some(pair) = v8::Local::<v8::Array>::try_from(outbound_sideband).ok() else {
+            return loader_throw(
+                scope,
+                "worker loader: globalOutbound broker must be an array",
+            );
+        };
+        let Some(kind_value) = pair.get_index(scope, 0).filter(|value| value.is_string()) else {
+            return loader_throw(
+                scope,
+                "worker loader: globalOutbound broker kind is missing",
+            );
+        };
+        let Some(target) = pair.get_index(scope, 1) else {
+            return loader_throw(
+                scope,
+                "worker loader: globalOutbound broker target is missing",
+            );
+        };
+        let kind_name = kind_value.to_rust_string_lossy(scope);
+        let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+            return loader_throw(
+                scope,
+                "worker loader: unsupported globalOutbound broker kind",
+            );
+        };
+        if kind != celld_logic::capability::CapabilityKind::Fetcher || !target.is_object() {
+            return loader_throw(
+                scope,
+                "worker loader: globalOutbound must be an explicit Fetcher broker",
+            );
+        }
+        let allowlist = match pair.get_index(scope, 2) {
+            Some(value) => match loader_string_array(scope, value, "Fetcher allowlist") {
+                Ok(allowlist) => allowlist,
+                Err(error) => return loader_throw(scope, &error),
+            },
+            None => Vec::new(),
+        };
+        if allowlist.is_empty() {
+            return loader_throw(
+                scope,
+                "worker loader: Fetcher brokers require a non-empty allowlist",
+            );
+        }
+        let token = next_capability_token();
+        let lifecycle = Arc::new(CapabilityLifecycle::live());
+        let grant = celld_logic::capability::CapabilityGrant {
+            owner,
+            worker: id,
+            kind,
+        };
+        loaded_capabilities.insert(
+            token.clone(),
+            Arc::new(LoadedCapability { grant, lifecycle }),
+        );
+        host_capabilities.push((
+            token.clone(),
+            HostCapability {
+                owner,
+                kind,
+                target: v8::Global::new(scope, target),
+                allowlist,
+            },
+        ));
+        loader_outbound = Some(LoaderCapabilityBinding {
+            name: String::new(),
+            token,
+            kind,
+            catalog: None,
+        });
     }
     if !host_capabilities.is_empty() {
         host_state
@@ -4500,7 +4663,7 @@ fn op_loader_load(
         .with_main_module(main.to_string())
         .with_egress(egress)
         .with_loader_env(loader_env)
-        .with_loader_capabilities(id, loader_capabilities),
+        .with_loader_capabilities(id, loader_capabilities, loader_outbound),
     );
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
@@ -4873,6 +5036,7 @@ fn op_loader_capability_grant(
                 owner: entry.owner,
                 kind,
                 target: v8::Global::new(scope, target),
+                allowlist: Vec::new(),
             },
         );
     rv.set(v8::String::new(scope, &token).unwrap().into());
@@ -5207,6 +5371,41 @@ fn op_loader_capability_target(
         return loader_throw(scope, "worker loader: unknown or mismatched capability");
     };
     rv.set(v8::Local::new(scope, &capability.target));
+}
+
+/// Resolve the URL allowlist for a Fetcher broker. This is host-only metadata;
+/// the loaded worker cannot replace it because the owner/token/kind check is
+/// repeated against the host isolate's registry.
+fn op_loader_capability_allowlist(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let owner = args.get(0).to_rust_string_lossy(scope).parse::<u64>();
+    let Ok(owner) = owner else {
+        return loader_throw(scope, "worker loader: malformed capability owner");
+    };
+    let token = args.get(1).to_rust_string_lossy(scope);
+    let kind_name = args.get(2).to_rust_string_lossy(scope);
+    let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+        return loader_throw(scope, "worker loader: unsupported capability kind");
+    };
+    let state = actor_runtime_state(scope);
+    if state.owner_id != owner {
+        return loader_throw(scope, "worker loader: capability owner mismatch");
+    }
+    let capabilities = state
+        .capabilities
+        .lock()
+        .expect("capability registry poisoned");
+    let Some(capability) = capabilities
+        .get(&token)
+        .filter(|capability| capability.owner == owner && capability.kind == kind)
+    else {
+        return loader_throw(scope, "worker loader: unknown or mismatched capability");
+    };
+    let allowlist = serde_json::to_string(&capability.allowlist).unwrap_or_else(|_| "[]".into());
+    rv.set(v8::String::new(scope, &allowlist).unwrap().into());
 }
 
 /// `__loader_drop(id)` — evict a loaded worker. Called from a
@@ -7359,7 +7558,8 @@ mod bootstrap;
 mod modules;
 use bootstrap::{
     adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
-    inject_compatibility_flags, inject_crons, inject_namespace_keys, inject_routing,
+    inject_compatibility_flags, inject_crons, inject_loader_outbound, inject_namespace_keys,
+    inject_routing,
     inject_storage_compatibility, install_harness, install_prelude, populate_cf_exports,
     register_class, register_entrypoints,
 };

@@ -21,6 +21,8 @@ pub enum CapabilityKind {
     Fetcher,
     /// A host-owned library with a deliberately small method surface.
     Library,
+    /// A host-approved catalog with an explicit tool invocation broker.
+    Tools,
 }
 
 impl CapabilityKind {
@@ -30,6 +32,7 @@ impl CapabilityKind {
             "workspace" => Some(Self::Workspace),
             "fetcher" => Some(Self::Fetcher),
             "library" => Some(Self::Library),
+            "tool" | "tools" => Some(Self::Tools),
             _ => None,
         }
     }
@@ -40,6 +43,7 @@ impl CapabilityKind {
             Self::Workspace => "workspace",
             Self::Fetcher => "fetcher",
             Self::Library => "library",
+            Self::Tools => "tools",
         }
     }
 }
@@ -225,6 +229,15 @@ mod tests {
         assert_eq!(
             authorize(Some(GRANT), 7, 11, CapabilityKind::Workspace, false),
             Err(AuthorizationError::NotLive)
+        );
+        let tool_grant = CapabilityGrant {
+            owner: 7,
+            worker: 11,
+            kind: CapabilityKind::Tools,
+        };
+        assert_eq!(
+            authorize(Some(tool_grant), 7, 11, CapabilityKind::Tools, true),
+            Ok(tool_grant)
         );
         assert_eq!(
             authorize(None, 7, 11, CapabilityKind::Workspace, true),
