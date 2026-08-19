@@ -255,6 +255,9 @@ test("host env injection materializes only opaque loaded-worker proxies", async 
   assert.match(harness, /agentGenerations/);
   assert.match(harness, /Agent scope was evicted/);
   assert.match(runtime, /clear_loader_agent/);
+  assert.match(runtime, /buffer_streams: true/);
+  assert.match(harness, /__bufferRpcStreams/);
+  assert.match(harness, /__celld\$bufferedStream/);
   assert.match(runtime, /worker loader: host internal operation is unavailable/);
   assert.match(runtime, /CapabilityKind::Tools/);
   assert.match(runtime, /release_loader_capabilities/);
@@ -276,7 +279,7 @@ test("capability interruption classes and clone-only transport are explicit", as
     "cancelled", "timed_out", "isolate_failure", "capability_failure",
     "host_cell_lost", "worker_disposed",
   ]) assert.match(logic, new RegExp(name));
-  assert.match(docs, /streams, stream handles,\s+backpressure/);
+  assert.match(docs, /byte-shaped result streams are buffered/);
   assert.match(docs, /losing ownership/);
 });
 

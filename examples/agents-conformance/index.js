@@ -67,7 +67,7 @@ import wasm from "./add.wasm";
 
 export default class extends WorkerEntrypoint {
   async run(input) {
-    const { instance } = new WebAssembly.Instance(wasm);
+    const instance = new WebAssembly.Instance(wasm);
     return { input, label, sum: instance.exports.add(20, 22) };
   }
 }
@@ -690,8 +690,7 @@ export class ConformanceAgent extends withWorkspace(
     }
     await this.setName(name);
     const workspace = await getWorkspace(this);
-    const run = await workspace.runtime.exec({
-      command,
+    const run = await workspace.runtime.exec(command, {
       backend: "worker-shell",
       encoding: "utf8",
       cwd: input?.cwd,
@@ -743,7 +742,7 @@ export class ConformanceAgent extends withWorkspace(
     await this.setName(name);
 
     const workspace = await getWorkspace(this);
-    if (!workspace.runtime.isCallable("worker-javascript")) {
+    if (this.env?.LOADER === undefined) {
       throw new Error(
         "Worker JavaScript backend is unavailable; set CELLD_WORKER_LOADER=LOADER",
       );
@@ -761,11 +760,11 @@ export class ConformanceAgent extends withWorkspace(
       await workspace.fs.mkdir("/workspace", { recursive: true });
       await workspace.fs.writeFile(
         "/workspace/helper.js",
-        "export const suffix = \":sibling\";\\n",
+        "export const suffix = \":sibling\";\n",
       );
       await workspace.fs.writeFile(
         "/workspace/javascript-input.txt",
-        "workspace\\n",
+        "workspace\n",
       );
     }
 
@@ -819,7 +818,7 @@ export class ConformanceAgent extends withWorkspace(
       modules: {
         "workspace/main.js": LOADER_MODULE_SOURCE,
         "workspace/nested/loader-helper.js":
-          "export const label = \":loader-sibling\";\\n",
+          "export const label = \":loader-sibling\";\n",
         "workspace/add.wasm": { wasm: WASM_ADD },
       },
       compatibilityDate: "2026-01-01",

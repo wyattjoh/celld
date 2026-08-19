@@ -2523,21 +2523,17 @@ fn begin<'s>(
     job: crate::WorkerJob,
 ) -> Begun {
     let job = match job {
-        crate::WorkerJob::Capability {
-            owner,
-            token,
-            kind,
-            path,
-            args,
-            cancel,
-            reply,
-        } => return begin_capability(tc, owner, token, kind, path, args, cancel, reply),
+        job @ crate::WorkerJob::Capability { .. } => return begin_capability(tc, job),
         crate::WorkerJob::Rpc {
             entrypoint,
             method,
             args,
+            buffer_streams,
             reply,
-        } => return begin_entrypoint_rpc(tc, &entrypoint, &method, args, reply),
+            ..
+        } => {
+            return begin_entrypoint_rpc(tc, &entrypoint, &method, args, buffer_streams, reply);
+        }
         job => job,
     };
     let crate::WorkerJob::Fetch {
@@ -2610,6 +2606,7 @@ fn begin_entrypoint_rpc(
     entrypoint: &str,
     method: &str,
     args: Vec<u8>,
+    buffer_streams: bool,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
     let context = IoContext::new();
@@ -2627,8 +2624,20 @@ fn begin_entrypoint_rpc(
         let args = bytes_value(tc, args);
         let recv = v8::undefined(tc).into();
         begin_event_context(tc)?;
+        let local = v8::Boolean::new(tc, false);
+        let buffer_streams = v8::Boolean::new(tc, buffer_streams);
         let ret = f
-            .call(tc, recv, &[entrypoint.into(), method.into(), args])
+            .call(
+                tc,
+                recv,
+                &[
+                    entrypoint.into(),
+                    method.into(),
+                    args,
+                    local.into(),
+                    buffer_streams.into(),
+                ],
+            )
             .ok_or_else(|| anyhow!("entrypoint RPC threw"))?;
         match ret.try_cast::<v8::Promise>() {
             Ok(promise) => Ok(promise),
@@ -2671,16 +2680,19 @@ fn begin_entrypoint_rpc(
 /// Start one host-side loaded-worker capability call. The dispatcher resolves
 /// the opaque target in this isolate, invokes exactly one method, and returns
 /// the result through the structured-clone envelope.
-fn begin_capability(
-    tc: &mut v8::PinScope,
-    owner: String,
-    token: String,
-    kind: String,
-    path: Vec<String>,
-    args: Vec<u8>,
-    cancel: tokio::sync::oneshot::Receiver<()>,
-    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
-) -> Begun {
+fn begin_capability(tc: &mut v8::PinScope, job: crate::WorkerJob) -> Begun {
+    let crate::WorkerJob::Capability {
+        owner,
+        token,
+        kind,
+        path,
+        args,
+        cancel,
+        reply,
+    } = job
+    else {
+        return Begun::Nothing;
+    };
     let context = IoContext::new();
     let guard = CurrentGuard::enter(context.clone());
     let started = (|| {
@@ -3348,10 +3360,8 @@ impl Worker {
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
 
-            let module = match compile_module(scope, &config.main_module, src) {
-                Some(m) => m,
-                None => return Err(anyhow!("compile: {}", exc!(scope))),
-            };
+            let module = compile_module(scope, &config.main_module, src)
+                .ok_or_else(|| anyhow!("compile: {}", exc!(scope)))?;
             register_stubs(scope, src, &config.modules); // cloudflare:*/node:* + text modules
             register_wasm_modules(scope, &config.modules);
             register_main_module(scope, &config.main_module, module);
@@ -3419,20 +3429,39 @@ impl Worker {
             // tell the harness which cells are local (route the rest cross-node)
             inject_routing(scope, owned.as_ref(), node)?;
 
-            // entry fetch
+            // Entry fetch. Loaded Worker Entrypoints (such as the Computer
+            // Worker Shell's named `ShellWorker` export) do not need a
+            // default fetch handler; they are driven only through the RPC
+            // registry below. Keep a harmless placeholder so the shared
+            // Worker turn machinery can still own one realm fetch slot.
             let dk = v8::String::new(scope, "default").unwrap();
-            let default = ns
-                .get(scope, dk.into())
-                .ok_or_else(|| anyhow!("no default export"))?
-                .to_object(scope)
-                .ok_or_else(|| anyhow!("default not object"))?;
+            let default_value = ns.get(scope, dk.into());
+            let default_exists = default_value.is_some();
+            let default_object = default_value.and_then(|value| value.to_object(scope));
+            let loaded_without_default =
+                config.loader_worker_id.is_some() && default_object.is_none();
+            let default = match default_object {
+                Some(value) => value,
+                None if loaded_without_default => v8::Object::new(scope),
+                None if default_exists => return Err(anyhow!("default not object")),
+                None => return Err(anyhow!("no default export")),
+            };
             let fk = v8::String::new(scope, "fetch").unwrap();
-            let fetch_value = default
-                .get(scope, fk.into())
-                .ok_or_else(|| anyhow!("no fetch"))?;
+            let fetch_value: v8::Local<v8::Value> = if loaded_without_default {
+                v8::undefined(scope).into()
+            } else {
+                default
+                    .get(scope, fk.into())
+                    .ok_or_else(|| anyhow!("no fetch"))?
+            };
             let default_is_entrypoint =
                 default.is_function() && cell_registry_has(scope, "entrypoints", "default")?;
-            let f: v8::Local<v8::Function> = if fetch_value.is_function() {
+            let f: v8::Local<v8::Function> = if loaded_without_default {
+                compile_fn(
+                    scope,
+                    "() => { throw new Error('loaded worker has no default fetch handler'); }",
+                )?
+            } else if fetch_value.is_function() {
                 fetch_value.try_into().expect("function casts to Function")
             } else if default_is_entrypoint {
                 // A class-based default entrypoint (extends WorkerEntrypoint)
@@ -5079,16 +5108,17 @@ fn op_loader_load(
     if agent_scope.len() > 1024 {
         return loader_throw(scope, "worker loader: Agent scope exceeds the 1 KiB limit");
     }
-    let host_slot = if capability_sideband.is_undefined() && outbound_sideband.is_undefined() {
-        Weak::new()
-    } else {
-        let Some(slot) = current_slot() else {
+    let host_slot = match current_slot() {
+        Some(slot) => Arc::downgrade(&slot),
+        None if capability_sideband.is_undefined() && outbound_sideband.is_undefined() => {
+            Weak::new()
+        }
+        None => {
             return loader_throw(
                 scope,
                 "worker loader: capability grants require an entered host isolate",
             );
-        };
-        Arc::downgrade(&slot)
+        }
     };
     let owner = host_state.owner_id;
 
@@ -5655,6 +5685,7 @@ fn op_loader_rpc(
             entrypoint,
             method,
             args: call_args,
+            buffer_streams: true,
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive_loaded_worker(slot, job));

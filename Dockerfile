@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG RUST_VERSION=1.97.1
+ARG NODE_VERSION=22
 ARG CELLD_COMMIT=unknown
 
 FROM rust:${RUST_VERSION}-bookworm AS build
@@ -32,6 +33,12 @@ RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,
     --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
     cargo test --profile "${CELLD_PROFILE}" --locked && \
     cargo clippy --profile "${CELLD_PROFILE}" --all-targets --locked -- -D warnings
+
+# Local Compose uses this opt-in target for one-shot deployment. The published
+# runtime remains the final, minimal stage below and does not ship Node/npm.
+FROM node:${NODE_VERSION}-bookworm-slim AS deployer
+COPY --from=test /out/celld /usr/local/bin/celld
+RUN npm install --global esbuild@0.28.2
 
 FROM debian:bookworm-slim
 RUN apt-get update && \

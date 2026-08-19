@@ -239,8 +239,11 @@ a stable `code` and `retryable` property, and pressure shedding rejects only
 new Code Mode work. Idle loaded workers may be evicted under pressure, while
 active calls finish their lifecycle and host mutations still use the owning
 cell's normal output gate. A loaded worker serves `fetch()` and single RPC
-method calls. Capability values use an opaque sideband; host objects and
-credentials never enter the loaded Worker's JSON environment. The sideband
+method calls. Named loaded-worker RPC results and byte-shaped capability
+results may carry bounded `Uint8Array` `ReadableStream`s; celld buffers them
+at the isolate boundary for Worker Shell's framed events and Workspace file
+reads. Capability values use an opaque sideband; host objects and credentials
+never enter the loaded Worker's JSON environment. The sideband
 supports the pinned Workspace, Library, Tools, and Fetcher proxy surfaces:
 
 ```js
@@ -281,11 +284,11 @@ capability exposes only `fetch()`, and its non-empty allowlist is checked by
 origin and path before the host target is called. Responses cross back as
 bounded structured-clone data/streams; broker response bodies are materialized
 before crossing the host boundary, and every runtime stream handle is
-owner-bound before it can be read, canceled, or tee'd. Arbitrary capability
-arguments and results remain clone-only: streams, stream handles, backpressure,
-and disposable result graphs are unsupported. The target stays rooted in the
-owning Agent isolate, so provider credentials and fleet bindings remain
-host-side.
+owner-bound before it can be read, canceled, or tee'd. Capability arguments
+remain clone-only; byte-shaped result streams are buffered within the same
+bounded transport limit, so live backpressure and arbitrary stream values are
+unsupported. The target stays rooted in the owning Agent isolate, so provider
+credentials and fleet bindings remain host-side.
 
 celld checks the host owner, Agent-loaded-worker identity, capability kind,
 allowlist, and liveness before every call. Capability and worker handles use

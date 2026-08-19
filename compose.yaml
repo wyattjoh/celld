@@ -1,0 +1,138 @@
+name: celld-local
+
+x-storage-environment: &storage-environment
+  AWS_ACCESS_KEY_ID: celld-local
+  AWS_SECRET_ACCESS_KEY: celld-local-secret
+  AWS_REGION: us-east-1
+  CELLD_BUCKET: s3://celld
+  S3_ENDPOINT: http://minio:9000
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: celld-local
+      MINIO_ROOT_PASSWORD: celld-local-secret
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        until mc alias set local http://minio:9000 celld-local celld-local-secret; do
+          sleep 1;
+        done;
+        mc mb --ignore-existing local/celld
+    restart: "no"
+
+  deployer:
+    build:
+      context: .
+      target: deployer
+      args:
+        CELLD_PROFILE: lab
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    working_dir: /workspace
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        npm ci --legacy-peer-deps --no-audit --no-fund &&
+        celld deploy .
+    environment:
+      <<: *storage-environment
+      CELLD_ESBUILD: /usr/local/bin/esbuild
+    volumes:
+      - ./examples/agents-conformance:/workspace:ro
+      - agents-node-modules:/workspace/node_modules
+    restart: "no"
+
+  model-provider:
+    image: node:22-bookworm-slim
+    working_dir: /workspace
+    command:
+      - node
+      - scripts/model-provider.mjs
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8788"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8788/health').then((response) => {
+            if (!response.ok) process.exit(1);
+          }).catch(() => process.exit(1));
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - ./examples/agents-conformance:/workspace:ro
+    init: true
+
+  celld:
+    build:
+      context: .
+      args:
+        CELLD_PROFILE: lab
+    depends_on:
+      deployer:
+        condition: service_completed_successfully
+      model-provider:
+        condition: service_healthy
+    environment:
+      <<: *storage-environment
+      CELLD_ADDR: 0.0.0.0:8080
+      CELLD_INTERNAL_ADDR: 0.0.0.0:8081
+      CELLD_ADVERTISE: celld:8081
+      CELLD_WATCH: /var/lib/celld/state
+      CELLD_WORKER_LOADER: LOADER
+      CELLD_VAR_MODEL_PROVIDER_URL: http://model-provider:8788/v1/chat
+      CELLD_AI_URL: http://model-provider:8788/v1/ai
+      CELLD_ALARM_RESIDENT_MS: "0"
+      # MinIO is convenient for this single-node lab but is not a supported
+      # production fencing backend; skip only the startup provider probe here.
+      CELLD_STORAGE_PROBE: "0"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - celld-state:/var/lib/celld
+    init: true
+    stop_grace_period: 30s
+
+  e2e:
+    image: node:22-bookworm-slim
+    profiles: ["test"]
+    depends_on:
+      celld:
+        condition: service_started
+    working_dir: /workspace
+    command: ["npm", "run", "e2e"]
+    environment:
+      CELLD_URL: http://celld:8080
+      CELLD_REQUEST_TIMEOUT_MS: "15000"
+      CELLD_READINESS_TIMEOUT_MS: "120000"
+    volumes:
+      - ./examples/agents-conformance:/workspace:ro
+    init: true
+    restart: "no"
+
+volumes:
+  agents-node-modules:
+  celld-state:
+  minio-data:

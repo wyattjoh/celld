@@ -192,6 +192,10 @@ pub enum WorkerJob {
         entrypoint: String,
         method: String,
         args: Vec<u8>,
+        /// Buffer returned ReadableStreams when the RPC crosses a loaded
+        /// Worker boundary. The loader currently transports one bounded
+        /// byte stream as a cloneable value.
+        buffer_streams: bool,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
     /// Invoke one explicitly granted loaded-worker capability in its host

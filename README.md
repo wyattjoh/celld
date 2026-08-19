@@ -83,6 +83,48 @@ docker run --rm --network host \
 Drop `--endpoint` and `--region` for AWS S3. Expose port 8080 through the load
 balancer, and keep port 8081 on the private network.
 
+### Local Agents and Code Mode stack
+
+The repository's Compose stack builds celld from the current checkout, starts
+MinIO and a deterministic model-provider double, creates a local bucket,
+deploys the pinned [`agents-conformance`](examples/agents-conformance/README.md)
+application, and starts celld with Worker Loader enabled:
+
+```sh
+docker compose up --build -d celld
+docker compose --profile test run --rm e2e
+```
+
+The E2E runner waits for celld and then exercises two independently named
+Agents, state and SQL isolation, Workspace files, Worker Shell, Worker
+JavaScript and loader modules, streamed chat and resume, the HTTP AI adapter,
+and delayed Agent scheduling. Each check prints a `PASS` line. The public
+Worker listener is at <http://127.0.0.1:8080>, MinIO's API and console are at
+<http://127.0.0.1:9000> and <http://127.0.0.1:9001>, and the private operator
+listener is bound only to <http://127.0.0.1:8081> for manual lifecycle tests.
+
+After changing the Worker fixture, deploy it again and restart the node because
+running nodes intentionally retain the deployment they loaded at startup:
+
+```sh
+docker compose run --rm deployer
+docker compose restart celld
+```
+
+Inspect or stop the stack with:
+
+```sh
+docker compose logs -f celld
+docker compose down          # keep local MinIO/celld data
+docker compose down --volumes # reset the entire lab
+```
+
+The Compose credentials are fixed local-development values. MinIO Community
+Edition does not satisfy celld's production fencing support contract, so this
+single-node lab explicitly disables the startup storage-provider probe. Never
+reuse this Compose topology, its credentials, or that probe override for a
+production fleet.
+
 ## Run it
 
 celld uses the standard AWS credential chain. Deploy to an S3-compatible

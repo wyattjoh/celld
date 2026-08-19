@@ -1982,6 +1982,7 @@ impl StatelessRuntime {
             entrypoint,
             method,
             args,
+            buffer_streams: false,
             reply,
         };
         let driving = tokio::spawn(drive_affiliated(

@@ -152,6 +152,7 @@ test("Worker Shell source is pinned, loaded, capability-scoped, and no-egress", 
   assert.match(sourceText, /WorkerShellBackend/);
   assert.match(sourceText, /egress: \{ mode: "none" \}/);
   assert.match(sourceText, /backend: "worker-shell"/);
+  assert.match(sourceText, /workspace\.runtime\.exec\(command,/);
   assert.match(sourceText, /unsupported_command/);
   assert.match(sourceText, /timed_out/);
   assert.match(sourceText, /WorkspaceServiceProxy/);

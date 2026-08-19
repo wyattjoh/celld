@@ -458,13 +458,15 @@ fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str) {
     // spelling, while referrer-aware resolution below handles nested relative
     // imports without making basename collisions authoritative.
     if let Some((_, basename)) = name.rsplit_once('/') {
-        if !registry.modules.contains_key(basename) {
-            registry.modules.insert(basename.to_string(), g.clone());
-        }
+        registry
+            .modules
+            .entry(basename.to_string())
+            .or_insert_with(|| g.clone());
         let relative = format!("./{basename}");
-        if !registry.modules.contains_key(&relative) {
-            registry.modules.insert(relative, g.clone());
-        }
+        registry
+            .modules
+            .entry(relative)
+            .or_insert_with(|| g.clone());
     }
     if let Some(script_id) = script_id {
         registry.canonical_names.insert(script_id, name.to_string());
@@ -798,6 +800,29 @@ fn dynamic_namespace<'s>(
         .get(&key)
         .map(|g| v8::Local::new(scope, g));
     if let Some(module) = cached {
+        return Ok(module.get_module_namespace());
+    }
+    let registered = modreg(scope)
+        .0
+        .lock()
+        .unwrap()
+        .modules
+        .get(spec)
+        .map(|module| v8::Local::new(scope, module));
+    if let Some(module) = registered {
+        if module.get_status() == v8::ModuleStatus::Uninstantiated {
+            module
+                .instantiate_module(scope, resolve_external)
+                .ok_or_else(|| anyhow!("dynamic module for {spec} did not link"))?;
+        }
+        if module.get_status() == v8::ModuleStatus::Instantiated {
+            module
+                .evaluate(scope)
+                .ok_or_else(|| anyhow!("dynamic module for {spec} did not evaluate"))?;
+        }
+        if module.get_status() != v8::ModuleStatus::Evaluated {
+            return Err(anyhow!("dynamic module for {spec} failed to evaluate"));
+        }
         return Ok(module.get_module_namespace());
     }
     let src = full_surface_source(scope, spec, &Default::default())

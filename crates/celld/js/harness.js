@@ -1593,36 +1593,41 @@ const __loaderCapabilityFinalizer = typeof FinalizationRegistry === "function"
 // methods on that returned value. The returned value is still a capability,
 // not a cross-isolate RPC stub: the marker below revives as another view of
 // the same opaque handle, rooted at the method path that produced it.
-const __loaderCapabilityRevive = (value) => {
-  const seen = new Set();
-  const revive = (current) => {
-    if (current === null || typeof current !== "object") return current;
-    const marker = current["__celld$loaderCapability"];
-    if (marker !== undefined && marker !== null &&
-        typeof marker === "object" &&
-        typeof marker.token === "string" &&
-        typeof marker.kind === "string" && Array.isArray(marker.path)) {
-      const workerId = globalThis.__loaderWorkerId;
-      if (typeof workerId !== "string")
-        throw new Error("worker loader: capability result has no worker owner");
-      return __makeLoaderCapability(
-        workerId, marker.token, marker.kind, marker.path,
-      );
-    }
-    if (seen.has(current)) return current;
-    seen.add(current);
-    if (Array.isArray(current)) {
-      for (let index = 0; index < current.length; index++)
-        current[index] = revive(current[index]);
+const __loaderCapabilityRevive = (() => {
+  let factory;
+  const reviveValue = (value) => {
+    const seen = new Set();
+    const revive = (current) => {
+      if (current === null || typeof current !== "object") return current;
+      const marker = current["__celld$loaderCapability"];
+      if (marker !== undefined && marker !== null &&
+          typeof marker === "object" &&
+          typeof marker.token === "string" &&
+          typeof marker.kind === "string" && Array.isArray(marker.path)) {
+        const workerId = globalThis.__loaderWorkerId;
+        if (typeof workerId !== "string")
+          throw new Error("worker loader: capability result has no worker owner");
+        return factory(workerId, marker.token, marker.kind, marker.path);
+      }
+      if (seen.has(current)) return current;
+      seen.add(current);
+      if (Array.isArray(current)) {
+        for (let index = 0; index < current.length; index++)
+          current[index] = revive(current[index]);
+        return current;
+      }
+      const proto = Object.getPrototypeOf(current);
+      if (proto !== Object.prototype && proto !== null) return current;
+      for (const key of Object.keys(current)) current[key] = revive(current[key]);
       return current;
-    }
-    const proto = Object.getPrototypeOf(current);
-    if (proto !== Object.prototype && proto !== null) return current;
-    for (const key of Object.keys(current)) current[key] = revive(current[key]);
-    return current;
+    };
+    return revive(value);
   };
-  return revive(value);
-};
+  Object.defineProperty(reviveValue, "__setFactory", {
+    value: (value) => { factory = value; },
+  });
+  return reviveValue;
+})();
 
 const __loaderCapabilityDeserialize = (bytes) =>
   __loaderCapabilityRevive(__rpcDes(bytes));
@@ -1792,6 +1797,9 @@ globalThis.__makeLoaderCapability = (
   return root;
 };
 
+__loaderCapabilityRevive.__setFactory(globalThis.__makeLoaderCapability);
+delete __loaderCapabilityRevive.__setFactory;
+
 globalThis.__makeLoaderOutbound = (workerId, token) => async (req) => {
   const body = ["GET", "HEAD"].includes(req.method)
     ? null : await req._consume();
@@ -1937,7 +1945,7 @@ globalThis.__dispatchLoaderCapability =
     } finally {
       workspaceView?.[Symbol.dispose]?.();
     }
-  }, false);
+  }, false, true);
 
 const __loaderClearers = [];
 globalThis.__clearLoaderAgent = (agentScope) => {
@@ -3205,6 +3213,10 @@ const __stubOp = (meta, path, args) => {
           entry.section !== block.holder))
         await __gate_wait(cell);
     }
+    // Same-isolate RPC can mutate cell storage without passing through the
+    // Rust cell-event output gate. Hold a stub reply behind that gate so a
+    // following capability call observes the write.
+    const gateBefore = cell === undefined ? null : __writePosition(cell);
     const reply = await __ctxRun(entry.ctx,
       () => __rpcRun(async () => {
         const decoded =
@@ -3218,6 +3230,11 @@ const __stubOp = (meta, path, args) => {
               __disposeStub(handle);
         }
       }, true));
+    if (gateBefore !== null) {
+      const after = __writePosition(cell);
+      if (after !== null && after > gateBefore)
+        await __gateWrite(cell, after);
+    }
     if (__abortedCtxs.size !== 0) {
       const aborted = __abortedCtxs.get(entry.ctx);
       if (aborted !== undefined)
@@ -3576,10 +3593,89 @@ const __rpcErrOut = (error) => {
   }
   return __tagged(0, sc);
 };
+// Buffer byte streams for loader boundaries that cross isolates. A loaded
+// Worker Shell returns a finite framed event stream, and Workspace file reads
+// return byte streams; the native loader transport is clone-only, so carry
+// each bounded stream as one byte value and revive it on the receiving
+// isolate.
+const __bufferRpcStreams = async (value, seen = new Map()) => {
+  if (value instanceof ReadableStream) {
+    const reader = value.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        if (!(next.value instanceof Uint8Array)) {
+          throw new TypeError(
+            "cross-isolate RPC streams must yield Uint8Array chunks");
+        }
+        size += next.value.byteLength;
+        if (size > MAX_LOADER_OUTPUT_BYTES) {
+          throw new Error(
+            "cross-isolate RPC stream exceeds bounded transport size");
+        }
+        chunks.push(next.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { "__celld$bufferedStream": bytes };
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return seen.get(value);
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null && !Array.isArray(value))
+    return value;
+  const out = Array.isArray(value) ? [] : {};
+  seen.set(value, out);
+  for (const key of Object.keys(value))
+    out[key] = await __bufferRpcStreams(value[key], seen);
+  return out;
+};
+
+// The inverse of __bufferRpcStreams. The revived stream deliberately emits
+// one chunk: Worker Shell's framed decoder accepts arbitrary chunking, and a
+// single chunk keeps this compatibility bridge bounded and deterministic.
+const __reviveBufferedStreams = (value, seen = new Map()) => {
+  if (value === null || typeof value !== "object") return value;
+  const bytes = value["__celld$bufferedStream"];
+  if (bytes !== undefined) {
+    if (!(bytes instanceof Uint8Array))
+      throw new TypeError("malformed cross-isolate RPC stream");
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+  if (seen.has(value)) return seen.get(value);
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null && !Array.isArray(value))
+    return value;
+  const out = Array.isArray(value) ? [] : {};
+  seen.set(value, out);
+  for (const key of Object.keys(value))
+    out[key] = __reviveBufferedStreams(value[key], seen);
+  return out;
+};
+
 // The callee half of one RPC: run `body`, answer tagged bytes.
-const __rpcRun = async (body, lift) => {
+const __rpcRun = async (body, lift, bufferStreams = false) => {
   try {
-    return __rpcOut(await body(), lift);
+    const value = await body();
+    return __rpcOut(
+      bufferStreams ? await __bufferRpcStreams(value) : value,
+      lift,
+    );
   } catch (error) {
     return __rpcErrOut(error);
   }
@@ -3587,35 +3683,37 @@ const __rpcRun = async (body, lift) => {
 // Revive only the opaque token marker that the host-side loader encoder
 // created. The token is still checked by the native capability registry on
 // every call, so a user-forged marker cannot acquire another worker's target.
-const __reviveLoaderCapabilities = (value) => {
-  const seen = new Set();
-  const revive = (item) => {
-    if (item === null || typeof item !== "object") return item;
-    const marker = item["__celld$loaderCapability"];
-    if (marker !== undefined) {
-      if (marker === null || typeof marker !== "object" ||
-          typeof marker.worker !== "string" ||
-          typeof marker.token !== "string" ||
-          typeof marker.kind !== "string") {
-        throw new TypeError("worker loader: malformed capability value");
+const __reviveLoaderCapabilities = (() => {
+  const factory = globalThis.__makeLoaderCapability;
+  return (value) => {
+    const seen = new Set();
+    const revive = (item) => {
+      if (item === null || typeof item !== "object") return item;
+      const marker = item["__celld$loaderCapability"];
+      if (marker !== undefined) {
+        if (marker === null || typeof marker !== "object" ||
+            typeof marker.worker !== "string" ||
+            typeof marker.token !== "string" ||
+            typeof marker.kind !== "string") {
+          throw new TypeError("worker loader: malformed capability value");
+        }
+        return factory(marker.worker, marker.token, marker.kind);
       }
-      return __makeLoaderCapability(
-        marker.worker, marker.token, marker.kind);
-    }
-    if (seen.has(item)) return item;
-    seen.add(item);
-    if (Array.isArray(item)) {
-      for (let index = 0; index < item.length; index++)
-        item[index] = revive(item[index]);
+      if (seen.has(item)) return item;
+      seen.add(item);
+      if (Array.isArray(item)) {
+        for (let index = 0; index < item.length; index++)
+          item[index] = revive(item[index]);
+        return item;
+      }
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== Object.prototype && prototype !== null) return item;
+      for (const key of Object.keys(item)) item[key] = revive(item[key]);
       return item;
-    }
-    const prototype = Object.getPrototypeOf(item);
-    if (prototype !== Object.prototype && prototype !== null) return item;
-    for (const key of Object.keys(item)) item[key] = revive(item[key]);
-    return item;
+    };
+    return revive(value);
   };
-  return revive(value);
-};
+})();
 const __rpcDesArgs = (bytes) => {
   if (bytes[0] === 0xff)
     return { args: __reviveLoaderCapabilities(__sc_decode(bytes)), received: [] };
@@ -3629,7 +3727,8 @@ const __rpcDesArgs = (bytes) => {
 // callee exceptions as real Errors with the callee's own
 // properties, `.remote`, and a local (caller-side) stack.
 const __rpcDes = (bytes) => {
-  if (bytes[0] === 0xff) return __sc_decode(bytes);
+  if (bytes[0] === 0xff)
+    return __reviveBufferedStreams(__sc_decode(bytes));
   if (bytes[0] === 1 || bytes[0] === 2) {
     const { value, handles, disposers } =
       __stubRevive(__sc_decode(bytes.subarray(1)));
@@ -4153,7 +4252,9 @@ const __callObjectEntrypoint = (handler, method, args) => {
 // One entrypoint op (a call, or a property GET when argsSc is
 // null), inside a fresh request context — the callee owns stubs
 // revived from its params, and stubs it mints belong to it.
-const __entrypointOp = (name, path, argsSc, local, makeInst) => {
+const __entrypointOp = (
+  name, path, argsSc, local, makeInst, bufferStreams = false,
+) => {
   const id = __nextCtxId++;
   return __ctxRun(id, () => (async () => {
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
@@ -4187,7 +4288,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
         drain = __endEvent();
       }
       return await result;
-    }, local);
+    }, local, bufferStreams);
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
     // stream's chunks may be produced by that very work, which
@@ -4215,9 +4316,9 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
 };
 // Cross-isolate and host callers still pass a single method name.
 globalThis.__dispatchEntrypointRpc =
-  (name, path, argsSc, local = false) => __entrypointOp(
+  (name, path, argsSc, local = false, bufferStreams = false) => __entrypointOp(
     name, typeof path === "string" ? [path] : path, argsSc, local,
-    undefined);
+    undefined, bufferStreams);
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
 // by wsId — so the isolate can be hibernated between messages.

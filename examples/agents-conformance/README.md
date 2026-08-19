@@ -124,10 +124,14 @@ lifecycle transition. The WebSocket chat protocol remains reserved for ticket
 ## Verify the target
 
 ```sh
-npm ci
+npm ci --legacy-peer-deps
 npm test
 npm run check:compatibility
 ```
+
+The pinned `ai@4` target and `@cloudflare/computer`'s optional `ai@6/7`
+peer range require npm's `--legacy-peer-deps` installation mode; the lockfile
+and compatibility checks still pin and verify the reviewed dependency graph.
 
 `check:compatibility` fails with stable `[compatibility.*]` error codes if a
 pinned package, lockfile integrity, lockfile digest, compatibility setting, or
@@ -138,6 +142,32 @@ public-route and ownership-transition evidence requires the deployment steps
 below. Updating the target is a deliberate review operation: regenerate the
 lockfile, update `compatibility.json` and the matrix together, and rerun the
 tests.
+
+## Local Compose E2E runner
+
+After Compose has deployed this fixture with its deterministic model provider,
+run the dependency-free Node runner from this directory:
+
+```sh
+CELLD_URL=http://celld:8080 npm run e2e
+```
+
+`CELLD_URL` defaults to `http://127.0.0.1:8080`; use the Compose service name
+when the runner is another service on the same network. `CELLD_REQUEST_TIMEOUT_MS`
+and `CELLD_READINESS_TIMEOUT_MS` set bounded positive-integer request and
+readiness/polling limits (defaults: 10000 and 60000). The runner prints one
+`PASS` or `FAIL` line per step and covers named-Agent state/SQL isolation,
+Workspace lifecycle, Worker Shell, Worker JavaScript (including loader modules
+and cancellation), deterministic chat streaming/messages/resume, the AI
+adapter, and a delayed schedule/alarm. It requires the deployment capabilities
+already described below: `LOADER`, `MODEL_PROVIDER_URL`, and the `AI` binding
+with `CELLD_AI_URL`.
+
+It intentionally does not automate hibernating WebSockets: the pinned Node
+runtime has no dependency-free deterministic WebSocket client workflow for an
+open socket plus private cell eviction. Use the manual hibernating session
+procedure below (and `CELLD_INTERNAL_URL` only for an operator-owned private
+listener) for that check; the runner never calls an internal listener.
 
 ## Bundle and deploy
 
