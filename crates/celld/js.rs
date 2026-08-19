@@ -1296,6 +1296,8 @@ struct LoaderCapabilityBinding {
 
 pub struct WorkerConfig {
     src: String,
+    /// The module identity used for referrer-aware sibling resolution.
+    main_module: String,
     pub script_name: String,
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
@@ -1361,6 +1363,7 @@ impl WorkerConfig {
         } = options;
         Self {
             src,
+            main_module: "worker.js".to_string(),
             script_name,
             do_classes,
             bindings,
@@ -1385,6 +1388,12 @@ impl WorkerConfig {
     /// Give this Worker the deployment's cron trigger expressions.
     pub fn with_crons(mut self, crons: Vec<String>) -> Self {
         self.crons = crons;
+        self
+    }
+
+    /// Set the declared main module identity for referrer-aware imports.
+    fn with_main_module(mut self, main_module: String) -> Self {
+        self.main_module = main_module;
         self
     }
 
@@ -3244,12 +3253,13 @@ impl Worker {
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
 
-            let module = match compile_module(scope, "worker.js", src) {
+            let module = match compile_module(scope, &config.main_module, src) {
                 Some(m) => m,
                 None => return Err(anyhow!("compile: {}", exc!(scope))),
             };
             register_stubs(scope, src, &config.modules); // cloudflare:*/node:* + text modules
             register_wasm_modules(scope, &config.modules);
+            register_main_module(scope, &config.main_module, module);
             register_loader_modules(scope, &config.modules);
             module
                 .instantiate_module(scope, resolve_external)
@@ -4487,6 +4497,7 @@ fn op_loader_load(
             modules,
             compat,
         })
+        .with_main_module(main.to_string())
         .with_egress(egress)
         .with_loader_env(loader_env)
         .with_loader_capabilities(id, loader_capabilities),
@@ -7354,8 +7365,8 @@ use bootstrap::{
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
-    register_loader_modules, register_stubs, register_wasm_modules, resolve_external,
-    ModuleRegistry,
+    register_loader_modules, register_main_module, register_stubs, register_wasm_modules,
+    resolve_external, ModuleRegistry,
 };
 /// Like `make_request`, but marks the request as incoming. Its signal is
 /// registered only if the handler actually suspends, preserving the

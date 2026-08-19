@@ -422,6 +422,24 @@ pub(super) fn register_stubs(
     );
 }
 
+/// Record the declared main module so relative imports from it can resolve
+/// against prefixed Worker Loader module names.
+pub(super) fn register_main_module(
+    scope: &mut v8::PinScope,
+    name: &str,
+    module: v8::Local<v8::Module>,
+) {
+    let Some(script_id) = module.script_id() else {
+        return;
+    };
+    modreg(scope)
+        .0
+        .lock()
+        .unwrap()
+        .canonical_names
+        .insert(script_id, name.to_string());
+}
+
 /// Compile `source` and insert it into the isolate's module registry under
 /// both `name` and `./name`, so bare and relative sibling imports resolve to
 /// one module.

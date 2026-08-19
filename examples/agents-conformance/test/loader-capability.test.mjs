@@ -64,6 +64,8 @@ test("runtime checks capability identity and denies ambient loaded-worker egress
   assert.match(runtime, /shutdown_loader_registry/);
   assert.match(runtime, /capability grants require a host isolate/);
   assert.match(runtime, /CapabilityKind::Library/);
+  assert.match(runtime, /with_main_module\(main\.to_string\(\)\)/);
+  assert.match(runtime, /register_main_module/);
 });
 
 test("host env injection materializes only opaque loaded-worker proxies", async () => {
