@@ -1331,6 +1331,9 @@ pub struct WorkerConfig {
     pub crons: Vec<String>,
     /// The identity of this loaded worker, if it was created by a host Loader.
     loader_worker_id: Option<u64>,
+    /// The Agent cell scope that created this loaded worker. Named loader
+    /// entries are cached per scope so one Agent cannot reuse another's worker.
+    loader_agent_scope: Option<String>,
     /// Opaque capability bindings materialized after plain JSON env values.
     loader_capabilities: Vec<LoaderCapabilityBinding>,
     /// The explicit globalOutbound Fetcher broker, if configured. Its token is
@@ -1387,6 +1390,7 @@ impl WorkerConfig {
             loader_env: None,
             crons: Vec::new(),
             loader_worker_id: None,
+            loader_agent_scope: None,
             loader_capabilities: Vec::new(),
             loader_outbound: None,
         }
@@ -1428,8 +1432,10 @@ impl WorkerConfig {
         worker_id: u64,
         capabilities: Vec<LoaderCapabilityBinding>,
         outbound: Option<LoaderCapabilityBinding>,
+        agent_scope: String,
     ) -> Self {
         self.loader_worker_id = Some(worker_id);
+        self.loader_agent_scope = Some(agent_scope);
         self.loader_capabilities = capabilities;
         self.loader_outbound = outbound;
         self
@@ -1686,6 +1692,8 @@ struct ActorRuntimeState {
     /// A non-`None` value means this isolate is a loaded worker and may issue
     /// calls only for this worker identity.
     loader_worker_id: Option<u64>,
+    /// Agent scope captured when the host created this loaded worker.
+    loader_agent_scope: Option<String>,
     egress: EgressPolicy,
 }
 
@@ -3241,6 +3249,7 @@ impl Worker {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             owner_id: NEXT_CAPABILITY_OWNER.fetch_add(1, Ordering::Relaxed),
             loader_worker_id: config.loader_worker_id,
+            loader_agent_scope: config.loader_agent_scope.clone(),
             egress: config.egress,
             ..Default::default()
         });
@@ -4101,6 +4110,8 @@ struct LoadedCapability {
 struct LoadedWorkerEntry {
     id: u64,
     state: tokio::sync::watch::Receiver<LoaderState>,
+    /// The Agent cell scope that owns this loaded worker and its brokers.
+    agent_scope: String,
     owner: celld_logic::capability::OwnerId,
     /// A random bearer guard for host-side fetch/RPC/dispose operations. The
     /// numeric worker id is intentionally not an authority or a capability.
@@ -4385,6 +4396,10 @@ fn op_loader_load(
     let capability_sideband = args.get(2);
     let outbound_sideband = args.get(3);
     let host_scope = current_context().cell_scope();
+    let agent_scope = args.get(4).to_rust_string_lossy(scope);
+    if agent_scope.len() > 1024 {
+        return loader_throw(scope, "worker loader: Agent scope exceeds the 1 KiB limit");
+    }
     let host_slot = if capability_sideband.is_undefined() && outbound_sideband.is_undefined() {
         Weak::new()
     } else {
@@ -4663,7 +4678,12 @@ fn op_loader_load(
         .with_main_module(main.to_string())
         .with_egress(egress)
         .with_loader_env(loader_env)
-        .with_loader_capabilities(id, loader_capabilities, loader_outbound),
+        .with_loader_capabilities(
+            id,
+            loader_capabilities,
+            loader_outbound,
+            agent_scope.clone(),
+        ),
     );
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
@@ -4675,6 +4695,7 @@ fn op_loader_load(
     let entry = Arc::new(LoadedWorkerEntry {
         id,
         state,
+        agent_scope,
         owner,
         control_token: control_token.clone(),
         host_slot,
@@ -5089,6 +5110,9 @@ fn op_loader_capability_call(
             ),
         );
     };
+    if state.loader_agent_scope.as_deref() != Some(entry.agent_scope.as_str()) {
+        return loader_throw(scope, "worker loader: capability Agent scope mismatch");
+    }
     let Some(capability) = entry
         .capabilities
         .lock()
@@ -5278,6 +5302,9 @@ fn op_loader_capability_drop(
             ),
         );
     };
+    if state.loader_agent_scope.as_deref() != Some(entry.agent_scope.as_str()) {
+        return loader_throw(scope, "worker loader: capability Agent scope mismatch");
+    }
     let Some(capability) = entry
         .capabilities
         .lock()

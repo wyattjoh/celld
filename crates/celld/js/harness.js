@@ -2204,17 +2204,19 @@ globalThis.__makeLoader = () => {
   };
   // getCode is deferred into a microtask so a throw (or async getCode)
   // surfaces as a rejection when the worker is first used, not at get()/load().
-  const loadFrom = (getCode) =>
+  const loaderAgentScope = () =>
+    __actorEventStack[__actorEventStack.length - 1] || "";
+  const loadFrom = (getCode, agentScope) =>
     Promise.resolve().then(getCode)
       .then((c) => {
         const { config: modulesConfig, wasm } = encodeModules(c);
         const { config, capabilities, outbound } = encodeEnvironment(modulesConfig);
-        return capabilities.length === 0 && outbound === null
-          ? __loader_load(JSON.stringify(config), wasm)
-          : __loader_load(
-            JSON.stringify(config), wasm, capabilities,
-            outbound === null ? undefined : outbound,
-          );
+        return __loader_load(
+          JSON.stringify(config), wasm,
+          capabilities.length === 0 ? undefined : capabilities,
+          outbound === null ? undefined : outbound,
+          agentScope,
+        );
       });
   return {
     // Explicit form for a host object in WorkerCode.env. The target never
@@ -2246,12 +2248,16 @@ globalThis.__makeLoader = () => {
         }),
       });
     },
-    load(code) { return makeStub(loadFrom(() => code), true); },
+    load(code) {
+      return makeStub(loadFrom(() => code, loaderAgentScope()), true);
+    },
     get(name, getCode) {
-      let idPromise = byName.get(name);
+      const agentScope = loaderAgentScope();
+      const cacheKey = `${agentScope}\u0000${name}`;
+      let idPromise = byName.get(cacheKey);
       if (idPromise === undefined) {
-        idPromise = loadFrom(getCode);
-        byName.set(name, idPromise);
+        idPromise = loadFrom(getCode, agentScope);
+        byName.set(cacheKey, idPromise);
       }
       return makeStub(idPromise, false);
     },
