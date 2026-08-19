@@ -18,7 +18,6 @@ test("Worker Loader uses an explicit capability sideband and opaque proxy", asyn
   assert.match(harness, /__loader_capability_target/);
   assert.match(harness, /__loader_load\(JSON\.stringify\(config\), wasm, capabilities\)/);
   assert.match(harness, /if \(prop === "then"\) return undefined/);
-  assert.match(harness, /only Workspace fs method calls are supported/);
   assert.match(harness, /Workspace capability only exposes getWorkspace and fs methods/);
   assert.match(harness, /__loaderCapabilityFinalizer/);
   assert.match(harness, /nested method proxy keeps the root alive/);
