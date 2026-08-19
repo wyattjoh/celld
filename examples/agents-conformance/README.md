@@ -12,8 +12,21 @@ stable names `alpha` and `beta` in the same deployment. Its callable
 `/agents/agents/<name>`. The state/SQL path writes and reads one state value
 and one SQL row per name at `/conformance/state/<name>`; the response exposes
 both surfaces so deterministic checks can verify that `alpha` and `beta` never
-share rows. Full bucket restore, ownership-transfer, and output-gate coverage
-belongs to the live-fleet runtime harness.
+share rows.
+
+The Agent also exercises the pinned hibernating `Server` surface. A text
+message received on `/agents/agents/<name>` increments durable Agent state and
+an event row, so a cell can be evicted while the host WebSocket remains open
+and the next message wakes a fresh instance. `/conformance/session/<name>`
+reports that state and event log. `/conformance/schedule/<name>` exposes the
+numeric-delay form of `Agent.schedule()`; its `recordScheduledWork` callback
+updates durable state and the schedule-run table. This deliberately uses
+celld's Durable Object alarm path, not a Worker cron trigger.
+
+The commands below are a deployed conformance procedure. The npm tests are
+contract checks and the storage test proves alarm persistence after close and
+reopen; they do not claim a live multi-node eviction, takeover, or restart run
+without the operator supplying a bucket and fleet.
 
 ## Verify the target
 
@@ -55,6 +68,56 @@ curl -fsS http://127.0.0.1:8080/conformance/state/beta
 curl -fsS http://127.0.0.1:8080/agents/agents/alpha
 curl -fsS http://127.0.0.1:8080/agents/agents/beta
 ```
+
+### Hibernating session procedure
+
+Use `websocat` (or another WebSocket client) against the public listener:
+
+```sh
+websocat ws://127.0.0.1:8080/agents/agents/alpha
+# send: {"message":"before-eviction"}
+```
+
+The response includes `messageCount` and `connectionId`. Capture the
+connection ID, close the client, and reconnect to the same Agent path. The
+second connection receives the already-incremented durable state. To exercise
+hibernation with the first socket still open, send a message, then ask the
+private operator listener to evict the named cell using the address printed at
+startup:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8081/evict/ConformanceAgent:alpha
+# send on the still-open WebSocket: {"message":"after-eviction"}
+curl -fsS http://127.0.0.1:8080/conformance/session/alpha
+```
+
+The open socket remains host-owned while the cell is inactive; the next
+message activates the cell and the event log must continue at the next
+`messageCount`. The internal listener is unauthenticated and must remain
+private; its port may be ephemeral, so replace `8081` with the startup value.
+
+### Durable Agent schedule procedure
+
+For this short-delay eviction check, start the node with
+`CELLD_ALARM_RESIDENT_MS=0`. The default near-alarm residency window keeps an
+imminent alarm resident, so an operator eviction is expected to wait instead of
+testing an inactive wake. Then schedule delayed work, evict the now-idle cell,
+and inspect the callback result:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8080/conformance/schedule/alpha \
+  -H 'content-type: application/json' \
+  -d '{"delaySeconds":2,"payload":{"job":"wake"}}'
+curl --max-time 10 -fsS -X POST http://127.0.0.1:8081/evict/ConformanceAgent:alpha
+node -e 'setTimeout(() => {}, 3000)'
+curl --max-time 10 -fsS http://127.0.0.1:8080/conformance/schedule/alpha
+```
+
+The final response must show `scheduledRuns` incremented and the payload in
+`runs`. This is a one-shot delayed schedule backed by `storage.setAlarm()`;
+the fixture intentionally does not use a cron trigger. A bucket-backed
+restart or ownership-transfer run should additionally verify the same response
+on the replacement node; that fleet evidence is not produced by `npm test`.
 
 The two callable responses contain `agent: "alpha"` and `agent: "beta"`
 respectively. State reads return the selected Agent state and only that Agent's

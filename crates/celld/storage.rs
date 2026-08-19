@@ -3873,4 +3873,37 @@ mod named_agent_lifecycle {
         close(beta);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn delayed_agent_alarm_survives_inactivity_and_reopen() {
+        install_for_test();
+        let root = std::env::temp_dir().join(format!(
+            "celld-agent-alarm-{}-{}",
+            std::process::id(),
+            NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let scope = "ConformanceAgent:alpha";
+        let path = root.join("alpha.sqlite");
+        let path_text = path.to_str().expect("sqlite path");
+        let due_at_ms = 1_800_000_000_000;
+
+        open(scope, path_text).expect("open agent");
+        set_alarm(scope, due_at_ms).expect("arm durable alarm");
+        assert_eq!(take_alarm_moves(), vec![(scope.to_string(), due_at_ms)]);
+        assert_eq!(
+            persisted_alarm(path_text, scope).map(|alarm| alarm.0),
+            Some(due_at_ms)
+        );
+
+        // Closing the cell is the deterministic runtime seam for inactivity:
+        // no in-memory alarm mirror may be required to restore the schedule.
+        close(scope);
+        open(scope, path_text).expect("reopen inactive agent");
+        assert_eq!(get_alarm(scope), Some(due_at_ms));
+        assert_eq!(due_alarm_entry(scope, due_at_ms), Some((due_at_ms, 0)));
+
+        close(scope);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

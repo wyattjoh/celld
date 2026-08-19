@@ -18,7 +18,8 @@ Durable Object surface supported by `celld`:
 - `rpc/` — JS RPC: Durable Object methods, a named entrypoint, callbacks,
   `RpcTarget`, and promise pipelining
 - `agents-conformance/` — pinned, source-unmodified Cloudflare Agents SDK
-  routing two named agents and a structured-cloneable callable method
+  routing two named agents with durable state, hibernating sessions, and
+  alarm-backed delayed work
 - `wasm/` — a Durable Object counter in Rust, compiled to Wasm with
   [workers-rs](https://github.com/cloudflare/workers-rs); needs a build
   step first (see its [README](wasm/README.md))

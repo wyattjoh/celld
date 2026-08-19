@@ -42,6 +42,29 @@ test("the fixture declares private Agent state and SQL lifecycle surfaces", asyn
   assert.match(source, /SELECT id, value, revision/);
 });
 
+test("the fixture declares hibernating sessions and alarm-backed delayed work", async () => {
+  const source = await readFile(join(ROOT, "index.js"), "utf8");
+  const readme = await readFile(join(ROOT, "README.md"), "utf8");
+
+  assert.match(source, /onConnect\(connection\)/);
+  assert.match(source, /onMessage\(connection, message\)/);
+  assert.match(source, /conformance_agent_session_events/);
+  assert.match(source, /async scheduleWork\(input\)/);
+  assert.match(source, /this\.schedule\(/);
+  assert.match(source, /recordScheduledWork\(payload, schedule\)/);
+  assert.ok(source.includes("/conformance/session/"));
+  assert.ok(source.includes("/conformance/schedule/"));
+  assert.match(readme, /hibernat/i);
+  assert.match(readme, /storage\.setAlarm\(\)/);
+  assert.match(readme, /evict\/ConformanceAgent:alpha/);
+});
+
+test("the deployed fixture keeps its Agent namespace binding addressable", async () => {
+  const wrangler = JSON.parse(await readFile(join(ROOT, "wrangler.jsonc"), "utf8"));
+  assert.equal(wrangler.durable_objects.bindings[0].name, "agents");
+  assert.equal(wrangler.durable_objects.bindings[0].class_name, "ConformanceAgent");
+});
+
 test("a direct upstream version change fails with a stable error", async () => {
   const root = await copyFixture();
   const path = join(root, "package.json");

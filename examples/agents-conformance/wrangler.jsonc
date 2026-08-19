@@ -5,7 +5,7 @@
   "compatibility_flags": ["js_rpc"],
   "durable_objects": {
     "bindings": [
-      { "name": "AGENTS", "class_name": "ConformanceAgent" }
+      { "name": "agents", "class_name": "ConformanceAgent" }
     ]
   },
   "migrations": [
