@@ -1657,7 +1657,8 @@ globalThis.__makeLoaderCapability = (
       get: (_base, prop) => {
         void keepRoot;
         if (prop === "then") return undefined;
-        if (prop === "dispose" || prop === Symbol.dispose) return drop;
+        if (prop === "dispose" || prop === Symbol.dispose)
+          return path.length === 0 ? drop : () => {};
         if (typeof prop !== "string") return undefined;
         return make([...path, prop]);
       },
@@ -1725,12 +1726,14 @@ globalThis.__dispatchLoaderCapability =
     const target = __loader_capability_target(owner, token, kind);
     const targetPath = shellFsPath ? path.slice(1) : path;
     let receiver = target;
+    let workspaceView;
     if (shellFsPath) {
       const getWorkspace = receiver.getWorkspace;
       if (typeof getWorkspace !== "function")
         throw new TypeError(
           "worker loader: WorkspaceServiceProxy does not expose getWorkspace");
-      receiver = await getWorkspace();
+      workspaceView = await getWorkspace();
+      receiver = workspaceView;
       if (receiver === null || receiver === undefined)
         throw new TypeError("worker loader: getWorkspace returned no Workspace");
     }
@@ -1746,7 +1749,12 @@ globalThis.__dispatchLoaderCapability =
     const callArgs = __sc_decode(argsBytes);
     if (!Array.isArray(callArgs))
       throw new TypeError("worker loader: capability arguments must be an array");
-    return Reflect.apply(method, receiver, callArgs);
+    if (!shellFsPath) return Reflect.apply(method, receiver, callArgs);
+    try {
+      return await Reflect.apply(method, receiver, callArgs);
+    } finally {
+      workspaceView?.[Symbol.dispose]?.();
+    }
   }, false);
 
 globalThis.__makeLoader = () => {

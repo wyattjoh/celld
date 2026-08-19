@@ -113,6 +113,33 @@ function hostFor(workspace) {
   return workspace.stub();
 }
 
+function capabilityWorkspaceView(target, onDispose) {
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    onDispose();
+    target[Symbol.dispose]?.();
+  };
+  const make = (path) => new Proxy(function () {}, {
+    get: (_base, prop) => {
+      if (prop === "then") return undefined;
+      if (prop === "dispose" || prop === Symbol.dispose) return dispose;
+      if (typeof prop !== "string") return undefined;
+      return make([...path, prop]);
+    },
+    apply: (_base, _this, args) => {
+      let receiver = target;
+      for (let index = 0; index < path.length - 1; index++) {
+        receiver = receiver[path[index]];
+      }
+      const method = receiver[path[path.length - 1]];
+      return Reflect.apply(method, receiver, args);
+    },
+  });
+  return make([]);
+}
+
 test("Worker Shell source is pinned, loaded, capability-scoped, and no-egress", async () => {
   const [sourceText, harness, matrix, packageJson] = await Promise.all([
     source("examples/agents-conformance/index.js"),
@@ -130,6 +157,8 @@ test("Worker Shell source is pinned, loaded, capability-scoped, and no-egress", 
   assert.match(sourceText, /WorkspaceServiceProxy/);
   assert.match(harness, /__celld\$loaderCapability/);
   assert.match(harness, /service\?\.name === "WorkspaceServiceProxy"/);
+  assert.match(harness, /path\.length === 0 \? drop/);
+  assert.match(harness, /workspaceView\?\.\[Symbol\.dispose\]/);
   assert.match(harness, /capabilityDescriptor\(value, name\)/);
   assert.match(harness, /Workspace capability only exposes getWorkspace and fs methods/);
   assert.match(harness, /globalThis\.\__loaderWorkerId/);
@@ -147,8 +176,12 @@ test("WorkerShellBackend loads ShellWorker with its WorkspaceServiceProxy capabi
   try {
     const workspace = new Workspace({ storage: storageFor(database) });
     let loadedCode;
+    let disposedViews = 0;
     const hostService = function WorkspaceServiceProxyStub() {};
-    hostService.getWorkspace = async () => workspace.stub();
+    hostService.getWorkspace = async () => capabilityWorkspaceView(
+      workspace.stub(),
+      () => { disposedViews++; },
+    );
     const loader = {
       get(name, getCode) {
         loadedCode = getCode();
@@ -206,6 +239,12 @@ test("WorkerShellBackend loads ShellWorker with its WorkspaceServiceProxy capabi
       "loaded\n",
     );
     assert.equal(await workspace.fs.readFile("/notes/todo.md", "utf8"), "loaded\n");
+    const second = await connection.rpc.shell.exec({
+      source: "cat /notes/todo.md",
+    });
+    const secondEvents = await collectDecodedEvents(second.events);
+    assert.equal(secondEvents.at(-1).code, 0);
+    assert.equal(disposedViews, 2);
   } finally {
     await connection?.close();
     database.close();
