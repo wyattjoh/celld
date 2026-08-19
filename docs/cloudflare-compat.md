@@ -304,12 +304,12 @@ plus local reopen and per-Agent isolation. With `CELLD_WORKER_LOADER=LOADER`,
 it runs the pinned Worker Shell and Worker JavaScript backends in fresh loaded
 workers. Worker Shell uses only core `just-bash` modules and the explicit
 Workspace fs capability; Worker JavaScript uses a library capability, reads a
-sibling module and Workspace file, returns structured data, and drains stdio
-rather than exporting a cross-isolate stream. Neither backend grants native
-process, host filesystem, arbitrary TCP, or ambient network access; unsupported
-commands, cancellation, and timeouts return explicit bounded outcomes. The
-fixture's local tests are not evidence of a live multi-node restore or
-ownership-transfer run.
+sibling module and Workspace file, returns structured data, and forwards
+bounded framed stdio as bytes rather than exporting a live cross-isolate
+stream. Neither backend grants native process, host filesystem, arbitrary TCP,
+or ambient network access; unsupported commands, cancellation, and timeouts
+return explicit bounded outcomes. The fixture's local tests are not evidence
+of a live multi-node restore or ownership-transfer run.
 
 ## node: imports
 

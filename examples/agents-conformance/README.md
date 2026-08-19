@@ -94,8 +94,9 @@ default module imports a sibling Workspace file, reads a Workspace file through
 `node:fs/promises`, and returns structured input/output. The host grants only
 an opaque `library` capability for the backend bridge; generated code has no
 ambient network access and cannot see the Agent, Workspace, or host objects.
-celld drains the backend's stdio stream in the loaded isolate for this first
-no-stdio integration. Use `{"operation":"cancel"}` to verify a bounded
+celld buffers the backend's bounded stdio frames in the loaded isolate and
+forwards them as bytes, rather than exporting a live cross-isolate stream. Use
+`{"operation":"cancel"}` to verify a bounded
 `cancelled` result. Invalid imports, isolate termination, and non-JSON result
 values return bounded backend failures rather than host objects or partial
 capability references.
@@ -223,9 +224,9 @@ curl -fsS -X POST http://127.0.0.1:8080/conformance/javascript/alpha \
 ```
 
 The first result includes `suffix: ":sibling"`, the Workspace file contents,
-and the structured input. The second result has `status: "cancelled"` and an
-exit code of 130. This seam intentionally does not expose worker stdout; the
-runtime drains it so a live stream cannot become an implicit cross-isolate
+the structured input, and bounded stdout/stderr fields. The second result has
+`status: "cancelled"` and an exit code of 130. The runtime forwards only the
+bounded framed bytes; a live stream cannot become an implicit cross-isolate
 capability. Unsupported imports, ambient `fetch()`, and non-JSON values fail
 with bounded errors.
 

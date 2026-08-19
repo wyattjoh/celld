@@ -34,6 +34,8 @@ test("Ticket 06 direct Workspace paths remain compatible with Worker Shell views
   assert.match(docs, /WORKSPACE\.fs\.readFile\(path, "utf8"\)/);
   assert.match(harness, /Workspace capability only exposes getWorkspace and fs methods/);
   assert.match(harness, /library capability paths must name one method/);
+  assert.match(harness, /attachOutputBytes/);
+  assert.match(harness, /bounded transport size/);
   assert.match(harness, /__celld\$loaderCapability/);
   assert.match(harness, /typeof wrapped\.js === "string"/);
 });

@@ -72,6 +72,20 @@ function computerLoader(loader) {
               const library = Object.freeze({
                 call: (...args) => host.call(...args),
                 assertResult: (...args) => host.assertResult(...args),
+                attachOutputBytes: async (bytes) => {
+                  if (!(bytes instanceof Uint8Array)) {
+                    throw new TypeError(
+                      "Worker JavaScript output must be a Uint8Array",
+                    );
+                  }
+                  const output = new ReadableStream({
+                    start(controller) {
+                      controller.enqueue(bytes);
+                      controller.close();
+                    },
+                  });
+                  return host.attachOutput(output);
+                },
                 attachOutput: async () => {},
               });
               return entrypoint.evaluate(

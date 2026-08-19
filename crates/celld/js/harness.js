@@ -1621,19 +1621,41 @@ const __loaderCapabilityRevive = (value) => {
 const __loaderCapabilityDeserialize = (bytes) =>
   __loaderCapabilityRevive(__rpcDes(bytes));
 
-// The pinned Computer Worker JavaScript backend always attaches its output
-// stream before evaluating the user's module. celld deliberately keeps this
-// first integration no-stdio: drain the stream inside the loaded isolate
-// instead of crossing a live stream into the host capability. Structured
-// input/output and Workspace calls still use the explicit library sideband.
-const __discardLoaderOutput = (stream) => {
+// The pinned Computer Worker JavaScript backend attaches its output stream
+// before evaluating the user's module. Live streams do not cross celld's
+// isolate boundary, so buffer the backend's already-bounded framed output in
+// the loaded isolate and forward it as bytes through a second explicit
+// library method. This preserves terminal result frames without exporting a
+// live host stream or giving generated code a new authority.
+const MAX_LOADER_OUTPUT_BYTES = 8 * 1024 * 1024;
+const __forwardLoaderOutput = (stream, workerId, token, kind) => {
   const reader = stream.getReader();
   return (async () => {
+    const chunks = [];
+    let size = 0;
     try {
-      while (!(await reader.read()).done) {}
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+        if (size > MAX_LOADER_OUTPUT_BYTES)
+          throw new Error(
+            "worker loader: capability output exceeds bounded transport size");
+        chunks.push(next.value);
+      }
     } finally {
       reader.releaseLock();
     }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const encoded = __rpcOut([bytes], false);
+    return __loader_capability_call(
+      workerId, token, kind, JSON.stringify(["attachOutputBytes"]), encoded,
+    ).then(__rpcDes);
   })();
 };
 
@@ -1686,7 +1708,7 @@ globalThis.__makeLoaderCapability = (
         if (args.length !== 1 || !(args[0] instanceof ReadableStream))
           return Promise.reject(new TypeError(
             "worker loader: library attachOutput requires a ReadableStream"));
-        return __discardLoaderOutput(args[0]);
+        return __forwardLoaderOutput(args[0], workerId, token, kind);
       }
       let encoded;
       try {
