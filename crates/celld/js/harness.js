@@ -1574,8 +1574,13 @@ const __loaderCapabilityCall = (...args) =>
 const __loaderCapabilityDrop = (...args) =>
   __loader_capability_drop(...args);
 const __loaderCapabilityFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry(([workerId, token, kind]) =>
-      __loaderCapabilityDrop(workerId, token, kind))
+  ? new FinalizationRegistry(([workerId, token, kind]) => {
+      try {
+        __loaderCapabilityDrop(workerId, token, kind);
+      } catch (error) {
+        if (!String(error).includes("worker_disposed")) throw error;
+      }
+    })
   : null;
 
 globalThis.__makeLoaderCapability = (workerId, token, kind) => {
@@ -1715,8 +1720,13 @@ globalThis.__makeLoader = () => {
   // finalizer drops the worker's isolate so it does not leak. Named get()
   // workers are retained by `byName` (memoized) and so are not registered.
   const finalizer = typeof FinalizationRegistry === "function"
-    ? new FinalizationRegistry((handle) =>
-        __loader_drop(handle.id, handle.token))
+    ? new FinalizationRegistry((handle) => {
+        try {
+          __loader_drop(handle.id, handle.token);
+        } catch (error) {
+          if (!String(error).includes("worker_disposed")) throw error;
+        }
+      })
     : null;
   const makeStub = (handlePromise, evictable) => {
     // Explicit disposal evicts the worker deterministically; the finalizer is

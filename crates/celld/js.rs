@@ -4126,6 +4126,29 @@ fn loader_interruption(
     format!("worker loader: {}: {detail}", class.as_str(),)
 }
 
+fn loader_result_error(
+    default: celld_logic::capability::InterruptionClass,
+    error: impl std::fmt::Display,
+) -> String {
+    let error = error.to_string();
+    let known = [
+        celld_logic::capability::InterruptionClass::Cancelled,
+        celld_logic::capability::InterruptionClass::TimedOut,
+        celld_logic::capability::InterruptionClass::IsolateFailure,
+        celld_logic::capability::InterruptionClass::CapabilityFailure,
+        celld_logic::capability::InterruptionClass::HostCellLost,
+        celld_logic::capability::InterruptionClass::WorkerDisposed,
+    ];
+    if known
+        .iter()
+        .any(|class| error.starts_with(&format!("worker loader: {}:", class.as_str())))
+    {
+        error
+    } else {
+        loader_interruption(default, error)
+    }
+}
+
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
     let message = v8::String::new(scope, message).unwrap();
     let exception = v8::Exception::error(scope, message);
@@ -4559,7 +4582,7 @@ fn op_loader_fetch(
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
         match receive.await {
             Ok(Ok(response)) => Ok(encode_http_response(response, false)),
-            Ok(Err(error)) => Err(loader_interruption(
+            Ok(Err(error)) => Err(loader_result_error(
                 celld_logic::capability::InterruptionClass::CapabilityFailure,
                 error,
             )),
@@ -4624,7 +4647,7 @@ fn op_loader_rpc(
         let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
         match receive.await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(loader_interruption(
+            Ok(Err(error)) => Err(loader_result_error(
                 celld_logic::capability::InterruptionClass::CapabilityFailure,
                 error,
             )),
@@ -4864,7 +4887,7 @@ fn op_loader_capability_call(
         let driving = tokio::spawn(crate::runtime::drive(host_slot, job, None));
         match receive.await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(loader_interruption(
+            Ok(Err(error)) => Err(loader_result_error(
                 celld_logic::capability::InterruptionClass::CapabilityFailure,
                 error,
             )),

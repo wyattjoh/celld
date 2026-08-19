@@ -26,6 +26,7 @@ test("Worker Loader uses an explicit capability sideband and opaque proxy", asyn
 
 test("runtime checks capability identity and denies ambient loaded-worker egress", async () => {
   const runtime = await source("crates/celld/js.rs");
+  const driver = await source("crates/celld/runtime.rs");
   assert.match(runtime, /capability::authorize/);
   assert.match(runtime, /capability owner mismatch/);
   assert.match(runtime, /capability worker mismatch/);
@@ -37,6 +38,11 @@ test("runtime checks capability identity and denies ambient loaded-worker egress
   assert.match(runtime, /host_loader_entry/);
   assert.match(runtime, /loaded workers cannot control sibling workers/);
   assert.match(runtime, /HostCellLost/);
+  assert.match(runtime, /loader_result_error/);
+  assert.match(runtime, /capability_cancel/);
+  assert.match(runtime, /worker loader: cancelled/);
+  assert.match(runtime, /worker loader: timed_out/);
+  assert.match(driver, /worker loader: host_cell_lost/);
   assert.match(runtime, /try_turn/);
   assert.match(runtime, /shutdown_loader_registry/);
 });
