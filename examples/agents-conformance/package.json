@@ -1,0 +1,16 @@
+{
+  "name": "celld-agents-conformance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:compatibility": "node scripts/check-compatibility.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/agents": "0.0.16",
+    "@cloudflare/computer": "0.2.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

@@ -4127,6 +4127,12 @@ globalThis.__cf = {
   WorkerEntrypoint: class WorkerEntrypoint {
     constructor(ctx, env) { this.ctx = ctx; this.env = env; }
   },
+  // Agents SDK imports this base while defining its optional workflow
+  // compatibility export. The conformance fixture does not instantiate a
+  // workflow, but the source-unmodified package must still link at load.
+  WorkflowEntrypoint: class WorkflowEntrypoint {
+    constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+  },
   // `new RpcStub(target)` wraps any local object or function in a
   // loopback stub; the constructor returns the proxy, so instanceof
   // works through __makeStub's getPrototypeOf trap.

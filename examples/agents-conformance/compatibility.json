@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "target": {
+    "compatibilityDate": "2026-01-01",
+    "compatibilityFlags": ["js_rpc"]
+  },
+  "packages": {
+    "@cloudflare/agents": {
+      "version": "0.0.16",
+      "integrity": "sha512-7xx7b60Z0PA7V2NRcxl+iHgT82B8At0RIigW5/yW1sKNDDhY23SgD/E+cFWMGzGcvoYHwlhmx34JIB2o1VRc3Q=="
+    },
+    "@cloudflare/computer": {
+      "version": "0.2.1",
+      "integrity": "sha512-jh0pa1csAExPItUYzrzBrZO1vCBjsQ6jX+aunrnKe2VSC9i8mEziQYZUL3IZId4GpceRL+v8HIzVr4kjbmQXPw=="
+    },
+    "esbuild": {
+      "version": "0.28.2",
+      "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
+    }
+  },
+  "lockfileSha256": "d87c57cdd782fafd9847e383145c3b8669d8fe860e665ca793e74750f1e4497c",
+  "matrix": "compatibility-matrix.md"
+}
