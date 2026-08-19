@@ -42,12 +42,12 @@ Not planned: **KV** (a different consistency model), **R2** (celld runs
 *on* blob storage; celld does not provide blob storage; declared
 `r2_buckets` bindings load, but each method throws), **Cache API**,
 **Workers AI, Vectorize, Hyperdrive, Browser Rendering, Email** (managed
-platform services; an experimental HTTP adapter for an AI binding exists
-behind `CELLD_AI_URL`), **custom domains, TLS termination** (platform
-surface; put TLS in your ingress proxy), **Python Workers** (workerd
-supplies the Pyodide runtime and the Python module shim; that layer is
-platform surface, not a function on Durable Objects; celld can add
-support if demand appears).
+platform services; the pinned Agents conformance fixture can use the
+explicit HTTP AI adapter binding configured by `CELLD_AI_URL`), **custom
+domains, TLS termination** (platform surface; put TLS in your ingress
+proxy), **Python Workers** (workerd supplies the Pyodide runtime and the
+Python module shim; that layer is platform surface, not a function on
+Durable Objects; celld can add support if demand appears).
 
 ## Runtime APIs
 
@@ -58,7 +58,7 @@ by category:
 | API | status |
 | --- | --- |
 | Fetch, Request, Response, Headers | **Yes.** Gaps: `Response.redirect()`, `Response.error()`, and the `cache` request option are missing. |
-| Bindings (`env`) | **Yes** for Durable Objects, service bindings, `vars`, assets, and D1. Other binding types are out of scope (see Services). |
+| Bindings (`env`) | **Yes** for Durable Objects, service bindings, `vars`, assets, D1, and the adapted HTTP AI binding. Other binding types are out of scope (see Services). A declared AI binding without `CELLD_AI_URL` fails clearly on first use. |
 | Context (`ctx`) | **Yes**: `waitUntil`, `props`, `exports`. `passThroughOnException()` is accepted but has no effect. There is no CDN behind it. `ctx.facets` is absent (see Facets). |
 | Handlers | `fetch`, `alarm`, `scheduled` (cron), `webSocketMessage`/`Close`/`Error`, RPC methods. **No** `queue`, `tail`, or `email` handlers. See [cron triggers](#cron-triggers). |
 | RPC | **Yes**, for most of the surface. See [RPC](#rpc). |
@@ -398,11 +398,12 @@ rather than reported as enabled, and celld accepts it without effect.
 and accepts `wrangler.jsonc` or `wrangler.json`, not `wrangler.toml`.
 The available config keys are `name`, `main`,
 `compatibility_date`, `compatibility_flags`, `durable_objects`,
-`migrations`, `assets`, `services`, `triggers`, `vars`, and
-`d1_databases`. An asset-only project can omit `main`. celld refuses
-symlinks and special files in the asset directory, and `.assetsignore`
-still needs Wrangler. Each other key — `routes`, `kv_namespaces`, and the
-rest — stops the deploy
+`migrations`, `assets`, `ai`, `services`, `triggers`, `vars`, and
+`d1_databases`. The `ai.binding` key creates the adapted HTTP AI binding;
+set `CELLD_AI_URL` on the node or the binding fails clearly on first use.
+An asset-only project can omit `main`. celld refuses symlinks and special
+files in the asset directory, and `.assetsignore` still needs Wrangler.
+Each other key — `routes`, `kv_namespaces`, and the rest — stops the deploy
 with an error that names the key: remove the key, or deploy that project
 with Wrangler.
 

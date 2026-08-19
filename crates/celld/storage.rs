@@ -3813,6 +3813,30 @@ mod named_agent_lifecycle {
             &[],
         )
         .expect("create beta table");
+        sql_exec(
+            alpha,
+            "CREATE TABLE conformance_ai_responses (response_id TEXT PRIMARY KEY, status TEXT NOT NULL, cursor INTEGER NOT NULL, messages TEXT NOT NULL, lease TEXT, lease_until INTEGER NOT NULL DEFAULT 0)",
+            &[],
+        )
+        .expect("create response state table");
+        sql_exec(
+            alpha,
+            "CREATE TABLE conformance_ai_response_chunks (response_id TEXT NOT NULL, sequence INTEGER NOT NULL, chunk TEXT NOT NULL, PRIMARY KEY (response_id, sequence))",
+            &[],
+        )
+        .expect("create response chunk table");
+        sql_exec(
+            alpha,
+            "INSERT INTO conformance_ai_responses (response_id, status, cursor, messages, lease, lease_until) VALUES (?1, 'streaming', 1, ?2, 'lease-1', 123)",
+            &[serde_json::json!("alpha-response"), serde_json::json!("[{\"id\":\"m1\"}]")],
+        )
+        .expect("write response cursor");
+        sql_exec(
+            alpha,
+            "INSERT INTO conformance_ai_response_chunks (response_id, sequence, chunk) VALUES (?1, 1, ?2)",
+            &[serde_json::json!("alpha-response"), serde_json::json!("[97,108,112,104,97]")],
+        )
+        .expect("write response chunk");
         let alpha_before = write_position(alpha).expect("alpha write position");
         sql_exec(
             alpha,
@@ -3858,6 +3882,18 @@ mod named_agent_lifecycle {
             sql_exec(alpha, "SELECT id, value FROM records", &[]).expect("read restored alpha SQL");
         let (_, beta_rows, _) =
             sql_exec(beta, "SELECT id, value FROM records", &[]).expect("read restored beta SQL");
+        let (_, response_rows, _) = sql_exec(
+            alpha,
+            "SELECT response_id, status, cursor, messages, lease, lease_until FROM conformance_ai_responses",
+            &[],
+        )
+        .expect("read restored response state");
+        let (_, chunk_rows, _) = sql_exec(
+            alpha,
+            "SELECT response_id, sequence, chunk FROM conformance_ai_response_chunks",
+            &[],
+        )
+        .expect("read restored response chunk");
         assert_eq!(
             alpha_rows,
             vec![vec![
@@ -3868,6 +3904,25 @@ mod named_agent_lifecycle {
         assert_eq!(
             beta_rows,
             vec![vec![serde_json::json!(beta), serde_json::json!("beta-row")]]
+        );
+        assert_eq!(
+            response_rows,
+            vec![vec![
+                serde_json::json!("alpha-response"),
+                serde_json::json!("streaming"),
+                serde_json::json!(1),
+                serde_json::json!("[{\"id\":\"m1\"}]"),
+                serde_json::json!("lease-1"),
+                serde_json::json!(123)
+            ]]
+        );
+        assert_eq!(
+            chunk_rows,
+            vec![vec![
+                serde_json::json!("alpha-response"),
+                serde_json::json!(1),
+                serde_json::json!("[97,108,112,104,97]")
+            ]]
         );
         close(alpha);
         close(beta);

@@ -48,7 +48,7 @@ function packageSpec(packageJson, name) {
  * Validate the complete, pinned compatibility target for this fixture.
  *
  * @param {string} root fixture directory.
- * @returns {{agentsVersion: string, computerVersion: string, lockfileSha256: string}}
+ * @returns {{agentsVersion: string, aiVersion: string, computerVersion: string, zodVersion: string, lockfileSha256: string}}
  *   The verified target summary.
  */
 export function checkCompatibility(root = DEFAULT_ROOT) {
@@ -113,7 +113,9 @@ export function checkCompatibility(root = DEFAULT_ROOT) {
 
   return {
     agentsVersion: target.packages["@cloudflare/agents"].version,
+    aiVersion: target.packages.ai.version,
     computerVersion: target.packages["@cloudflare/computer"].version,
+    zodVersion: target.packages.zod.version,
     lockfileSha256: lockfileDigest,
   };
 }
@@ -123,7 +125,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const result = checkCompatibility(process.argv[2] ?? DEFAULT_ROOT);
     console.log(
       `compatibility target verified: @cloudflare/agents@${result.agentsVersion}, ` +
-        `@cloudflare/computer@${result.computerVersion}, ` +
+        `ai@${result.aiVersion}, @cloudflare/computer@${result.computerVersion}, ` +
         `lockfile sha256 ${result.lockfileSha256}`,
     );
   } catch (error) {

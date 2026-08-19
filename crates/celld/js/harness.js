@@ -577,15 +577,29 @@ globalThis.__makeR2Bucket = (name) => {
   }
   return bucket;
 };
-globalThis.__makeAiBinding = (url) => ({
+globalThis.__makeAiBinding = (name, url) => ({
   async run(model, input) {
     const response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, input }),
     });
-    if (!response.ok) throw new Error(`AI binding returned ${response.status}`);
+    if (!response.ok) {
+      throw new Error(
+        `AI binding ${name} HTTP adapter returned ${response.status}`,
+      );
+    }
     return response.json();
+  },
+});
+// Keep a declared AI binding present when its deployment capability is absent.
+// A missing binding is much harder to diagnose than this stable first-use
+// failure, and it must not silently turn into a Workers AI compatibility claim.
+globalThis.__makeMissingAiBinding = (name) => ({
+  async run() {
+    throw new Error(
+      `AI binding ${name} requires the CELLD_AI_URL deployment capability`,
+    );
   },
 });
 // A host timer op resolves once, so an interval arms a new one after every

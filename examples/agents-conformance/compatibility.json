@@ -13,11 +13,19 @@
       "version": "0.2.1",
       "integrity": "sha512-jh0pa1csAExPItUYzrzBrZO1vCBjsQ6jX+aunrnKe2VSC9i8mEziQYZUL3IZId4GpceRL+v8HIzVr4kjbmQXPw=="
     },
+    "ai": {
+      "version": "4.3.19",
+      "integrity": "sha512-dIE2bfNpqHN3r6IINp9znguYdhIOheKW2LDigAMrgt/upT3B8eBGPSCblENvaZGoq+hxaN9fSMzjWpbqloP+7Q=="
+    },
+    "zod": {
+      "version": "3.25.76",
+      "integrity": "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="
+    },
     "esbuild": {
       "version": "0.28.2",
       "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
     }
   },
-  "lockfileSha256": "d87c57cdd782fafd9847e383145c3b8669d8fe860e665ca793e74750f1e4497c",
+  "lockfileSha256": "8b85da9d52c50269d249dd600b4dace6583b7690d39f927ead59bce719a74f16",
   "matrix": "compatibility-matrix.md"
 }

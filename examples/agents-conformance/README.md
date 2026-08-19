@@ -1,9 +1,11 @@
 # Agents compatibility conformance
 
 This is the smallest source-unmodified multi-Agent application for celld. It
-pins `@cloudflare/agents@0.0.16` and `@cloudflare/computer@0.2.1`; the exact
-resolved package integrity values and complete lockfile digest are recorded in
-[`compatibility.json`](compatibility.json).
+pins `@cloudflare/agents@0.0.16`, `ai@4.3.19`, and
+`@cloudflare/computer@0.2.1`; the exact resolved package integrity values and
+complete lockfile digest are recorded in [`compatibility.json`](compatibility.json).
+The `ai` version is pinned because the published `AIChatAgent` implementation
+uses its `appendResponseMessages` helper.
 
 The fixture declares one `ConformanceAgent` Durable Object class and addresses
 stable names `alpha` and `beta` in the same deployment. Its callable
@@ -46,6 +48,18 @@ The commands below are deployed conformance procedures. The npm tests are
 contract checks and the storage tests prove alarm and Workspace persistence
 after close and reopen; they do not claim a live multi-node takeover or
 output-gate timing run without the operator supplying a bucket and fleet.
+`ConformanceAgent` extends the pinned `AIChatAgent` without changing the SDK.
+The HTTP-only seam at `/conformance/chat/<name>` saves the incoming messages,
+checkpoints each provider chunk in the owning Agent cell before exposing it,
+renews its single-resumer lease while the provider is active, and saves the
+assistant message only after the provider stream closes.
+Responses carry an `x-celld-response-id`; a caller that disconnects can use
+`/conformance/resume/<name>?response=<id>&after=<cursor>` to replay durable
+chunks and continue the deterministic provider from its stored cursor after an
+Agent eviction/reopen. `/conformance/messages/<name>` uses the inherited
+AIChatAgent message reader, so the same conversation is observable after the
+lifecycle transition. The WebSocket chat protocol remains reserved for ticket
+03.
 
 ## Verify the target
 
@@ -57,9 +71,13 @@ npm run check:compatibility
 
 `check:compatibility` fails with stable `[compatibility.*]` error codes if a
 pinned package, lockfile integrity, lockfile digest, compatibility setting, or
-matrix entry drifts. Updating the target is a deliberate review operation:
-regenerate the lockfile, update `compatibility.json` and the matrix together,
-and rerun the tests.
+matrix entry drifts. The Node tests exercise the deterministic provider and
+source seam; they do not pretend to be a live celld deployment. The Rust
+storage lifecycle test verifies response rows across close/reopen, while the
+public-route and ownership-transition evidence requires the deployment steps
+below. Updating the target is a deliberate review operation: regenerate the
+lockfile, update `compatibility.json` and the matrix together, and rerun the
+tests.
 
 ## Bundle and deploy
 
@@ -72,20 +90,14 @@ CELLD_ESBUILD="$PWD/node_modules/.bin/esbuild" \
   --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
 ```
 
-Start or restart celld against the same bucket, then check the public listener:
+The model provider double is a separate HTTP capability. Start it before
+starting the node that loads the deployment:
 
 ```sh
-curl -fsS http://127.0.0.1:8080/conformance/call/alpha
-curl -fsS http://127.0.0.1:8080/conformance/call/beta
-curl -fsS http://127.0.0.1:8080/conformance/names
-curl -fsS -X POST http://127.0.0.1:8080/conformance/state/alpha \
-  -H 'content-type: application/json' -d '{"value":"alpha-state","revision":1}'
-curl -fsS -X POST http://127.0.0.1:8080/conformance/state/beta \
-  -H 'content-type: application/json' -d '{"value":"beta-state","revision":1}'
-curl -fsS http://127.0.0.1:8080/conformance/state/alpha
-curl -fsS http://127.0.0.1:8080/conformance/state/beta
-curl -fsS http://127.0.0.1:8080/agents/agents/alpha
-curl -fsS http://127.0.0.1:8080/agents/agents/beta
+node scripts/model-provider.mjs --port 8788
+CELLD_VAR_MODEL_PROVIDER_URL=http://127.0.0.1:8788/v1/chat \
+CELLD_AI_URL=http://127.0.0.1:8788/v1/ai \
+celld --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
 ```
 
 ### Hibernating session procedure
@@ -143,3 +155,52 @@ respectively. State reads return the selected Agent state and only that Agent's
 SQL row after local activation and reopen. The route responses identify
 `surface: "routeAgentRequest"`. The supported/adapted/unsupported decisions are
 in [`compatibility-matrix.md`](compatibility-matrix.md).
+`MODEL_PROVIDER_URL` is injected by the node's deployment capability and is
+not in the Worker source. `CELLD_AI_URL` supplies the optional Cloudflare-shaped
+`env.AI.run(model, input)` adapter. Provider credentials belong to the
+operator-owned HTTP endpoint (or its proxy); this fixture never places a token
+in Worker vars, generated code, Workspace contents, or default telemetry.
+
+Then check persistence and streaming through the public listener:
+
+```sh
+curl -fsS -N http://127.0.0.1:8080/conformance/chat/alpha \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"id":"m1","role":"user","content":"hello"}]}'
+
+curl -fsS http://127.0.0.1:8080/conformance/messages/alpha
+# Use the response's x-celld-response-id. Query the durable cursor after a disconnect.
+curl -fsS 'http://127.0.0.1:8080/conformance/resume/alpha?response=<response-id>&status=1'
+# Then resume after the returned cursor.
+curl -fsS -N 'http://127.0.0.1:8080/conformance/resume/alpha?response=<response-id>&after=<cursor>'
+curl -fsS -X POST http://127.0.0.1:8080/conformance/ai-adapter/alpha \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"id":"m2","role":"user","content":"hello"}]}'
+```
+
+The deterministic provider uses an explicit `ndjson-v1` frame sequence over
+HTTP; the Agent emits only each frame's text, so transport read coalescing
+cannot change the durable cursor. It returns the complete response
+`deterministic response for hello`. Interrupt the stream after a chunk, then resume with the
+returned response ID and cursor; the resumed body contains the missing suffix
+and the completed response is stored in SQLite. After an idle eviction or node
+restart, repeat the resume request and `/conformance/messages/alpha`; verify the
+same chunks and both user and assistant messages remain. A 30-second lease
+is renewed every 10 seconds while a provider fetch/stream is active; if the
+heartbeat is lost, the stale stream cannot advance the durable cursor. This
+fixture proves
+checkpoint-before-exposure and local close/reopen behavior; it does not claim
+that a live-fleet output-gate acknowledgement replaces the existing ownership
+and replication tests. The adapter endpoint is
+an availability check for the Cloudflare-shaped path; the streamed-response
+evidence uses ordinary `fetch()` as required by this ticket.
+
+If `MODEL_PROVIDER_URL` is absent, chat returns a `503` with
+`missing_deployment_capability` and an actionable message. If the AI binding
+is declared but `CELLD_AI_URL` is absent, `env.AI.run()` fails with the same
+clear deployment-capability error instead of an undefined binding. Full bucket
+restore, ownership-transfer, and output-gate coverage belongs to the live-fleet
+runtime harness.
+
+The supported/adapted/unsupported decisions are in
+[`compatibility-matrix.md`](compatibility-matrix.md).

@@ -302,8 +302,21 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 name, database
             ));
         }
-        if let (Some(name), Ok(url)) = (ai_binding, std::env::var("CELLD_AI_URL")) {
-            lines.push_str(&format!("e[{:?}] = __makeAiBinding({:?});\n", name, url));
+        if let Some(name) = ai_binding {
+            match std::env::var("CELLD_AI_URL") {
+                Ok(url) if !url.trim().is_empty() => {
+                    lines.push_str(&format!(
+                        "e[{:?}] = __makeAiBinding({:?}, {:?});\n",
+                        name, name, url
+                    ));
+                }
+                _ => {
+                    lines.push_str(&format!(
+                        "e[{:?}] = __makeMissingAiBinding({:?});\n",
+                        name, name
+                    ));
+                }
+            }
         }
         for (binding, script, entrypoint) in services {
             let entrypoint = match entrypoint {

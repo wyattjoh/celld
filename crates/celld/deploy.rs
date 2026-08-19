@@ -39,6 +39,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "durable_objects",
     "migrations",
     "assets",
+    "ai",
     "services",
     "triggers",
     "vars",
@@ -271,6 +272,7 @@ impl Built {
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
                     )),
+                    Some("ai") => Some((format!("env.{name} (AI)"), "HTTP AI adapter".to_string())),
                     _ => None,
                 }
             })
@@ -843,6 +845,27 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         do_classes.push(D1_CLASS.to_string());
         sqlite_classes.push(D1_CLASS.to_string());
     }
+    let ai_binding = match object.get("ai") {
+        None => None,
+        Some(Value::Object(ai)) => {
+            let binding = ai
+                .get("binding")
+                .and_then(Value::as_str)
+                .filter(|binding| !binding.is_empty())
+                .ok_or_else(|| anyhow!("config `ai.binding` must be a non-empty string"))?;
+            if !valid_binding(binding) {
+                bail!("invalid AI binding name: {binding:?}");
+            }
+            Some(binding)
+        }
+        Some(_) => bail!("config `ai` must be an object"),
+    };
+    if let Some(name) = ai_binding {
+        bindings.push(json!({
+            "type": "ai",
+            "name": name,
+        }));
+    }
     let vars = match object.get("vars") {
         None => None,
         Some(Value::Object(vars)) => Some(vars),
@@ -866,6 +889,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     if main.is_none()
         && (!do_classes.is_empty()
             || !sqlite_classes.is_empty()
+            || ai_binding.is_some()
             || service_count > 0
             || var_count > 0)
     {
