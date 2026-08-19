@@ -1525,10 +1525,34 @@ pub(crate) async fn drive(
     drive_affiliated(slot.affiliate(), job, telemetry).await;
 }
 
+/// Drive a loaded worker with its Code Mode timeout rather than the normal
+/// Worker handler budget. The host capability call, if any, remains an
+/// independent authoritative event and is never rolled back by this timeout.
+pub(crate) async fn drive_loaded_worker(slot: Arc<crate::pool::Slot>, job: crate::WorkerJob) {
+    drive_affiliated_with_budget(
+        slot.affiliate(),
+        job,
+        None,
+        js::loaded_worker_budget(),
+        Some(celld_logic::code_mode::EXECUTION_TIMEOUT_ERROR),
+    )
+    .await;
+}
+
 async fn drive_affiliated(
     affiliation: crate::pool::Affiliation,
     job: crate::WorkerJob,
     telemetry: Option<(Arc<str>, Arc<str>)>,
+) {
+    drive_affiliated_with_budget(affiliation, job, telemetry, js::handler_budget(), None).await;
+}
+
+async fn drive_affiliated_with_budget(
+    affiliation: crate::pool::Affiliation,
+    job: crate::WorkerJob,
+    telemetry: Option<(Arc<str>, Arc<str>)>,
+    budget: Duration,
+    timeout_error: Option<&'static str>,
 ) {
     let slot = affiliation.slot().clone();
     // One sampling decision per request, shared by the SERVER span and
@@ -1545,7 +1569,6 @@ async fn drive_affiliated(
     // here for the request's whole life, so maintenance cannot free the heap
     // between placement and this first turn or while a promise is suspended.
     let _affiliation = affiliation;
-    let budget = js::handler_budget();
     let mut ops = Ops::new();
 
     let mut job = Some(job);
@@ -1591,7 +1614,11 @@ async fn drive_affiliated(
                 }
             },
             Wake::Expired => {
-                entry.time_out(budget);
+                if let Some(error) = timeout_error {
+                    entry.time_out_with(error);
+                } else {
+                    entry.time_out(budget);
+                }
                 break;
             }
             Wake::Idle => {

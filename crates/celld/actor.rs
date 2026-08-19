@@ -1188,6 +1188,8 @@ impl Actor {
             Ownership::Memory(_) => random_process_generation(),
         };
         let ttl_ms = crate::env_vars::positive_or("CELLD_TTL_MS", 10_000)?;
+        let pressure = pressure_config_from_environment()?;
+        crate::js::configure_code_mode_memory_limit(pressure.rss_hard_bytes);
         let lease_spec = NodeLeaseSpec {
             // Startup has already resolved the environment and CLI settings
             // into this validated internal address. Reading the environment
@@ -1217,7 +1219,7 @@ impl Actor {
                     )?),
                     idle_evict_ms: crate::env_vars::positive::<u64>("CELLD_IDLE_EVICT_S")?
                         .map(|seconds| seconds.saturating_mul(1_000)),
-                    pressure: pressure_config_from_environment()?,
+                    pressure,
                     max_outbound_websockets: crate::env_vars::positive_or(
                         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
                         DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
@@ -1402,6 +1404,11 @@ impl Actor {
                 };
                 let now_mono_ms = crate::asyncrt::mono_ms();
                 self.drive(Event::LoadSampled { load, now_mono_ms }, out);
+                // Code Mode is disposable compute. Pressure rejects new loads
+                // and calls, then evicts only idle loaded workers; the owning
+                // cell and its authoritative Workspace state remain under the
+                // core's normal durability and fencing gates.
+                crate::js::set_code_mode_pressure(self.state.shedding(), load.rss_bytes);
                 // Report a change of shed reason once. `rss-hard` is the one
                 // that needs an operator: it says the resident set size crossed
                 // the absolute cap, so the allocator is holding memory that

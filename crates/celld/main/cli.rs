@@ -306,8 +306,14 @@ TUNING:
   CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
   CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
-  CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
-  CELLD_HANDLER_BUDGET_S          JavaScript handler budget
+  CELLD_MAX_LOADED_WORKERS         Loaded Code Mode worker ceiling (default: 256)
+  CELLD_MAX_LOADED_WORKER_MEMORY_MB
+                                  Code Mode memory admission ceiling
+  CELLD_MAX_LOADED_WORKER_CONCURRENCY
+                                  Concurrent Code Mode executions (default: 64)
+  CELLD_LOADED_WORKER_TIMEOUT_S    Code Mode execution timeout
+  CELLD_FETCH_TIMEOUT_S            Outbound fetch timeout
+  CELLD_HANDLER_BUDGET_S           JavaScript handler budget
   CELLD_TOKIO_THREADS             Tokio runtime worker threads
   CELLD_OUTPUT_GATE               `0` removes the durability wait from writes
   RUST_LOG                        Runtime log filter (default: info)

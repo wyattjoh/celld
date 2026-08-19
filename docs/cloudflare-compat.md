@@ -227,11 +227,21 @@ Loader](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-l
 new isolate for each loaded worker. These inputs are honored:
 `mainModule`, sibling `modules`, `compatibilityDate`/`Flags`, plain-JSON
 `env`, `globalOutbound: null` (no egress), and an explicit Fetcher broker.
-The limits of workerd apply: 64 MiB of code and 1 MiB of env, plus the
-`CELLD_MAX_LOADED_WORKERS` limit. A loaded worker serves `fetch()` and single
-RPC method calls. Capability values use an opaque sideband; host objects and
-credentials never enter the loaded Worker's JSON environment. The sideband
-supports the pinned Workspace, Library, Tools, and Fetcher proxy surfaces.
+The limits of workerd apply: 64 MiB of code and 1 MiB of env. celld
+additionally bounds retained workers with `CELLD_MAX_LOADED_WORKERS` (default
+256), concurrent loaded-worker fetch/RPC/capability calls with
+`CELLD_MAX_LOADED_WORKER_CONCURRENCY` (default 64), and each loaded-worker
+response with `CELLD_LOADED_WORKER_TIMEOUT_S` (defaulting to the normal handler
+budget). `CELLD_MAX_LOADED_WORKER_MEMORY_MB` can set a node-wide Code Mode
+reservation ceiling; otherwise the reservation is derived from the per-isolate
+V8 heap limit and worker ceiling. Each bound has a distinct refusal error, and
+pressure shedding rejects only new Code Mode work. Idle loaded workers may be
+evicted under pressure, while active calls finish their lifecycle and host
+mutations still use the owning cell's normal output gate. A loaded worker
+serves `fetch()` and single RPC method calls. Capability values use an opaque
+sideband; host objects and credentials never enter the loaded Worker's JSON
+environment. The sideband supports the pinned Workspace, Library, Tools, and
+Fetcher proxy surfaces:
 
 ```js
 const outbound = env.LOADER.fetcher(env.HTTP_GATEWAY, {
@@ -297,7 +307,10 @@ operations with bounded denials. When an Agent cell is evicted or its
 activation ends, its loaded-worker registry entries are revoked immediately and
 host references are released after in-flight calls settle. Awaitable properties
 and pipelined capability calls remain unsupported. Unsupported values fail
-with `DataCloneError` rather than crossing as host objects.
+with `DataCloneError` rather than crossing as host objects. Pressure does not
+roll back an acknowledged Workspace mutation or evict its Agent cell: Code Mode
+is disposable compute, while the cell remains the authoritative state and
+mutation boundary.
 
 ## Computer filesystem-only Workspace
 

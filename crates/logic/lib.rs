@@ -12,6 +12,7 @@ pub mod alarm;
 pub mod cache;
 pub mod capability;
 pub mod cell;
+pub mod code_mode;
 pub mod cron;
 pub mod dead_node_reconciliation;
 pub mod gate;

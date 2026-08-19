@@ -50,6 +50,14 @@ the same cell write position used by the output gate. These focused tests
 establish the seam; without a live bucket evidence bundle they do not claim
 eviction, restart, or ownership-transfer behavior on a fleet.
 
+Code Mode admission is tested in the pure logic crate rather than by sleeping
+against V8: code bytes, env bytes, retained workers, execution concurrency,
+reserved memory, and pressure each have a distinct deterministic refusal. The
+runtime tests cover disposal races, idle-worker shedding, and release after
+in-flight capability calls. Pressure sheds only disposable loaded-worker work;
+the authoritative Agent cell and its acknowledged Workspace mutations remain
+under the ordinary cell and output-gate tests.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is also specified in TLA+. Heyang Zhou wrote

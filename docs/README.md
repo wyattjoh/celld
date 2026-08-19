@@ -377,7 +377,10 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_ACTIVATIONS` | The limit for concurrent cold-cell activations (default: the available CPU count or 128, whichever is smaller) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLD_WORKER_LOADER` | Bind a Worker Loader (Code Mode) at this `env` name. A Worker can then start isolates at runtime. Off unless set (experimental) |
-| `CELLD_MAX_LOADED_WORKERS` | The limit for concurrent loaded workers (default: 256) |
+| `CELLD_MAX_LOADED_WORKERS` | The retained Code Mode worker limit (default: 256) |
+| `CELLD_MAX_LOADED_WORKER_CONCURRENCY` | Concurrent Code Mode fetch/RPC/capability calls (default: 64) |
+| `CELLD_LOADED_WORKER_TIMEOUT_S` | Code Mode response timeout (defaults to `CELLD_HANDLER_BUDGET_S`) |
+| `CELLD_MAX_LOADED_WORKER_MEMORY_MB` | Optional node-wide Code Mode memory admission ceiling |
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding, applied to the memory that the cells hold (default: 80% of the available memory; 0 disables the threshold and the absolute cap) |
 | `CELLD_OUTPUT_GATE` | The default is `1`, so celld proves each write durable before it acknowledges the write. Set `0` to remove the replication wait and accept possible loss of an acknowledged write |

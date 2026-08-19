@@ -299,3 +299,22 @@ test("Worker JavaScript failure paths stay bounded and no-egress", async () => {
   assert.match(docs, /non-JSON/);
   assert.match(docs, /no\s+ambient network access/);
 });
+
+test("Code Mode admission bounds are distinct and pressure preserves cell authority", async () => {
+  const runtime = await source("crates/celld/js.rs");
+  const logic = await source("crates/logic/code_mode.rs");
+  const main = await source("crates/celld/main.rs");
+  assert.match(logic, /CodeSize/);
+  assert.match(logic, /EnvSize/);
+  assert.match(logic, /WorkerLimit/);
+  assert.match(logic, /ConcurrencyLimit/);
+  assert.match(logic, /MemoryLimit/);
+  assert.match(logic, /Pressured/);
+  assert.match(runtime, /CELLD_MAX_LOADED_WORKER_CONCURRENCY/);
+  assert.match(runtime, /CELLD_LOADED_WORKER_TIMEOUT_S/);
+  assert.match(runtime, /memory admission limit exceeded/);
+  assert.match(runtime, /pressure shedding rejects new Code Mode work/);
+  assert.match(runtime, /drive_loaded_worker/);
+  assert.match(main, /set_code_mode_pressure/);
+  assert.match(main, /authoritative Workspace state remain/);
+});

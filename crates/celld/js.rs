@@ -2100,6 +2100,11 @@ impl InFlight {
         self.fail(error);
     }
 
+    /// Give up on a bounded runtime with its stable, caller-visible error.
+    pub fn time_out_with(&mut self, error: &'static str) {
+        self.fail(anyhow!(error));
+    }
+
     /// Nothing this request awaits can move it, so it will never settle on
     /// its own. Reachable when a handler awaits a promise only some *other*
     /// request could resolve — which the pump concealed, because it settled
@@ -4029,9 +4034,162 @@ fn op_svc_call_impl(
 
 // Mirror the workerd dynamic-worker limits (worker-loader.c++): 64 MiB total
 // module bytes, 1 MiB env. Messages match so the conformance cases pass.
-const MAX_DYNAMIC_WORKER_CODE_SIZE: usize = 64 * 1024 * 1024;
-const MAX_DYNAMIC_WORKER_ENV_SIZE: usize = 1024 * 1024;
+const MAX_DYNAMIC_WORKER_CODE_SIZE: usize = celld_logic::code_mode::DEFAULT_MAX_CODE_BYTES;
+const MAX_DYNAMIC_WORKER_ENV_SIZE: usize = celld_logic::code_mode::DEFAULT_MAX_ENV_BYTES;
 const MAX_DYNAMIC_WORKER_CAPABILITIES: u32 = 64;
+
+static CODE_MODE_ADMISSION: OnceLock<Mutex<celld_logic::code_mode::Admission>> = OnceLock::new();
+
+fn code_mode_limits() -> celld_logic::code_mode::Limits {
+    let max_workers = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
+        .expect("validated CELLD_MAX_LOADED_WORKERS");
+    let worker_memory_bytes = v8_heap_limit_bytes() as u64;
+    let default_memory_bytes = worker_memory_bytes.saturating_mul(max_workers as u64);
+    let configured_memory_bytes =
+        crate::env_vars::optional::<u64>("CELLD_MAX_LOADED_WORKER_MEMORY_MB")
+            .expect("validated CELLD_MAX_LOADED_WORKER_MEMORY_MB")
+            .map(|megabytes| {
+                megabytes
+                    .checked_mul(1024 * 1024)
+                    .expect("validated CELLD_MAX_LOADED_WORKER_MEMORY_MB range")
+            });
+    celld_logic::code_mode::Limits {
+        max_code_bytes: MAX_DYNAMIC_WORKER_CODE_SIZE,
+        max_env_bytes: MAX_DYNAMIC_WORKER_ENV_SIZE,
+        max_workers,
+        max_concurrent_executions: crate::env_vars::positive_or(
+            "CELLD_MAX_LOADED_WORKER_CONCURRENCY",
+            celld_logic::code_mode::DEFAULT_MAX_CONCURRENT_EXECUTIONS,
+        )
+        .expect("validated CELLD_MAX_LOADED_WORKER_CONCURRENCY"),
+        execution_timeout_ms: loaded_worker_budget().as_millis().min(u64::MAX as u128) as u64,
+        worker_memory_bytes,
+        max_memory_bytes: Some(configured_memory_bytes.unwrap_or(default_memory_bytes)),
+    }
+}
+
+fn code_mode_admission() -> &'static Mutex<celld_logic::code_mode::Admission> {
+    CODE_MODE_ADMISSION
+        .get_or_init(|| Mutex::new(celld_logic::code_mode::Admission::new(code_mode_limits())))
+}
+
+fn code_mode_error(error: celld_logic::code_mode::AdmissionError) -> String {
+    use celld_logic::code_mode::AdmissionError;
+    match error {
+        AdmissionError::CodeSize { actual, limit } => format!(
+            "Dynamic Worker code size ({actual} bytes) exceeds the maximum allowed size of {limit} bytes."
+        ),
+        AdmissionError::EnvSize { actual, limit } => format!(
+            "Dynamic Worker env size ({actual} bytes) exceeds the maximum allowed size of {limit} bytes."
+        ),
+        AdmissionError::WorkerLimit { active, limit } => {
+            format!("worker loader: too many loaded workers (active {active}, limit {limit})")
+        }
+        AdmissionError::ConcurrencyLimit { active, limit } => format!(
+            "worker loader: execution concurrency limit exceeded (active {active}, limit {limit})"
+        ),
+        AdmissionError::MemoryLimit {
+            observed,
+            reserved,
+            requested,
+            limit,
+        } => format!(
+            "worker loader: memory admission limit exceeded (observed {observed}, reserved {reserved}, requested {requested}, limit {limit} bytes)"
+        ),
+        AdmissionError::Pressured => {
+            "worker loader: pressure shedding rejects new Code Mode work".into()
+        }
+    }
+}
+
+fn admit_loader_worker(code_bytes: usize, env_bytes: usize) -> Result<u64, String> {
+    let mut admission = code_mode_admission()
+        .lock()
+        .expect("Code Mode admission poisoned");
+    admission.observe_memory(celld_logic::code_mode::MemorySample {
+        resident_bytes: crate::memory::sample().rss_bytes,
+    });
+    let memory_bytes = admission.limits().worker_memory_bytes;
+    admission
+        .admit_worker(celld_logic::code_mode::WorkerRequest {
+            code_bytes,
+            env_bytes,
+            memory_bytes,
+        })
+        .map(|reservation| reservation.memory_bytes)
+        .map_err(code_mode_error)
+}
+
+fn release_loader_worker(memory_bytes: u64) {
+    code_mode_admission()
+        .lock()
+        .expect("Code Mode admission poisoned")
+        .release_worker(celld_logic::code_mode::WorkerReservation { memory_bytes });
+}
+
+struct CodeModeExecutionGuard;
+
+impl Drop for CodeModeExecutionGuard {
+    fn drop(&mut self) {
+        code_mode_admission()
+            .lock()
+            .expect("Code Mode admission poisoned")
+            .release_execution(celld_logic::code_mode::ExecutionReservation);
+    }
+}
+
+fn admit_code_mode_execution() -> Result<CodeModeExecutionGuard, String> {
+    code_mode_admission()
+        .lock()
+        .expect("Code Mode admission poisoned")
+        .admit_execution()
+        .map(|_| CodeModeExecutionGuard)
+        .map_err(code_mode_error)
+}
+
+/// Apply the node's pressure sample to Code Mode admission.
+///
+/// Pressure closes only new loaded-worker loads and calls. Existing calls keep
+/// their lifecycle reservations, so an acknowledged Workspace mutation is not
+/// interrupted or rolled back by shedding. Ready idle workers are disposable
+/// and are evicted after their host references finish releasing.
+pub fn set_code_mode_pressure(pressured: bool, resident_bytes: u64) {
+    {
+        let mut admission = code_mode_admission()
+            .lock()
+            .expect("Code Mode admission poisoned");
+        admission.observe_memory(celld_logic::code_mode::MemorySample { resident_bytes });
+        admission.set_pressured(pressured);
+    }
+    if pressured {
+        shed_idle_loaded_workers();
+    }
+}
+
+/// Apply a node-wide RSS safety cap without resetting active reservations.
+pub fn configure_code_mode_memory_limit(node_limit: Option<u64>) {
+    let mut admission = code_mode_admission()
+        .lock()
+        .expect("Code Mode admission poisoned");
+    let configured = admission.limits().max_memory_bytes;
+    let effective = match (configured, node_limit) {
+        (Some(configured), Some(node_limit)) => Some(configured.min(node_limit)),
+        (Some(configured), None) => Some(configured),
+        (None, node_limit) => node_limit,
+    };
+    admission.set_max_memory_bytes(effective);
+}
+
+pub(crate) fn loaded_worker_budget() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let default = handler_budget().as_secs().max(1);
+        Duration::from_secs(
+            crate::env_vars::positive_or("CELLD_LOADED_WORKER_TIMEOUT_S", default)
+                .expect("validated CELLD_LOADED_WORKER_TIMEOUT_S"),
+        )
+    })
+}
 
 #[derive(Clone)]
 enum LoaderState {
@@ -4065,6 +4223,10 @@ impl CapabilityLifecycle {
 
     fn is_live(&self) -> bool {
         self.state.load(Ordering::Acquire)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire) == 0
     }
 
     fn dispose(&self) {
@@ -4302,6 +4464,53 @@ mod loader_capability_tests {
         );
         http_streams().lock().unwrap().remove(&9001);
     }
+
+    #[test]
+    fn runtime_maps_each_code_mode_admission_failure_to_a_distinct_error() {
+        use celld_logic::code_mode::AdmissionError;
+        let errors = [
+            code_mode_error(AdmissionError::CodeSize {
+                actual: 2,
+                limit: 1,
+            }),
+            code_mode_error(AdmissionError::EnvSize {
+                actual: 2,
+                limit: 1,
+            }),
+            code_mode_error(AdmissionError::WorkerLimit {
+                active: 2,
+                limit: 1,
+            }),
+            code_mode_error(AdmissionError::ConcurrencyLimit {
+                active: 2,
+                limit: 1,
+            }),
+            code_mode_error(AdmissionError::MemoryLimit {
+                observed: 2,
+                reserved: 2,
+                requested: 2,
+                limit: 1,
+            }),
+            code_mode_error(AdmissionError::Pressured),
+        ];
+        let distinct = errors.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), errors.len());
+        assert!(errors
+            .iter()
+            .all(|error| error.contains("worker loader") || error.starts_with("Dynamic Worker")));
+    }
+
+    #[test]
+    fn pressure_does_not_dispose_an_in_flight_capability_call() {
+        let lifecycle = Arc::new(CapabilityLifecycle::live());
+        let call = lifecycle.acquire("workspace").expect("live capability");
+        lifecycle.dispose();
+        assert!(!lifecycle.is_idle());
+        assert!(!lifecycle.is_live());
+        drop(call);
+        assert!(lifecycle.is_idle());
+    }
+    }
 }
 
 struct LoadedCapability {
@@ -4318,6 +4527,9 @@ struct LoadedWorkerEntry {
     /// A random bearer guard for host-side fetch/RPC/dispose operations. The
     /// numeric worker id is intentionally not an authority or a capability.
     control_token: String,
+    /// Reservation charged until the worker and all host capability roots are
+    /// fully disposed.
+    memory_bytes: u64,
     host_slot: Weak<crate::pool::Slot>,
     /// The cell event that minted this worker, when one exists. Ownership
     /// loss revokes entries by this scope even when the host isolate is shared.
@@ -4334,6 +4546,35 @@ fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
     LOADER_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+fn shed_idle_loaded_workers() {
+    let victims = {
+        let mut registry = loader_registry().lock().unwrap();
+        let ids: Vec<u64> = registry
+            .iter()
+            .filter(|(_, entry)| {
+                entry.lifecycle.is_idle() && matches!(*entry.state.borrow(), LoaderState::Ready(_))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut victims = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = registry.remove(&id) {
+                // Dispose under the registry lock. A caller that cloned the
+                // entry before this removal may still finish, but no new call
+                // can acquire a lifecycle reservation after this edge.
+                entry.lifecycle.dispose();
+                victims.push(entry);
+            }
+        }
+        victims
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        for entry in victims {
+            handle.spawn(release_loader_entry(entry));
+        }
+    }
+}
+
 fn random_loader_token(prefix: &str) -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("OS random source unavailable");
@@ -4346,6 +4587,7 @@ fn random_loader_token(prefix: &str) -> String {
 
 fn next_capability_token() -> String {
     random_loader_token("cap")
+}
 }
 
 fn capability_error(error: celld_logic::capability::AuthorizationError) -> String {
@@ -4559,14 +4801,16 @@ fn op_loader_load(
     // Total module bytes, checked before compiling anything (the oversized
     // module is never parsed) — the extra modules are not yet loaded but do
     // count against the ceiling, as upstream.
-    let code_size: usize = src.len()
-        + modules
-            .iter()
-            .map(|(_, source)| match source {
+    let code_size = modules
+        .iter()
+        .try_fold(src.len(), |total, (_, source)| {
+            let bytes = match source {
                 ModuleSource::Text(source) | ModuleSource::EsModule(source) => source.len(),
                 ModuleSource::Wasm(bytes) => bytes.len(),
-            })
-            .sum::<usize>();
+            };
+            total.checked_add(bytes)
+        })
+        .unwrap_or(usize::MAX);
     if code_size > MAX_DYNAMIC_WORKER_CODE_SIZE {
         return loader_throw(
             scope,
@@ -4633,16 +4877,6 @@ fn op_loader_load(
             }
         }
     };
-    // Bound live loaded workers so a runaway agent loop cannot exhaust
-    // isolates. Evicted workers (dropped stubs) free their slot.
-    let max = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
-        .expect("validated CELLD_MAX_LOADED_WORKERS");
-    if loader_registry().lock().unwrap().len() >= max {
-        return loader_throw(
-            scope,
-            &format!("worker loader: too many loaded workers (limit {max})"),
-        );
-    }
     // Honor the WorkerCode's declared compatibility (workerd worker_compat
     // reads snake_case keys); Code Mode workers keep RPC on regardless.
     let mut compat = crate::worker_compat(&serde_json::json!({
@@ -4854,6 +5088,15 @@ fn op_loader_load(
             catalog: None,
         });
     }
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
+    };
+    let memory_bytes =
+        match admit_loader_worker(code_size, loader_env.as_ref().map_or(0, String::len)) {
+            Ok(memory_bytes) => memory_bytes,
+            Err(error) => return loader_throw(scope, &error),
+        };
     if !host_capabilities.is_empty() {
         host_state
             .capabilities
@@ -4887,10 +5130,6 @@ fn op_loader_load(
             agent_scope.clone(),
         ),
     );
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle,
-        Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
-    };
     let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
     let lifecycle = Arc::new(CapabilityLifecycle::live());
     let control_token = random_loader_token("worker");
@@ -4900,6 +5139,7 @@ fn op_loader_load(
         agent_scope,
         owner,
         control_token: control_token.clone(),
+        memory_bytes,
         host_slot,
         host_scope,
         capabilities: Mutex::new(loaded_capabilities),
@@ -4907,17 +5147,25 @@ fn op_loader_load(
     });
     loader_registry().lock().unwrap().insert(id, entry);
     handle.spawn(async move {
-        let state =
-            match tokio::task::spawn_blocking(move || Worker::load_config(config, &[])).await {
-                Ok(Ok(worker)) => {
+        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config, &[]))
+            .await
+        {
+            Ok(Ok(worker)) => {
+                if lifecycle.is_live() {
                     loaded.send_replace(LoaderState::Ready(crate::pool::Slot::standalone(worker)));
-                    return;
                 }
-                Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
-                Err(error) => LoaderState::Failed(Arc::from(format!(
-                    "worker loader: load task failed: {error}"
-                ))),
-            };
+                // A finalizer or pressure shed may have disposed the
+                // entry while compilation was running. In that race the
+                // newly built isolate is dropped here; the disposer that
+                // owns the registry entry releases its reservation and
+                // host capability roots after its in-flight calls settle.
+                return;
+            }
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+            Err(error) => LoaderState::Failed(Arc::from(format!(
+                "worker loader: load task failed: {error}"
+            ))),
+        };
         lifecycle.dispose();
         loaded.send_replace(state);
         release_loader_entry_by_id(id).await;
@@ -4972,6 +5220,7 @@ fn op_loader_fetch(
     let headers =
         serde_json::from_str(&args.get(5).to_rust_string_lossy(scope)).unwrap_or_default();
     let async_id = asyncrt::enqueue(async move {
+        let _execution = admit_code_mode_execution()?;
         let _call = entry.lifecycle.acquire("worker").map_err(|error| {
             loader_interruption(
                 celld_logic::capability::InterruptionClass::WorkerDisposed,
@@ -4996,7 +5245,7 @@ fn op_loader_fetch(
             request_id: None,
             reply,
         };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        let driving = tokio::spawn(crate::runtime::drive_loaded_worker(slot, job));
         match receive.await {
             Ok(Ok(response)) => Ok(encode_http_response(response, false)),
             Ok(Err(error)) => Err(loader_result_error(
@@ -5053,6 +5302,7 @@ fn op_loader_rpc(
     let method = args.get(3).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(4)).unwrap_or_default();
     let async_id = asyncrt::enqueue(async move {
+        let _execution = admit_code_mode_execution()?;
         let _call = entry.lifecycle.acquire("worker").map_err(|error| {
             loader_interruption(
                 celld_logic::capability::InterruptionClass::WorkerDisposed,
@@ -5074,7 +5324,7 @@ fn op_loader_rpc(
             args: call_args,
             reply,
         };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        let driving = tokio::spawn(crate::runtime::drive_loaded_worker(slot, job));
         match receive.await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(loader_result_error(
@@ -5144,21 +5394,25 @@ async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
         }
         tokens.push(token);
     }
-    let Some(slot) = entry.host_slot.upgrade() else {
-        return;
-    };
     let owner = entry.owner;
-    if slot
-        .try_turn(move |worker| worker.release_loader_capabilities(owner, &tokens))
-        .await
-        .is_none()
-    {
-        tracing::debug!(
-            event = "loaded_worker_host_already_freed",
-            owner,
-            "host isolate was freed before capability references were removed"
-        );
+    let memory_bytes = entry.memory_bytes;
+    if let Some(slot) = entry.host_slot.upgrade() {
+        if slot
+            .try_turn(move |worker| worker.release_loader_capabilities(owner, &tokens))
+            .await
+            .is_none()
+        {
+            tracing::debug!(
+                event = "loaded_worker_host_already_freed",
+                owner,
+                "host isolate was freed before capability references were removed"
+            );
+        }
     }
+    // The reservation is released last: host-side persistent handles and all
+    // in-flight capability calls are gone before another worker may claim the
+    // same memory budget.
+    release_loader_worker(memory_bytes);
 }
 
 fn take_loader_entries(
@@ -5387,6 +5641,21 @@ fn op_loader_capability_call(
     ) {
         return loader_throw(scope, &capability_error(error));
     }
+
+    let Some(host_slot) = entry.host_slot.upgrade() else {
+        schedule_loader_entry_release(entry.id);
+        return loader_throw(
+            scope,
+            &loader_interruption(
+                celld_logic::capability::InterruptionClass::HostCellLost,
+                "capability host is no longer live",
+            ),
+        );
+    };
+    let execution = match admit_code_mode_execution() {
+        Ok(execution) => execution,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let worker_call = match entry.lifecycle.acquire("worker") {
         Ok(call) => call,
         Err(error) => {
@@ -5411,16 +5680,6 @@ fn op_loader_capability_call(
             )
         }
     };
-    let Some(host_slot) = entry.host_slot.upgrade() else {
-        schedule_loader_entry_release(entry.id);
-        return loader_throw(
-            scope,
-            &loader_interruption(
-                celld_logic::capability::InterruptionClass::HostCellLost,
-                "capability host is no longer live",
-            ),
-        );
-    };
     let owner = entry.owner.to_string();
     let job_kind = kind.as_str().to_string();
     let (reply, receive) = tokio::sync::oneshot::channel();
@@ -5434,6 +5693,7 @@ fn op_loader_capability_call(
         reply,
     };
     let async_id = asyncrt::enqueue(async move {
+        let _execution = execution;
         let _worker_call = worker_call;
         let _capability_call = capability_call;
         let driving = tokio::spawn(crate::runtime::drive(host_slot, job, None));

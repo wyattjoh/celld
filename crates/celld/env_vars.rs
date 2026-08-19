@@ -35,6 +35,8 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_LTX_COMPACTIONS",
         "CELLD_LTX_COMPACTION_MIN_TXIDS",
         "CELLD_MAX_LOADED_WORKERS",
+        "CELLD_MAX_LOADED_WORKER_CONCURRENCY",
+        "CELLD_LOADED_WORKER_TIMEOUT_S",
         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
         "CELLD_MAX_REQUESTS",
         "CELLD_MAX_STATELESS_ISOLATES",
@@ -54,6 +56,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ASSET_CACHE_BYTES",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
+        "CELLD_MAX_LOADED_WORKER_MEMORY_MB",
         "CELLD_MAX_RSS_MB",
     ] {
         optional::<u64>(name)?;
@@ -68,6 +71,11 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(megabytes) = positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")? {
         if megabytes.checked_mul(1024 * 1024).is_none() {
             bail!("CELLD_V8_HEAP_LIMIT_MB is too large: {megabytes}");
+        }
+    }
+    if let Some(megabytes) = optional::<u64>("CELLD_MAX_LOADED_WORKER_MEMORY_MB")? {
+        if megabytes.checked_mul(1024 * 1024).is_none() {
+            bail!("CELLD_MAX_LOADED_WORKER_MEMORY_MB is too large: {megabytes}");
         }
     }
 
