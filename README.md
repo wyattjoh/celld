@@ -91,6 +91,8 @@ deploys the pinned [`agents-conformance`](examples/agents-conformance/README.md)
 application, and starts celld with Worker Loader enabled:
 
 ```sh
+# Override this when running another copy of the lab at the same time.
+export CELLD_COMPOSE_PROJECT=celld-behavioral
 docker compose up --build -d celld
 docker compose --profile test run --rm e2e
 ```
@@ -98,10 +100,16 @@ docker compose --profile test run --rm e2e
 The E2E runner waits for celld and then exercises two independently named
 Agents, state and SQL isolation, Workspace files, Worker Shell, Worker
 JavaScript and loader modules, streamed chat and resume, the HTTP AI adapter,
-and delayed Agent scheduling. Each check prints a `PASS` line. The public
-Worker listener is at <http://127.0.0.1:8080>, MinIO's API and console are at
-<http://127.0.0.1:9000> and <http://127.0.0.1:9001>, and the private operator
-listener is bound only to <http://127.0.0.1:8081> for manual lifecycle tests.
+and delayed Agent scheduling. Each check prints a `PASS` line. The stack
+publishes no host ports: celld, MinIO, and the model provider communicate only
+on the Compose project network, so the lab cannot collide with another stack's
+host listeners. Use a throwaway client container on that network for manual
+requests, for example:
+
+```sh
+docker compose run --rm --entrypoint node e2e -e \
+  'fetch("http://celld:8080/conformance/names").then(async (r) => console.log(await r.text()))'
+```
 
 After changing the Worker fixture, deploy it again and restart the node because
 running nodes intentionally retain the deployment they loaded at startup:
@@ -115,7 +123,7 @@ Inspect or stop the stack with:
 
 ```sh
 docker compose logs -f celld
-docker compose down          # keep local MinIO/celld data
+docker compose down           # keep local MinIO/celld data
 docker compose down --volumes # reset the entire lab
 ```
 

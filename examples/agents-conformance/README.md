@@ -4,7 +4,8 @@ This is the smallest source-unmodified multi-Agent application for celld. It
 pins `@cloudflare/agents@0.0.16`, `ai@4.3.19`,
 `@cloudflare/computer@0.2.1`, and `just-bash@3.4.0`; the exact resolved package
 integrity values and complete lockfile digest are recorded in
-[`compatibility.json`](compatibility.json).
+[`compatibility.json`](compatibility.json). The retired white-box assertion
+mapping is documented in [`coverage-map.md`](coverage-map.md).
 The `ai` version is pinned because the published `AIChatAgent` implementation
 uses its `appendResponseMessages` helper.
 
@@ -158,16 +159,31 @@ and `CELLD_READINESS_TIMEOUT_MS` set bounded positive-integer request and
 readiness/polling limits (defaults: 10000 and 60000). The runner prints one
 `PASS` or `FAIL` line per step and covers named-Agent state/SQL isolation,
 Workspace lifecycle, Worker Shell, Worker JavaScript (including loader modules
-and cancellation), deterministic chat streaming/messages/resume, the AI
-adapter, and a delayed schedule/alarm. It requires the deployment capabilities
-already described below: `LOADER`, `MODEL_PROVIDER_URL`, and the `AI` binding
-with `CELLD_AI_URL`.
+and cancellation), Code Mode capability lifecycle/eviction, egress, tools,
+bounded output, admission errors, deterministic chat
+streaming/messages/resume, the AI adapter, and a delayed schedule/alarm. It
+requires the deployment capabilities already described below: `LOADER`,
+`MODEL_PROVIDER_URL`, and the `AI` binding with `CELLD_AI_URL`.
 
 It intentionally does not automate hibernating WebSockets: the pinned Node
 runtime has no dependency-free deterministic WebSocket client workflow for an
 open socket plus private cell eviction. Use the manual hibernating session
 procedure below (and `CELLD_INTERNAL_URL` only for an operator-owned private
 listener) for that check; the runner never calls an internal listener.
+
+The process-level shutdown check starts a dedicated celld child inside the
+`shutdown` service, so it never signals or shares ports with the long-running
+`celld` service. Compose keeps both the lab and its clients on the private
+project network; run it after the public e2e workflow:
+
+```sh
+docker compose --profile test run --rm shutdown
+```
+
+It starts a hanging loaded-worker call, sends `SIGTERM` to that child celld
+process, and requires a bounded clean exit. `CELLD_PID` and
+`CELLD_SHUTDOWN_COMMAND` are available for equivalent non-Compose process
+harnesses.
 
 ## Bundle and deploy
 
@@ -193,6 +209,11 @@ celld --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
 ```
 
 ### Hibernating session procedure
+
+The commands below use host-loopback listeners for a manually started node. The
+Compose lab deliberately publishes no ports; run `websocat`/`curl` from a
+client container on its private project network and replace
+`127.0.0.1:8080`/`127.0.0.1:8081` with `celld:8080`/`celld:8081`.
 
 Use `websocat` (or another WebSocket client) against the public listener:
 

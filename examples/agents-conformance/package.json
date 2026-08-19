@@ -5,6 +5,7 @@
   "scripts": {
     "check:compatibility": "node scripts/check-compatibility.mjs",
     "e2e": "node scripts/e2e.mjs",
+    "shutdown:drain": "node scripts/shutdown-drain.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

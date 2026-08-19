@@ -1648,10 +1648,18 @@ const __forwardLoaderOutput = (stream, workerId, token, kind) => {
       while (true) {
         const next = await reader.read();
         if (next.done) break;
+        const remaining = MAX_LOADER_OUTPUT_BYTES - size;
+        if (remaining <= 0) {
+          await reader.cancel("bounded loader output");
+          break;
+        }
+        if (next.value.byteLength > remaining) {
+          chunks.push(next.value.slice(0, remaining));
+          size = MAX_LOADER_OUTPUT_BYTES;
+          await reader.cancel("bounded loader output");
+          break;
+        }
         size += next.value.byteLength;
-        if (size > MAX_LOADER_OUTPUT_BYTES)
-          throw new Error(
-            "worker loader: capability output exceeds bounded transport size");
         chunks.push(next.value);
       }
     } finally {
@@ -3611,11 +3619,18 @@ const __bufferRpcStreams = async (value, seen = new Map()) => {
           throw new TypeError(
             "cross-isolate RPC streams must yield Uint8Array chunks");
         }
-        size += next.value.byteLength;
-        if (size > MAX_LOADER_OUTPUT_BYTES) {
-          throw new Error(
-            "cross-isolate RPC stream exceeds bounded transport size");
+        const remaining = MAX_LOADER_OUTPUT_BYTES - size;
+        if (remaining <= 0) {
+          await reader.cancel("bounded loader output");
+          break;
         }
+        if (next.value.byteLength > remaining) {
+          chunks.push(next.value.slice(0, remaining));
+          size = MAX_LOADER_OUTPUT_BYTES;
+          await reader.cancel("bounded loader output");
+          break;
+        }
+        size += next.value.byteLength;
         chunks.push(next.value);
       }
     } finally {

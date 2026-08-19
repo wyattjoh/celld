@@ -2400,6 +2400,16 @@ impl Worker {
         ops
     }
 
+    #[cfg(test)]
+    fn test_stream_owner(&mut self) -> StreamOwner {
+        let inner = self.inner.as_mut().expect("live worker isolate");
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let cs = &mut v8::ContextScope::new(hs, realm.context);
+        current_stream_owner(cs).expect("loaded test worker stream owner")
+    }
+
     /// Clear named Worker Loader entries for an Agent before its cell
     /// residency is returned. Without this callback, `loader.get()` would
     /// keep a revoked worker id in its host-side memoization map.
@@ -4413,6 +4423,57 @@ impl Drop for CapabilityCallGuard {
 mod loader_capability_tests {
     use super::*;
 
+    fn init_v8() {
+        static ENGINE: std::sync::Once = std::sync::Once::new();
+        ENGINE.call_once(|| {
+            v8::V8::set_flags_from_string("--expose-gc");
+            Engine::init();
+        });
+    }
+
+    fn load_test_worker(source: &str, worker_id: Option<u64>) -> Worker {
+        init_v8();
+        let mut config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name: "__loader-behavior-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            ai_binding: None,
+            vars: Vec::new(),
+            node: String::new(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        })
+        .with_egress(EgressPolicy::Deny);
+        config.loader_worker_id = worker_id;
+        config.loader_agent_scope = worker_id.map(|_| "Agent:test".into());
+        Worker::load_config(Arc::new(config), &[]).expect("behavior test worker")
+    }
+
+    async fn fetch_with_worker(worker: Worker) -> HttpResponse {
+        let slot = crate::pool::Slot::standalone(worker);
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        crate::runtime::drive(
+            slot,
+            crate::WorkerJob::Fetch {
+                queued_at: Instant::now(),
+                url: "https://behavior.example/".into(),
+                method: "GET".into(),
+                body: Vec::new(),
+                headers: Vec::new(),
+                request_id: None,
+                reply,
+            },
+            None,
+        )
+        .await;
+        receive
+            .await
+            .expect("behavior worker reply")
+            .expect("behavior worker result")
+    }
+
     #[test]
     fn disposal_rejects_new_calls_but_keeps_existing_call_rooted() {
         let lifecycle = Arc::new(CapabilityLifecycle::live());
@@ -4482,28 +4543,37 @@ mod loader_capability_tests {
     }
 
     #[test]
-    fn loaded_worker_replaces_raw_host_storage_and_denies_ambient_fetch() {
-        static ENGINE: std::sync::Once = std::sync::Once::new();
-        ENGINE.call_once(|| {
-            v8::V8::set_flags_from_string("--expose-gc");
-            Engine::init();
-        });
+    fn loaded_worker_denies_every_raw_host_authority_family() {
+        init_v8();
         let mut config = WorkerConfig::new(WorkerConfigOptions {
             src: r#"
+                const attempt = (fn) => {
+                  try { fn(); return "allowed"; }
+                  catch (error) { return error.message; }
+                };
                 export default {
                   fetch() {
-                    let raw;
-                    try { __storage_get("Agent:alpha", "secret"); }
-                    catch (error) { raw = error.message; }
+                    const host = {
+                      storage: attempt(() => __storage_get("Agent:alpha", "secret")),
+                      sql: attempt(() => __sql_exec()),
+                      alarm: attempt(() => __alarm_set()),
+                      durableObject: attempt(() => __do_call()),
+                      service: attempt(() => __svc_call()),
+                      serviceRpc: attempt(() => __svc_rpc()),
+                      rpc: attempt(() => __rpc_call()),
+                      loaderFetch: attempt(() => __loader_fetch()),
+                      loaderRpc: attempt(() => __loader_rpc()),
+                      loaderDrop: attempt(() => __loader_drop()),
+                      streamRead: attempt(() => __http_stream_read(9001)),
+                      streamTee: attempt(() => __http_stream_tee(9001)),
+                      streamCancel: attempt(() => __http_stream_cancel(9001)),
+                    };
                     let ambient;
                     try {
                       __op_fetch("GET", "https://ambient.example/",
                         undefined, "[]", "follow");
                     } catch (error) { ambient = error.message; }
-                    let stream;
-                    try { __http_stream_cancel(9001); }
-                    catch (error) { stream = error.message; }
-                    return new Response(`${raw}|${ambient}|${stream}`);
+                    return new Response(JSON.stringify({ host, ambient }));
                   },
                 };
             "#
@@ -4541,11 +4611,339 @@ mod loader_capability_tests {
             .expect("loaded worker fetch reply")
             .expect("loaded worker fetch result");
         assert_eq!(response.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("denial response JSON");
+        let host = body["host"].as_object().expect("host denial object");
+        for family in [
+            "storage",
+            "sql",
+            "alarm",
+            "durableObject",
+            "service",
+            "serviceRpc",
+            "rpc",
+            "loaderFetch",
+            "loaderRpc",
+            "loaderDrop",
+        ] {
+            assert_eq!(
+                host[family],
+                "worker loader: host internal operation is unavailable to loaded workers",
+                "raw {family} authority escaped the loaded isolate"
+            );
+        }
         assert_eq!(
-            String::from_utf8(response.body).unwrap(),
-            "worker loader: host internal operation is unavailable to loaded workers|This worker is not permitted to access the internet via global functions like fetch(). It must use capabilities (such as bindings in 'env') to talk to the outside world.|worker loader: response stream owner mismatch"
+            host["streamRead"],
+            "worker loader: response stream owner mismatch"
+        );
+        assert_eq!(
+            host["streamTee"],
+            "worker loader: response stream owner mismatch"
+        );
+        assert_eq!(
+            host["streamCancel"],
+            "worker loader: response stream owner mismatch"
+        );
+        assert_eq!(
+            body["ambient"],
+            "This worker is not permitted to access the internet via global functions like fetch(). It must use capabilities (such as bindings in 'env') to talk to the outside world."
         );
         http_streams().lock().unwrap().remove(&9001);
+    }
+
+    fn stream_case_source(operation: &str, stream_id: u64) -> String {
+        match operation {
+            "read" => format!(
+                r#"
+                    export default {{
+                      async fetch() {{
+                        try {{
+                          return new Response(await __http_stream_read({stream_id}));
+                        }} catch (error) {{
+                          return new Response("error:" + error.message);
+                        }}
+                      }},
+                    }};
+                "#
+            ),
+            "tee" => format!(
+                r#"
+                    export default {{
+                      fetch() {{
+                        try {{
+                          return new Response(__http_stream_tee({stream_id}));
+                        }} catch (error) {{
+                          return new Response("error:" + error.message);
+                        }}
+                      }},
+                    }};
+                "#
+            ),
+            "cancel" => format!(
+                r#"
+                    export default {{
+                      fetch() {{
+                        try {{
+                          __http_stream_cancel({stream_id});
+                          return new Response("ok");
+                        }} catch (error) {{
+                          return new Response("error:" + error.message);
+                        }}
+                      }},
+                    }};
+                "#
+            ),
+            "write" => format!(
+                r#"
+                    export default {{
+                      async fetch() {{
+                        try {{
+                          await __response_stream_write(
+                            {stream_id}, new Uint8Array([7]));
+                          return new Response("ok");
+                        }} catch (error) {{
+                          return new Response("error:" + error.message);
+                        }}
+                      }},
+                    }};
+                "#
+            ),
+            _ => panic!("unknown stream case {operation}"),
+        }
+    }
+
+    fn next_test_stream_id() -> u64 {
+        100_000 + NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn register_test_stream(stream_id: u64, owner: StreamOwner, bytes: Option<&[u8]>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        if let Some(bytes) = bytes {
+            sender
+                .try_send(Ok(bytes.to_vec()))
+                .expect("test stream chunk");
+        }
+        drop(sender);
+        register_http_stream(stream_id, HttpStreamSource::Receiver(receiver), Some(owner));
+    }
+
+    fn register_test_response_writer(stream_id: u64, owner: StreamOwner) {
+        let (writer, receiver) = tokio::sync::mpsc::channel(1);
+        register_http_stream(stream_id, HttpStreamSource::Receiver(receiver), Some(owner));
+        let (finished, _) = tokio::sync::watch::channel(false);
+        response_stream_writers().lock().unwrap().insert(
+            stream_id,
+            ResponseStreamWriter {
+                created: Instant::now(),
+                owner: Some(owner),
+                writer,
+                finished,
+            },
+        );
+    }
+
+    fn cleanup_test_streams(stream_ids: impl IntoIterator<Item = u64>) {
+        let stream_ids: Vec<_> = stream_ids.into_iter().collect();
+        let mut streams = http_streams().lock().unwrap();
+        for stream_id in &stream_ids {
+            streams.remove(stream_id);
+        }
+        drop(streams);
+        let mut writers = response_stream_writers().lock().unwrap();
+        for stream_id in stream_ids {
+            writers.remove(&stream_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_owner_binds_read_tee_cancel_and_response_write() {
+        init_v8();
+
+        let read_id = next_test_stream_id();
+        let mut same_read = load_test_worker(&stream_case_source("read", read_id), Some(101));
+        let same_owner = same_read.test_stream_owner();
+        assert_eq!(same_owner.worker, 101);
+        register_test_stream(read_id, same_owner, Some(b"same-owner"));
+        let response = fetch_with_worker(same_read).await;
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            r#"{"bytes":[115,97,109,101,45,111,119,110,101,114],"done":false}"#
+        );
+
+        let read_id_cross = next_test_stream_id();
+        let mut cross_read =
+            load_test_worker(&stream_case_source("read", read_id_cross), Some(102));
+        let cross_owner = cross_read.test_stream_owner();
+        assert_ne!(same_owner, cross_owner);
+        register_test_stream(read_id_cross, same_owner, Some(b"cross-owner"));
+        let response = fetch_with_worker(cross_read).await;
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "error:worker loader: response stream owner mismatch"
+        );
+
+        let tee_id = next_test_stream_id();
+        let mut same_tee = load_test_worker(&stream_case_source("tee", tee_id), Some(103));
+        let tee_owner = same_tee.test_stream_owner();
+        register_test_stream(tee_id, tee_owner, None);
+        let response = fetch_with_worker(same_tee).await;
+        let tee_ids: [u64; 2] = serde_json::from_slice(&response.body).expect("tee ids");
+        assert_ne!(tee_ids[0], tee_ids[1]);
+
+        let cross_tee_id = next_test_stream_id();
+        let mut cross_tee = load_test_worker(&stream_case_source("tee", cross_tee_id), Some(104));
+        let cross_tee_owner = cross_tee.test_stream_owner();
+        register_test_stream(cross_tee_id, tee_owner, None);
+        let response = fetch_with_worker(cross_tee).await;
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "error:worker loader: response stream owner mismatch"
+        );
+        assert!(!stream_owner_allowed(
+            Some(tee_owner),
+            Some(cross_tee_owner)
+        ));
+
+        let cancel_id = next_test_stream_id();
+        let mut same_cancel = load_test_worker(&stream_case_source("cancel", cancel_id), Some(105));
+        let cancel_owner = same_cancel.test_stream_owner();
+        register_test_stream(cancel_id, cancel_owner, None);
+        let response = fetch_with_worker(same_cancel).await;
+        assert_eq!(String::from_utf8(response.body).unwrap(), "ok");
+
+        let cross_cancel_id = next_test_stream_id();
+        let mut cross_cancel =
+            load_test_worker(&stream_case_source("cancel", cross_cancel_id), Some(106));
+        let cross_cancel_owner = cross_cancel.test_stream_owner();
+        register_test_stream(cross_cancel_id, cancel_owner, None);
+        let response = fetch_with_worker(cross_cancel).await;
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "error:worker loader: response stream owner mismatch"
+        );
+        assert_ne!(cancel_owner, cross_cancel_owner);
+
+        let write_id = next_test_stream_id();
+        let mut same_write = load_test_worker(&stream_case_source("write", write_id), Some(107));
+        let write_owner = same_write.test_stream_owner();
+        register_test_response_writer(write_id, write_owner);
+        let response = fetch_with_worker(same_write).await;
+        assert_eq!(String::from_utf8(response.body).unwrap(), "ok");
+
+        let cross_write_id = next_test_stream_id();
+        let mut cross_write =
+            load_test_worker(&stream_case_source("write", cross_write_id), Some(108));
+        let cross_write_owner = cross_write.test_stream_owner();
+        register_test_response_writer(cross_write_id, write_owner);
+        let response = fetch_with_worker(cross_write).await;
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "error:worker loader: response stream owner mismatch"
+        );
+        assert_ne!(write_owner, cross_write_owner);
+
+        cleanup_test_streams([
+            read_id,
+            read_id_cross,
+            tee_id,
+            tee_ids[0],
+            tee_ids[1],
+            cross_tee_id,
+            cancel_id,
+            cross_cancel_id,
+            write_id,
+            cross_write_id,
+        ]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_slots_keep_agent_data_and_classify_freed_slots() {
+        init_v8();
+        let alpha = crate::pool::Slot::standalone(load_test_worker(
+            r#"export default { fetch() { return new Response("alpha"); } };"#,
+            None,
+        ));
+        let beta = crate::pool::Slot::standalone(load_test_worker(
+            r#"export default { fetch() { return new Response("beta"); } };"#,
+            None,
+        ));
+
+        let mut calls = Vec::new();
+        for index in 0..64 {
+            let slot = if index % 2 == 0 {
+                alpha.clone()
+            } else {
+                beta.clone()
+            };
+            let expected = if index % 2 == 0 { "alpha" } else { "beta" };
+            calls.push(tokio::spawn(async move {
+                let (reply, receive) = tokio::sync::oneshot::channel();
+                crate::runtime::drive(
+                    slot,
+                    crate::WorkerJob::Fetch {
+                        queued_at: Instant::now(),
+                        url: "https://slot.example/".into(),
+                        method: "GET".into(),
+                        body: Vec::new(),
+                        headers: Vec::new(),
+                        request_id: None,
+                        reply,
+                    },
+                    None,
+                )
+                .await;
+                let response = receive
+                    .await
+                    .expect("concurrent slot reply")
+                    .expect("concurrent slot response");
+                assert_eq!(String::from_utf8(response.body).unwrap(), expected);
+            }));
+        }
+        for call in calls {
+            call.await.expect("concurrent slot task");
+        }
+
+        let alpha_marker = alpha.clone();
+        assert!(
+            alpha
+                .turn(|_| current_slot()
+                    .is_some_and(|current| { Arc::ptr_eq(&current, &alpha_marker) }))
+                .await
+        );
+        let beta_marker = beta.clone();
+        assert!(
+            beta.turn(
+                |_| current_slot().is_some_and(|current| { Arc::ptr_eq(&current, &beta_marker) })
+            )
+            .await
+        );
+
+        let freed = crate::pool::Slot::standalone(load_test_worker(
+            r#"export default { fetch() { return new Response("unreachable"); } };"#,
+            None,
+        ));
+        freed.free_for_test().await;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        crate::runtime::drive(
+            freed,
+            crate::WorkerJob::Fetch {
+                queued_at: Instant::now(),
+                url: "https://slot.example/freed".into(),
+                method: "GET".into(),
+                body: Vec::new(),
+                headers: Vec::new(),
+                request_id: None,
+                reply,
+            },
+            None,
+        )
+        .await;
+        let result = receive.await.expect("freed slot reply");
+        let error = match result {
+            Ok(_) => panic!("freed slot must not return a response"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("host_cell_lost"));
     }
 
     #[test]
@@ -6950,17 +7348,22 @@ fn op_response_stream_write(
             view.copy_contents(&mut bytes);
             bytes
         });
-    let writer = response_stream_writers()
-        .lock()
-        .unwrap()
-        .get_mut(&stream_id)
-        .and_then(|stream| {
-            if !stream_owner_allowed(stream.owner, expected_owner) {
-                return None;
-            }
-            stream.created = Instant::now();
-            Some(stream.writer.clone())
+    let mut writers = response_stream_writers().lock().unwrap();
+    let Some(stream) = writers.get_mut(&stream_id) else {
+        drop(writers);
+        let id = asyncrt::enqueue(async {
+            Err::<String, String>("response stream consumer canceled".into())
         });
+        rv.set(promise_for(scope, id));
+        return;
+    };
+    if !stream_owner_allowed(stream.owner, expected_owner) {
+        drop(writers);
+        return loader_throw(scope, "worker loader: response stream owner mismatch");
+    }
+    stream.created = Instant::now();
+    let writer = Some(stream.writer.clone());
+    drop(writers);
     let id = asyncrt::enqueue(async move {
         let Some(bytes) = bytes else {
             return Err("response stream chunks must be ArrayBuffer views".into());

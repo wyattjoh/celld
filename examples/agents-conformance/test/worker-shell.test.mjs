@@ -2,17 +2,12 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 import { test } from "node:test";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const FIXTURE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-
-async function source(path) {
-  return readFile(join(ROOT, path), "utf8");
-}
 
 function storageFor(database) {
   return {
@@ -140,32 +135,26 @@ function capabilityWorkspaceView(target, onDispose) {
   return make([]);
 }
 
-test("Worker Shell source is pinned, loaded, capability-scoped, and no-egress", async () => {
-  const [sourceText, harness, matrix, packageJson] = await Promise.all([
-    source("examples/agents-conformance/index.js"),
-    source("crates/celld/js/harness.js"),
-    source("examples/agents-conformance/compatibility-matrix.md"),
-    source("examples/agents-conformance/package.json"),
-  ]);
-  const packageData = JSON.parse(packageJson);
+test("Worker Shell package target stays pinned and bundleable", async () => {
+  const packageData = JSON.parse(
+    await readFile(join(FIXTURE_ROOT, "package.json"), "utf8"),
+  );
+  const matrix = await readFile(
+    join(FIXTURE_ROOT, "compatibility-matrix.md"),
+    "utf8",
+  );
   assert.equal(packageData.dependencies["just-bash"], "3.4.0");
-  assert.match(sourceText, /WorkerShellBackend/);
-  assert.match(sourceText, /egress: \{ mode: "none" \}/);
-  assert.match(sourceText, /backend: "worker-shell"/);
-  assert.match(sourceText, /workspace\.runtime\.exec\(command,/);
-  assert.match(sourceText, /unsupported_command/);
-  assert.match(sourceText, /timed_out/);
-  assert.match(sourceText, /WorkspaceServiceProxy/);
-  assert.match(harness, /__celld\$loaderCapability/);
-  assert.match(harness, /service\?\.name === "WorkspaceServiceProxy"/);
-  assert.match(harness, /path\.length === 0 \? drop/);
-  assert.match(harness, /workspaceView\?\.\[Symbol\.dispose\]/);
-  assert.match(harness, /capabilityDescriptor\(value, name\)/);
-  assert.match(harness, /Workspace capability only exposes getWorkspace and fs methods/);
-  assert.match(harness, /globalThis\.\__loaderWorkerId/);
   assert.match(matrix, /just-bash@3\.4\.0/);
   assert.match(matrix, /Worker Shell backend.*adapted/);
-  assert.doesNotMatch(sourceText, /shell\/(?:curl|python|sqlite|js-exec)/);
+
+  const { ShellWorker, WorkerShellBackend, close } =
+    await loadPinnedShellWorker();
+  try {
+    assert.equal(typeof ShellWorker, "function");
+    assert.equal(typeof WorkerShellBackend, "function");
+  } finally {
+    await close();
+  }
 });
 
 test("WorkerShellBackend loads ShellWorker with its WorkspaceServiceProxy capability", async () => {

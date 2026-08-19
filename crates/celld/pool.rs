@@ -140,6 +140,12 @@ impl Slot {
         Self::standalone(worker)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn free_for_test(&self) {
+        self.retiring.store(true, Ordering::Relaxed);
+        self.worker.lock().await.take();
+    }
+
     /// Give this isolate a cell's realm. Held for as long as the cell lives
     /// here, which is what stops the isolate being retired underneath it.
     fn house(self: &Arc<Self>) -> Residency {

@@ -1,0 +1,81 @@
+name: Upstream canary
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_url:
+        description: "Git URL to merge as upstream/main"
+        required: false
+        default: "https://github.com/denoland/celld.git"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-canary
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: ${{ inputs.upstream_url || 'https://github.com/denoland/celld.git' }}
+  RUST_VERSION: 1.97.1
+
+jobs:
+  canary:
+    name: Merge upstream and run the conformance gauntlet
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the current ref
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Merge upstream into a throwaway canary branch
+        env:
+          UPSTREAM_URL: ${{ env.UPSTREAM_URL }}
+        run: |
+          set -euo pipefail
+          git config user.name "celld upstream canary"
+          git config user.email "celld-upstream-canary@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+          branch="canary/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch --create "$branch"
+          if ! git merge --no-edit upstream/main; then
+            echo "upstream merge conflicts:" >&2
+            git diff --name-only --diff-filter=U | tee "$RUNNER_TEMP/upstream-conflicts"
+            exit 1
+          fi
+
+      - name: Run workspace Rust tests
+        run: cargo test --workspace
+
+      - name: Install and verify the pinned compatibility target
+        run: |
+          set -euo pipefail
+          npm --prefix examples/agents-conformance ci \
+            --legacy-peer-deps --no-audit --no-fund
+          npm --prefix examples/agents-conformance run check:compatibility
+
+      - name: Run Compose public e2e
+        run: |
+          set -euo pipefail
+          docker compose up --build -d celld
+          docker compose --profile test run --rm e2e
+
+      - name: Run the process-level shutdown drain check
+        if: always()
+        run: docker compose --profile test run --rm shutdown
+
+      - name: Clean up Compose resources
+        if: always()
+        run: docker compose down --volumes --remove-orphans

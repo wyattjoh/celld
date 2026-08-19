@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const DEFAULT_URL = "http://127.0.0.1:8080";
+const DEFAULT_INTERNAL_URL = "http://127.0.0.1:8081";
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_READINESS_TIMEOUT_MS = 60_000;
 
@@ -23,6 +24,10 @@ function baseUrlFromEnv() {
 }
 
 const baseUrl = baseUrlFromEnv();
+const internalUrl = new URL(process.env.CELLD_INTERNAL_URL ?? DEFAULT_INTERNAL_URL);
+if (internalUrl.username || internalUrl.password) {
+  throw new Error("CELLD_INTERNAL_URL must not include credentials");
+}
 const requestTimeoutMs = timeoutFromEnv(
   "CELLD_REQUEST_TIMEOUT_MS",
   DEFAULT_REQUEST_TIMEOUT_MS,
@@ -32,8 +37,8 @@ const readinessTimeoutMs = timeoutFromEnv(
   DEFAULT_READINESS_TIMEOUT_MS,
 );
 
-function endpoint(path) {
-  return new URL(path, baseUrl).toString();
+function endpoint(path, base = baseUrl) {
+  return new URL(path, base).toString();
 }
 
 function fail(message) {
@@ -44,11 +49,11 @@ function expect(condition, message) {
   if (!condition) fail(message);
 }
 
-async function request(path, init = {}) {
+async function requestStatus(path, init = {}, base = baseUrl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
   try {
-    const response = await fetch(endpoint(path), {
+    return await fetch(endpoint(path, base), {
       ...init,
       headers: {
         ...(init.body === undefined ? {} : { "content-type": "application/json" }),
@@ -56,10 +61,6 @@ async function request(path, init = {}) {
       },
       signal: controller.signal,
     });
-    if (!response.ok) {
-      fail(`${init.method ?? "GET"} ${path} returned HTTP ${response.status}`);
-    }
-    return response;
   } catch (error) {
     if (error?.name === "AbortError") {
       fail(`${init.method ?? "GET"} ${path} exceeded ${requestTimeoutMs}ms`);
@@ -70,8 +71,16 @@ async function request(path, init = {}) {
   }
 }
 
-async function json(path, init = {}) {
-  const response = await request(path, init);
+async function request(path, init = {}, base = baseUrl) {
+  const response = await requestStatus(path, init, base);
+  if (!response.ok) {
+    fail(`${init.method ?? "GET"} ${path} returned HTTP ${response.status}`);
+  }
+  return response;
+}
+
+async function json(path, init = {}, base = baseUrl) {
+  const response = await request(path, init, base);
   try {
     return await response.json();
   } catch {
@@ -79,8 +88,19 @@ async function json(path, init = {}) {
   }
 }
 
-async function post(path, body) {
-  return json(path, { method: "POST", body: JSON.stringify(body) });
+async function jsonStatus(path, init = {}, base = baseUrl) {
+  const response = await requestStatus(path, init, base);
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    fail(`${init.method ?? "GET"} ${path} returned invalid JSON`);
+  }
+  return { status: response.status, body };
+}
+
+async function post(path, body, base = baseUrl) {
+  return json(path, { method: "POST", body: JSON.stringify(body) }, base);
 }
 
 async function step(name, action) {
@@ -182,6 +202,100 @@ await step("Worker JavaScript loader modules and cancellation", async () => {
   const cancelled = await post("/conformance/javascript/alpha", { operation: "cancel" });
   expect(cancelled.status === "cancelled" && cancelled.exitCode === 130,
     "Worker JavaScript cancellation was not bounded");
+});
+
+await step("Code Mode capability lifecycle and eviction", async () => {
+  const disposed = await post("/conformance/code-mode/alpha", {
+    operation: "disposed",
+    value: "lifecycle",
+  });
+  expect(disposed.disposed && disposed.before?.value === "lifecycle",
+    "capability lifecycle probe did not complete before disposal");
+  expect(disposed.error?.code === "code_mode.host_lost" ||
+    disposed.error?.code === "code_mode.disposed",
+    "disposed capability did not return a stable Code Mode code");
+  expect(typeof disposed.error?.retryable === "boolean",
+    "disposed capability omitted retryable metadata");
+
+  const mutation = await post("/conformance/code-mode/alpha", {
+    operation: "mutation",
+    value: "durable-before-disposal",
+    delayMs: 25,
+  });
+  expect(mutation.value?.mutation?.agent === "alpha" &&
+    mutation.mutations?.[0]?.value === "durable-before-disposal",
+    "acknowledged capability mutation was not observable after disposal");
+
+  const eviction = await post("/conformance/code-mode/alpha", {
+    operation: "eviction-prepare",
+  });
+  expect(typeof eviction.scope === "string" && eviction.scope.length > 0,
+    "eviction probe did not expose its resident cell scope");
+  await request(`/evict/ConformanceAgent:${eviction.scope}`, { method: "POST" }, internalUrl);
+  const stale = await post("/conformance/code-mode/alpha", {
+    operation: "eviction-stale",
+  });
+  expect(stale.error?.code === "code_mode.host_lost" ||
+    stale.error?.code === "code_mode.disposed",
+    "an evicted Agent's stale loader handle was not rejected");
+  expect(/worker_disposed|host_lost|disposed/i.test(stale.error?.message ?? ""),
+    "stale loader failure omitted its interruption class");
+});
+
+await step("Code Mode egress, tools, and bounded output", async () => {
+  const egress = await post("/conformance/code-mode/alpha", {
+    operation: "egress",
+    url: "https://approved.example/api/v1",
+  });
+  expect(egress.value?.status === 200 &&
+    egress.value?.body === "approved:https://approved.example/api/v1",
+    "allowlisted Code Mode egress did not succeed");
+  const denied = await post("/conformance/code-mode/alpha", {
+    operation: "egress",
+    url: "https://approved.example/apix",
+  });
+  expect(denied.error && /denied URL/i.test(denied.error.message),
+    "same-origin disallowed-path egress was not denied");
+
+  const tools = await post("/conformance/code-mode/alpha", {
+    operation: "tools",
+    value: { query: "safe" },
+  });
+  expect(tools.value?.catalog?.length === 1 &&
+    tools.value.catalog[0].name === "echo" &&
+    !Object.hasOwn(tools.value.catalog[0], "secret") &&
+    tools.value.result?.agent === "alpha",
+    "tool catalog or explicit invocation broker was not bounded");
+
+  const output = await post("/conformance/code-mode/alpha", {
+    operation: "output",
+    size: 8 * 1024 * 1024 + 1024,
+  });
+  expect(output.requested > output.value?.result?.length &&
+    output.value.result.length === 8 * 1024 * 1024 &&
+    output.value.result.first === 65 && output.value.result.last === 65,
+    "loaded-worker output was not deterministically truncated");
+});
+
+await step("Code Mode admission and error wire contract", async () => {
+  const admission = await post("/conformance/code-mode/alpha", {
+    operation: "admission",
+  });
+  const byLabel = new Map(admission.results?.map((result) => [result.label, result]));
+  expect(byLabel.get("code_size")?.error?.code === "code_mode.code_size" &&
+    byLabel.get("code_size")?.error?.retryable === false,
+    "oversized Code Mode code did not expose a non-retryable wire error");
+  expect(byLabel.get("env_size")?.error?.code === "code_mode.env_size" &&
+    byLabel.get("env_size")?.error?.retryable === false,
+    "oversized Code Mode env did not expose a non-retryable wire error");
+
+  const timedOut = await post("/conformance/code-mode/alpha", {
+    operation: "timeout",
+    delayMs: 5_000,
+  });
+  expect(timedOut.error?.code === "code_mode.timeout" &&
+    timedOut.error?.retryable === true,
+    "bounded Code Mode timeout did not expose retryable wire metadata");
 });
 
 await step("deterministic streamed chat, messages, and resume", async () => {

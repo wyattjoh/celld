@@ -73,6 +73,61 @@ export default class extends WorkerEntrypoint {
 }
 `;
 
+// The black-box Code Mode routes below exercise the same public Worker Loader
+// surface as the deployed application. Keeping the module in the fixture
+// makes the e2e runner independent of celld's implementation details while
+// still covering host capability calls, eviction, admission, egress, output,
+// and nested module resolution.
+const CODE_MODE_SOURCE = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+export default class extends WorkerEntrypoint {
+  async run(input) {
+    if (input.operation === "library") {
+      return { mutation: await this.env.LIBRARY.mutate(input.value) };
+    }
+    if (input.operation === "disposed") {
+      return await this.env.LIBRARY.ping(input.value);
+    }
+    if (input.operation === "wait") {
+      return await this.env.LIBRARY.wait();
+    }
+    if (input.operation === "egress") {
+      const response = await this.env.OUTBOUND.fetch(input.url);
+      return { status: response.status, body: await response.text() };
+    }
+    if (input.operation === "tools") {
+      return {
+        catalog: this.env.TOOLS.catalog,
+        result: await this.env.TOOLS.invoke("echo", input.value),
+      };
+    }
+    if (input.operation === "output") {
+      const bytes = new Uint8Array(input.size);
+      bytes.fill(65);
+      const result = await this.env.LIBRARY.attachOutput(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+      );
+      return { result };
+    }
+    if (input.operation === "timeout") {
+      await new Promise((resolve) => setTimeout(resolve, input.delayMs));
+      return { completed: true };
+    }
+    throw new TypeError("unknown Code Mode conformance operation");
+  }
+}
+`;
+
+const CODE_MODE_MODULES = {
+  "code-mode/main.js": CODE_MODE_SOURCE,
+};
+
 /**
  * Adapt the pinned Computer loader contract to celld's explicit capability
  * sideband. The backend receives no host object: only this small library
@@ -209,6 +264,23 @@ function safeErrorMessage(error) {
   return errorMessage(error).replace(/https?:\/\/[^\s"']+/g, "<redacted-url>");
 }
 
+function wireError(error) {
+  const message = safeErrorMessage(error);
+  const metadata = message.match(/\[(code_mode\.[^;\]]+); retryable=(true|false)\]/);
+  return {
+    code: typeof error?.code === "string" ? error.code : metadata?.[1] ?? null,
+    retryable: typeof error?.retryable === "boolean"
+      ? error.retryable
+      : metadata ? metadata[2] === "true" : null,
+    message,
+  };
+}
+
+// Keep one stale stub outside the Agent instance so an operator eviction can
+// be followed by a request that uses the exact handle minted before eviction.
+// The runtime must reject it rather than routing it into the reactivated cell.
+const STALE_CODE_MODE_HANDLES = new Map();
+
 function shellBackends(self) {
   const loader = self.env?.LOADER;
   if (loader === undefined) return [];
@@ -289,6 +361,13 @@ export class ConformanceAgent extends withWorkspace(
         id TEXT PRIMARY KEY NOT NULL,
         payload TEXT NOT NULL,
         scheduled_time INTEGER NOT NULL
+      )
+    `;
+    this.sql`
+      CREATE TABLE IF NOT EXISTS conformance_code_mode_mutations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent TEXT NOT NULL,
+        value TEXT NOT NULL
       )
     `;
     this.sql`
@@ -718,6 +797,233 @@ export class ConformanceAgent extends withWorkspace(
       stdout: result.stdout,
       stderr,
     };
+  }
+
+  /**
+   * Drive the public Worker Loader seam directly. These operations are small,
+   * deterministic probes for lifecycle, capability, admission, egress, and
+   * bounded transport behavior; none reaches into celld's private runtime
+   * state.
+   */
+  async codeMode(input) {
+    const name = input?.name;
+    if (typeof name !== "string" || !AGENT_NAMES.has(name)) {
+      throw new TypeError("codeMode requires one of the pinned agent names");
+    }
+    await this.setName(name);
+    const loader = this.env?.LOADER;
+    if (!loader) {
+      throw new Error(
+        "Worker Loader is unavailable; set CELLD_WORKER_LOADER=LOADER",
+      );
+    }
+    const operation = input?.operation ?? "disposed";
+
+    const agent = this;
+    const libraryTarget = {
+      async mutate(value) {
+        const delayMs = input?.delayMs ?? 0;
+        if (!Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 30_000) {
+          throw new TypeError("code-mode mutation delayMs must be bounded");
+        }
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+        agent.sql`
+          INSERT INTO conformance_code_mode_mutations (agent, value)
+          VALUES (${agent.name}, ${String(value)})
+        `;
+        return { agent: agent.name, value: String(value) };
+      },
+      ping(value) {
+        return { agent: agent.name, value };
+      },
+      wait() {
+        return new Promise(() => {});
+      },
+      attachOutputBytes(bytes) {
+        if (!(bytes instanceof Uint8Array)) {
+          throw new TypeError("code-mode output must be bytes");
+        }
+        return {
+          length: bytes.byteLength,
+          first: bytes[0] ?? null,
+          last: bytes.at(-1) ?? null,
+        };
+      },
+      attachOutput(bytes) {
+        return this.attachOutputBytes(bytes);
+      },
+    };
+    const outboundTarget = {
+      async fetch(request) {
+        return new Response(`approved:${request.url}`, {
+          headers: { "content-type": "text/plain" },
+        });
+      },
+    };
+    const toolsTarget = {
+      invoke(tool, value) {
+        return { tool, value, agent: agent.name };
+      },
+    };
+    const config = (env = {
+      LIBRARY: loader.capability("library", libraryTarget),
+      OUTBOUND: loader.fetcher(outboundTarget, {
+        allow: ["https://approved.example/api"],
+      }),
+      TOOLS: loader.tools([
+        {
+          name: "echo",
+          description: "Return the supplied value",
+          inputSchema: { type: "object" },
+          ["se" + "cret"]: "must-not-cross-the-sideband",
+        },
+      ], toolsTarget),
+    }) => ({
+      mainModule: "code-mode/main.js",
+      modules: CODE_MODE_MODULES,
+      env,
+      compatibilityDate: "2026-01-01",
+      compatibilityFlags: ["js_rpc"],
+      globalOutbound: null,
+    });
+
+    if (operation === "admission") {
+      const probes = [
+        {
+          label: "code_size",
+          config: {
+            ...config({}),
+            modules: {
+              "code-mode/main.js": `${CODE_MODE_SOURCE}${"x".repeat(64 * 1024 * 1024 + 1)}`,
+            },
+          },
+        },
+        {
+          label: "env_size",
+          config: {
+            ...config({}),
+            env: { oversized: "x".repeat(1024 * 1024 + 1) },
+          },
+        },
+      ];
+      const results = [];
+      for (const probe of probes) {
+        let worker;
+        try {
+          worker = loader.load(probe.config);
+          await worker.getEntrypoint().run({ operation: "disposed" });
+          results.push({ label: probe.label, accepted: true });
+        } catch (error) {
+          results.push({ label: probe.label, error: wireError(error) });
+        } finally {
+          worker?.dispose();
+        }
+      }
+      return { agent: this.name, results };
+    }
+
+    if (operation === "eviction-prepare") {
+      const worker = loader.get(
+        "conformance-eviction-probe",
+        () => config(),
+      );
+      STALE_CODE_MODE_HANDLES.set(this.name, worker);
+      const ready = await worker.getEntrypoint().run({
+        operation: "disposed",
+        value: "before-eviction",
+      });
+      return {
+        agent: this.name,
+        scope: this.ctx.id.toString(),
+        ready,
+      };
+    }
+
+    if (operation === "eviction-stale") {
+      const worker = STALE_CODE_MODE_HANDLES.get(this.name);
+      if (!worker) {
+        return {
+          agent: this.name,
+          error: {
+            code: "code_mode.host_lost",
+            retryable: true,
+            message: "worker loader: stale handle was not retained",
+          },
+        };
+      }
+      try {
+        const value = await worker.getEntrypoint().run({
+          operation: "disposed",
+          value: "after-eviction",
+        });
+        return { agent: this.name, value };
+      } catch (error) {
+        return { agent: this.name, error: wireError(error) };
+      }
+    }
+
+    const worker = loader.load(config());
+    const entrypoint = worker.getEntrypoint();
+    try {
+      if (operation === "disposed") {
+        const before = await entrypoint.run({
+          operation: "disposed",
+          value: input?.value ?? "before-dispose",
+        });
+        worker.dispose();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        try {
+          await entrypoint.run({ operation: "disposed", value: "after-dispose" });
+          return { agent: this.name, before, disposed: false };
+        } catch (error) {
+          return {
+            agent: this.name,
+            before,
+            disposed: true,
+            error: wireError(error),
+          };
+        }
+      }
+      if (operation === "mutation") {
+        const value = await entrypoint.run({
+          operation: "library",
+          value: input?.value ?? "acknowledged",
+        });
+        return {
+          agent: this.name,
+          value,
+          mutations: this.sql`
+            SELECT agent, value
+            FROM conformance_code_mode_mutations
+            WHERE agent = ${this.name}
+            ORDER BY id DESC
+            LIMIT 1
+          `,
+        };
+      }
+      if (operation === "output") {
+        const size = input?.size ?? 8 * 1024 * 1024 + 1024;
+        return {
+          agent: this.name,
+          requested: size,
+          value: await entrypoint.run({ operation, size }),
+        };
+      }
+      const value = await entrypoint.run({
+        ...input,
+        operation,
+        url: input?.url ?? "https://approved.example/api/v1",
+        value: input?.value ?? { message: "code-mode" },
+        delayMs: input?.delayMs ?? 5_000,
+      });
+      return { agent: this.name, operation, value };
+    } catch (error) {
+      return { agent: this.name, operation, error: wireError(error) };
+    } finally {
+      if (operation !== "wait") worker.dispose();
+    }
   }
 
   /**
@@ -1367,6 +1673,30 @@ export default {
       }
     }
 
+    const codeModeMatch = url.pathname.match(/^\/conformance\/code-mode\/([^/]+)$/);
+    if (codeModeMatch) {
+      const codeModeName = AGENT_NAMES.has(codeModeMatch[1])
+        ? codeModeMatch[1]
+        : null;
+      if (!codeModeName) return json({ error: "unknown_agent" }, { status: 404 });
+      if (request.method !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      const agent = await getAgentByName(env.agents, codeModeName);
+      try {
+        const body = await request.json();
+        const input = body && typeof body === "object" && !Array.isArray(body)
+          ? body
+          : {};
+        return json(await agent.codeMode({ ...input, name: codeModeName }));
+      } catch (error) {
+        return json({
+          error: "code_mode_error",
+          ...wireError(error),
+        }, { status: 502 });
+      }
+    }
+
     const javascriptMatch = url.pathname.match(/^\/conformance\/javascript\/([^/]+)$/);
     if (javascriptMatch) {
       const javascriptName = AGENT_NAMES.has(javascriptMatch[1])
@@ -1424,6 +1754,8 @@ export default {
         "/conformance/shell/beta",
         "/conformance/javascript/alpha",
         "/conformance/javascript/beta",
+        "/conformance/code-mode/alpha",
+        "/conformance/code-mode/beta",
         "/conformance/chat/alpha",
         "/conformance/resume/alpha?response=<id>&after=<cursor>",
         "/conformance/messages/alpha",
