@@ -25,14 +25,14 @@ async function copyFixture() {
   return root;
 }
 
-test("the checked-in Agents, AI, and Computer target is exact", () => {
+test("the checked-in Agents, AI, Computer, and Worker Shell target is exact", () => {
   assert.deepEqual(checkCompatibility(ROOT), {
     agentsVersion: "0.0.16",
     aiVersion: "4.3.19",
     computerVersion: "0.2.1",
     zodVersion: "3.25.76",
     lockfileSha256:
-      "8b85da9d52c50269d249dd600b4dace6583b7690d39f927ead59bce719a74f16",
+      "58a8d0772f3b32269294c3762c82aa614943ae298bf9b5160dd477562e5c851e",
   });
 });
 
@@ -72,7 +72,7 @@ test("the deployed fixture keeps its Agent namespace binding addressable", async
 
 test("the fixture wires a filesystem-only Workspace to each Agent cell", async () => {
   const source = await readFile(join(ROOT, "index.js"), "utf8");
-  assert.match(source, /getWorkspace, withWorkspace/);
+  assert.match(source, /getWorkspace,[\s\S]*withWorkspace/);
   assert.match(source, /export class ConformanceAgent extends withWorkspace\(/);
   assert.match(source, /storage: self\.ctx\.storage/);
   for (const operation of ["create", "read", "update", "list", "search", "delete"]) {
@@ -84,7 +84,10 @@ test("the fixture wires a filesystem-only Workspace to each Agent cell", async (
   assert.match(source, /workspace\.fs\.grep/);
   assert.match(source, /workspace\.fs\.rm/);
   assert.ok(source.includes("/conformance/workspace/alpha"));
-  assert.doesNotMatch(source, /WorkerShellBackend|WorkerJavaScriptBackend/);
+  assert.match(source, /WorkerShellBackend/);
+  assert.match(source, /egress: \{ mode: "none" \}/);
+  assert.match(source, /\/conformance\/shell\/alpha/);
+  assert.doesNotMatch(source, /WorkerJavaScriptBackend/);
 });
 
 test("the source-unmodified AIChatAgent seam persists complete HTTP streams", async () => {

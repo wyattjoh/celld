@@ -10,6 +10,7 @@
     "@cloudflare/agents": "0.0.16",
     "@cloudflare/computer": "0.2.1",
     "ai": "4.3.19",
+    "just-bash": "3.4.0",
     "zod": "3.25.76"
   },
   "devDependencies": {

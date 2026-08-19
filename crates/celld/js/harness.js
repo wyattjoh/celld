@@ -1583,7 +1583,58 @@ const __loaderCapabilityFinalizer = typeof FinalizationRegistry === "function"
     })
   : null;
 
-globalThis.__makeLoaderCapability = (workerId, token, kind) => {
+// A Worker Shell backend first obtains a host Workspace stub and then calls
+// methods on that returned value. The returned value is still a capability,
+// not a cross-isolate RPC stub: the marker below revives as another view of
+// the same opaque handle, rooted at the method path that produced it.
+const __loaderCapabilityRevive = (value) => {
+  const seen = new Set();
+  const revive = (current) => {
+    if (current === null || typeof current !== "object") return current;
+    const marker = current["__celld$loaderCapability"];
+    if (marker !== undefined && marker !== null &&
+        typeof marker === "object" &&
+        typeof marker.token === "string" &&
+        typeof marker.kind === "string" && Array.isArray(marker.path)) {
+      const workerId = globalThis.__loaderWorkerId;
+      if (typeof workerId !== "string")
+        throw new Error("worker loader: capability result has no worker owner");
+      return __makeLoaderCapability(
+        workerId, marker.token, marker.kind, marker.path,
+      );
+    }
+    if (seen.has(current)) return current;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length; index++)
+        current[index] = revive(current[index]);
+      return current;
+    }
+    const proto = Object.getPrototypeOf(current);
+    if (proto !== Object.prototype && proto !== null) return current;
+    for (const key of Object.keys(current)) current[key] = revive(current[key]);
+    return current;
+  };
+  return revive(value);
+};
+
+const __loaderCapabilityDeserialize = (bytes) =>
+  __loaderCapabilityRevive(__rpcDes(bytes));
+
+globalThis.__makeLoaderCapability = (
+  workerId, token, kind, initialPath = [],
+) => {
+  // The loaded worker owns this identity. Capability-return markers omit it
+  // from their host-visible payload and recover it here, so a marker copied
+  // into another worker still fails the Rust owner/worker authorization check.
+  if (!Object.hasOwn(globalThis, "__loaderWorkerId")) {
+    Object.defineProperty(globalThis, "__loaderWorkerId", {
+      configurable: false,
+      enumerable: false,
+      value: workerId,
+      writable: false,
+    });
+  }
   let disposed = false;
   let root;
   const unregisterToken = {};
@@ -1625,12 +1676,12 @@ globalThis.__makeLoaderCapability = (workerId, token, kind) => {
         }
         return __loaderCapabilityCall(
           workerId, token, kind, JSON.stringify(path), encoded,
-        ).then(__rpcDes);
+        ).then(__loaderCapabilityDeserialize);
       },
     });
     return proxy;
   };
-  root = make([]);
+  root = make(initialPath);
   if (__loaderCapabilityFinalizer)
     __loaderCapabilityFinalizer.register(
       root, [workerId, token, kind], unregisterToken,
@@ -1645,11 +1696,28 @@ globalThis.__dispatchLoaderCapability =
         path.some((part) => !__loaderCapabilitySafe(part))) {
       throw new TypeError("worker loader: invalid capability method path");
     }
-    // Ticket 06 deliberately exposes only the pinned Workspace filesystem
-    // surface. Fetcher brokers and other capability kinds are later work.
-    if (kind !== "workspace" || path.length !== 2 || path[0] !== "fs")
+    // Worker Shell receives the service proxy's getWorkspace() result as an
+    // opaque capability view. All subsequent calls stay on the explicit
+    // Workspace fs allowlist; other host APIs and outbound brokers remain
+    // unavailable to loaded code.
+    if (kind !== "workspace" ||
+        (path.length !== 1 && path.length !== 3) ||
+        path[0] !== "getWorkspace" ||
+        (path.length === 3 && path[1] !== "fs"))
       throw new TypeError(
-        "worker loader: only Workspace fs method calls are supported");
+        "worker loader: Workspace capability only exposes getWorkspace and fs methods");
+    if (path.length === 3 && !new Set([
+      "readFile", "exists", "stat", "statOrNull", "lstat", "lstatOrNull",
+      "readdir", "find", "ls", "grep", "readlink", "writeFile", "mkdir",
+      "rm", "chmod", "symlink",
+    ]).has(path[2]))
+      throw new TypeError(
+        "worker loader: Workspace capability method is unsupported");
+    if (path.length === 1) {
+      return {
+        "__celld$loaderCapability": { token, kind, path },
+      };
+    }
     const target = __loader_capability_target(owner, token, kind);
     let receiver = target;
     for (let i = 0; i < path.length - 1; i++) {

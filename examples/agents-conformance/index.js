@@ -2,9 +2,20 @@ import {
   getAgentByName,
   routeAgentRequest,
 } from "@cloudflare/agents";
-import { getWorkspace, withWorkspace } from "@cloudflare/computer";
+import {
+  getWorkspace,
+  withWorkspace,
+  WorkspaceServiceProxy,
+} from "@cloudflare/computer";
+import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { AIChatAgent } from "@cloudflare/agents/ai-chat-agent";
 import { appendResponseMessages } from "ai";
+
+// The Worker Shell backend asks the host cell for this entrypoint over the
+// granted Workspace capability. Re-exporting the pinned package class makes
+// it available through the same-isolate ctx.exports surface without patching
+// the package implementation.
+export { WorkspaceServiceProxy };
 
 const AGENT_NAMES = new Set(["alpha", "beta"]);
 const SESSION_STATE_ID = "default";
@@ -116,6 +127,23 @@ function safeErrorMessage(error) {
   return errorMessage(error).replace(/https?:\/\/[^\s"']+/g, "<redacted-url>");
 }
 
+function shellBackends(self) {
+  const loader = self.env?.LOADER;
+  if (loader === undefined) return [];
+  return [new WorkerShellBackend({
+    id: "worker-shell",
+    loader,
+    workspace: {
+      binding: "agents",
+      id: self.ctx.id.toString(),
+    },
+    ctx: self.ctx,
+    // The shell has the Workspace capability only. Do not opt into the
+    // package's direct or HTTP-gateway egress modes for this fixture.
+    egress: { mode: "none" },
+  })];
+}
+
 /**
  * Source-unmodified AIChatAgent used by the celld compatibility fixture.
  * The callable method returns nested cloneable data, while the HTTP chat seam
@@ -129,7 +157,10 @@ function safeErrorMessage(error) {
  */
 export class ConformanceAgent extends withWorkspace(
   AIChatAgent,
-  (self) => ({ storage: self.ctx.storage }),
+  (self) => ({
+    storage: self.ctx.storage,
+    backends: shellBackends(self),
+  }),
 ) {
   constructor(ctx, env) {
     super(ctx, env);
@@ -449,7 +480,8 @@ export class ConformanceAgent extends withWorkspace(
 
   /**
    * Exercise the pinned filesystem-only Computer surface from the owning
-   * Agent cell. No Worker Loader, shell, or JavaScript backend is configured.
+   * Agent cell. The shell backend is a separate loaded-worker surface below;
+   * both use this Agent cell's authoritative Workspace tables.
    * Mutating calls return only after the host's normal cell output gate sees
    * the SQLite write position advance.
    */
@@ -535,6 +567,64 @@ export class ConformanceAgent extends withWorkspace(
       force: input?.force === true,
     });
     return { agent: this.name, operation, path: target, deleted: true };
+  }
+
+  /**
+   * Run one pinned just-bash Worker Shell command through a fresh loaded
+   * worker. The package's backend uses only the explicitly granted Workspace
+   * capability and `globalOutbound: null`; it never receives a host path,
+   * process handle, socket, or ambient network authority.
+   */
+  async shell(input) {
+    const name = input?.name;
+    if (typeof name !== "string" || !AGENT_NAMES.has(name)) {
+      throw new TypeError("shell requires one of the pinned agent names");
+    }
+    const command = input?.command;
+    if (typeof command !== "string" || command.trim().length === 0) {
+      throw new TypeError("shell requires a non-empty command string");
+    }
+    if (this.env?.LOADER === undefined) {
+      throw new Error(
+        "Worker Shell requires the LOADER Worker Loader deployment capability",
+      );
+    }
+    const timeoutMs = input?.timeoutMs;
+    if (timeoutMs !== undefined &&
+        (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000)) {
+      throw new TypeError("shell timeoutMs must be an integer between 1 and 30000");
+    }
+    await this.setName(name);
+    const workspace = await getWorkspace(this);
+    const run = await workspace.runtime.exec({
+      command,
+      backend: "worker-shell",
+      encoding: "utf8",
+      cwd: input?.cwd,
+      env: input?.env,
+      stdin: input?.stdin,
+      timeoutMs,
+    });
+    const result = await run.result();
+    const stderr = result.stderr;
+    const outcome = result.status === "cancelled" || result.exitCode === 130
+      ? "interrupted"
+      : result.exitCode === 124 ? "timed_out"
+      : result.exitCode === 127 && /command not found|not found/i.test(stderr)
+        ? "unsupported_command"
+        : result.status === "completed" && result.exitCode === 0
+          ? "completed" : "failed";
+    return {
+      agent: this.name,
+      backend: run.backend,
+      id: run.id,
+      command,
+      outcome,
+      status: result.status,
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr,
+    };
   }
 
   /**
@@ -1041,6 +1131,32 @@ export default {
       return json(await agent.workspace({ ...input, name: workspaceName }));
     }
 
+    const shellMatch = url.pathname.match(/^\/conformance\/shell\/([^/]+)$/);
+    if (shellMatch) {
+      const shellName = AGENT_NAMES.has(shellMatch[1]) ? shellMatch[1] : null;
+      if (!shellName) return json({ error: "unknown_agent" }, { status: 404 });
+      if (request.method !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      const agent = await getAgentByName(env.agents, shellName);
+      const body = await request.json();
+      const input = body && typeof body === "object" && !Array.isArray(body)
+        ? body
+        : {};
+      try {
+        return json(await agent.shell({ ...input, name: shellName }));
+      } catch (error) {
+        const message = safeErrorMessage(error);
+        const invalid = /requires|must be|non-empty/.test(message);
+        const missing = /LOADER Worker Loader/.test(message);
+        return json({
+          error: invalid ? "invalid_shell_request"
+            : missing ? "missing_deployment_capability" : "shell_execution_error",
+          message,
+        }, { status: invalid ? 400 : missing ? 503 : 502 });
+      }
+    }
+
     for (const [prefix, suffix] of [
       ["/conformance/chat/", "chat"],
       ["/conformance/resume/", "resume"],
@@ -1070,6 +1186,8 @@ export default {
         "/conformance/schedule/beta",
         "/conformance/workspace/alpha",
         "/conformance/workspace/beta",
+        "/conformance/shell/alpha",
+        "/conformance/shell/beta",
         "/conformance/chat/alpha",
         "/conformance/resume/alpha?response=<id>&after=<cursor>",
         "/conformance/messages/alpha",

@@ -1,6 +1,6 @@
 # Agents compatibility target
 
-This fixture is the pinned, source-unmodified compatibility seam extended through tickets 02, 03, 04, and 05.
+This fixture is the pinned, source-unmodified compatibility seam extended through tickets 02, 03, 04, 05, and 09.
 The package versions, lockfile integrity values, and lockfile digest are checked
 by `npm run check:compatibility`; changing an upstream version without a
 reviewed target update fails before deployment.
@@ -45,7 +45,8 @@ The status describes the celld contract at this fixture seam:
 | celld HTTP AI adapter (`ai` binding + `CELLD_AI_URL`) | `/conformance/ai-adapter/<name>` calls `env.AI.run(model, input)` | adapted | celld maps the declared binding to an operator-owned HTTP endpoint and fails clearly when the endpoint capability is absent |
 | deployment credential isolation | provider URL/token is not in `index.js`, Worker vars, Workspace files, or default telemetry | adapted | provider authentication belongs to the operator-owned HTTP endpoint; this credential-free double tests transport only |
 | public deployment/lifecycle route | README curl flow covers chat, status, resume, and messages after a node transition | adapted | this worktree has no live bucket/node credentials; Node tests and Rust storage tests are bounded local evidence, so a live deployment run is still required for end-to-end acceptance |
-| `@cloudflare/computer@0.2.1` Worker JavaScript backend | not exercised by this ticket | unsupported | loader capability integration is ticket 08 |
-| `@cloudflare/computer@0.2.1` Worker Shell backend | not exercised by this ticket | unsupported | loader capability integration is ticket 09 |
+| `@cloudflare/computer@0.2.1` Worker JavaScript backend | not exercised by this ticket | unsupported | loader capability integration is ticket 08; this ticket does not add a JavaScript backend |
+| `@cloudflare/computer@0.2.1` Worker Shell backend | `/conformance/shell/<name>` runs pinned core commands in a loaded worker | adapted | `WorkerShellBackend` is source-unmodified; celld grants only the Workspace fs sideband and forces `globalOutbound: null`; shell state stays in the Agent cell |
+| `just-bash@3.4.0` core Worker Shell runtime | `mkdir`, redirection, `cat`, `grep`, and unsupported-command/timeout outcomes | supported | the exact package is a direct fixture dependency and lockfile target; no optional Python, SQLite, or JS-exec groups are bundled, and core `curl` is denied by `globalOutbound: null` |
 | `@cloudflare/computer@0.2.1` container backend, R2, and Artifacts | not exercised by this ticket | unsupported | no Linux/container or object-store emulation is implied |
 | `esbuild@0.28.2` Worker bundling | `celld deploy` bundles `index.js` and accepts the `ai` binding | adapted | celld's deploy allowlist records the AI binding while the endpoint remains node deployment configuration |

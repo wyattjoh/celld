@@ -1,9 +1,10 @@
 # Agents compatibility conformance
 
 This is the smallest source-unmodified multi-Agent application for celld. It
-pins `@cloudflare/agents@0.0.16`, `ai@4.3.19`, and
-`@cloudflare/computer@0.2.1`; the exact resolved package integrity values and
-complete lockfile digest are recorded in [`compatibility.json`](compatibility.json).
+pins `@cloudflare/agents@0.0.16`, `ai@4.3.19`,
+`@cloudflare/computer@0.2.1`, and `just-bash@3.4.0`; the exact resolved package
+integrity values and complete lockfile digest are recorded in
+[`compatibility.json`](compatibility.json).
 The `ai` version is pinned because the published `AIChatAgent` implementation
 uses its `appendResponseMessages` helper.
 
@@ -28,16 +29,57 @@ numeric-delay form of `Agent.schedule()`; its `recordScheduledWork` callback
 updates durable state and the schedule-run table. This deliberately uses
 celld's Durable Object alarm path, not a Worker cron trigger.
 
-The Agent also uses the pinned filesystem-only Computer seam:
-`withWorkspace(Agent, (self) => ({ storage: self.ctx.storage }))`. The
-Workspace has no execution backend, and its `fs` surface is exercised through
+The Agent uses the pinned filesystem-only Computer seam and its Worker Shell
+backend. `withWorkspace(Agent, ...)` passes `self.ctx.storage` to the VFS and
+registers `WorkerShellBackend` only when the explicit `LOADER` binding is
+present. The Workspace's `fs` surface is exercised through
 `POST /conformance/workspace/<name>` with an operation of `create`, `read`,
-`update`, `list`, `search`, or `delete`. The package's VFS tables therefore
-live in the owning Agent cell's authoritative SQLite database, not in a second
-store. With the default `CELLD_OUTPUT_GATE=1`, the host withholds a successful
-mutating response until the cell's configured durability path proves the
-SQLite write position; `CELLD_OUTPUT_GATE=0` explicitly opts out of that
-acknowledgment guarantee.
+`update`, `list`, `search`, or `delete`; shell commands use
+`POST /conformance/shell/<name>`. Both surfaces use the owning Agent cell's
+authoritative SQLite database, not a second store. With the default
+`CELLD_OUTPUT_GATE=1`, the host withholds a successful mutating response until
+the cell's configured durability path proves the SQLite write position;
+`CELLD_OUTPUT_GATE=0` explicitly opts out of that acknowledgment guarantee.
+
+Worker Shell is the source-unmodified `@cloudflare/computer@0.2.1`
+`WorkerShellBackend` running pinned `just-bash@3.4.0` in a loaded worker. The
+fixture bundles only the core command group: there is no native process
+execution, host filesystem, arbitrary TCP socket, Python, SQLite,
+JavaScript-exec, or ambient network capability. The host passes the Workspace
+as an opaque capability; the loaded worker can call only the allowlisted
+Workspace `fs` methods. `egress: { mode: "none" }` becomes
+`globalOutbound: null`, so the pinned core `curl` command reports a bounded
+fetch failure instead of reaching the network. No optional network or
+code-execution command groups are added.
+
+For example, after deploying with `LOADER` enabled:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8080/conformance/shell/alpha \
+  -H 'content-type: application/json' \
+  -d '{"command":"mkdir -p /notes && printf \"hello\\n\" > /notes/todo.md && cat /notes/todo.md"}'
+# {"outcome":"completed", "stdout":"hello\\n", ...}
+curl -fsS -X POST http://127.0.0.1:8080/conformance/shell/alpha \
+  -H 'content-type: application/json' \
+  -d '{"command":"cat /notes/todo.md | grep hello"}'
+# The same file is visible through /conformance/workspace/alpha.
+curl -fsS -X POST http://127.0.0.1:8080/conformance/shell/alpha \
+  -H 'content-type: application/json' \
+  -d '{"command":"curl https://example.invalid"}'
+# {"outcome":"failed", "exitCode":1, "stderr":"curl: (1) fetch failed\\n", ...}
+curl -fsS -X POST http://127.0.0.1:8080/conformance/shell/alpha \
+  -H 'content-type: application/json' \
+  -d '{"command":"sleep 5", "timeoutMs":1}'
+# {"outcome":"timed_out", "exitCode":124, ...}
+```
+
+The shell result always includes a stable `outcome`: `completed`, `failed`,
+`unsupported_command`, `timed_out`, or `interrupted`. Unsupported commands and
+cancellation are returned as bounded stderr plus a nonzero exit code. A
+command never rolls back an already acknowledged Workspace mutation; a
+mutation before timeout remains durable and can be inspected with the
+filesystem route. Missing `LOADER` is a `503 missing_deployment_capability`,
+not a silent in-process fallback.
 
 The focused package/runtime fixture test covers all six operations, reopen
 persistence, and alpha/beta isolation. It does not claim a live bucket restore,
@@ -95,6 +137,7 @@ starting the node that loads the deployment:
 
 ```sh
 node scripts/model-provider.mjs --port 8788
+CELLD_WORKER_LOADER=LOADER \
 CELLD_VAR_MODEL_PROVIDER_URL=http://127.0.0.1:8788/v1/chat \
 CELLD_AI_URL=http://127.0.0.1:8788/v1/ai \
 celld --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
@@ -203,4 +246,7 @@ restore, ownership-transfer, and output-gate coverage belongs to the live-fleet
 runtime harness.
 
 The supported/adapted/unsupported decisions are in
-[`compatibility-matrix.md`](compatibility-matrix.md).
+[`compatibility-matrix.md`](compatibility-matrix.md). Worker Shell evidence
+requires the node to start with `CELLD_WORKER_LOADER=LOADER`; without that
+explicit deployment capability the fixture intentionally returns the clear
+missing-capability error above.

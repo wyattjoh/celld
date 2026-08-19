@@ -13,6 +13,10 @@
       "version": "0.2.1",
       "integrity": "sha512-jh0pa1csAExPItUYzrzBrZO1vCBjsQ6jX+aunrnKe2VSC9i8mEziQYZUL3IZId4GpceRL+v8HIzVr4kjbmQXPw=="
     },
+    "just-bash": {
+      "version": "3.4.0",
+      "integrity": "sha512-dSJDEyjcy/xhGspY7PvO+5UYCcwMDT8sabuHNt/OPDZMDSonyJi3liVBBgLpUKcf2bFAvTLnN4Y1lBkNPm04Ow=="
+    },
     "ai": {
       "version": "4.3.19",
       "integrity": "sha512-dIE2bfNpqHN3r6IINp9znguYdhIOheKW2LDigAMrgt/upT3B8eBGPSCblENvaZGoq+hxaN9fSMzjWpbqloP+7Q=="
@@ -26,6 +30,6 @@
       "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
     }
   },
-  "lockfileSha256": "8b85da9d52c50269d249dd600b4dace6583b7690d39f927ead59bce719a74f16",
+  "lockfileSha256": "58a8d0772f3b32269294c3762c82aa614943ae298bf9b5160dd477562e5c851e",
   "matrix": "compatibility-matrix.md"
 }

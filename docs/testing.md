@@ -32,14 +32,18 @@ Tests. Before a release, we also replay scenarios through the full
 `celld` binary in each deployment mode: storage, SQL, alarms, streams,
 WebSockets, and lifecycle.
 
-The pinned Agents fixture's filesystem-only Computer test is deliberately
-narrow. It runs the package's `Workspace` against a Durable-Object-shaped SQL
-adapter and asserts create/read/update/list/search/delete, reopening the same
-SQLite database, and isolation between two Agent databases. The Rust storage
-fixture separately asserts that the file-row mutations advance the same cell
-write position used by the output gate. These focused tests establish the seam;
-without a live bucket evidence bundle they do not claim eviction, restart, or
-ownership-transfer behavior on a fleet.
+The pinned Agents fixture's Computer tests are deliberately narrow. The
+filesystem test runs the package's `Workspace` against a Durable-Object-shaped
+SQL adapter and asserts create/read/update/list/search/delete, reopening the
+same SQLite database, and isolation between two Agent databases. The Worker
+Shell fixture pins `@cloudflare/computer@0.2.1` and `just-bash@3.4.0`, checks the
+loaded-worker source seam, the Workspace capability allowlist, no-egress
+policy, unsupported-command result, and timeout/interruption wording. It does
+not add native process, host filesystem, TCP, or an alternate Workspace store.
+The Rust storage fixture separately asserts that file-row mutations advance
+the same cell write position used by the output gate. These focused tests
+establish the seam; without a live bucket evidence bundle they do not claim
+eviction, restart, or ownership-transfer behavior on a fleet.
 
 ## Specification: exhaustive at small size
 
