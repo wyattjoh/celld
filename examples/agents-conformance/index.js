@@ -5,6 +5,7 @@ import {
 } from "@cloudflare/agents";
 
 const AGENT_NAMES = new Set(["alpha", "beta"]);
+const SESSION_STATE_ID = "default";
 
 function initialSessionState(name) {
   return {
@@ -43,6 +44,17 @@ export class ConformanceAgent extends Agent {
       )
     `;
     this.sql`
+      CREATE TABLE IF NOT EXISTS conformance_agent_session_state (
+        id TEXT PRIMARY KEY NOT NULL,
+        message_count INTEGER NOT NULL,
+        connection_count INTEGER NOT NULL,
+        scheduled_runs INTEGER NOT NULL,
+        last_message TEXT,
+        last_scheduled TEXT,
+        last_connection_id TEXT
+      )
+    `;
+    this.sql`
       CREATE TABLE IF NOT EXISTS conformance_agent_session_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         connection_id TEXT NOT NULL,
@@ -60,10 +72,68 @@ export class ConformanceAgent extends Agent {
   }
 
   sessionSnapshot() {
+    const rows = this.sql`
+      SELECT message_count, connection_count, scheduled_runs,
+             last_message, last_scheduled, last_connection_id
+      FROM conformance_agent_session_state
+      WHERE id = ${SESSION_STATE_ID}
+    `;
+    const row = rows[0];
+    if (row) {
+      let lastScheduled = null;
+      try {
+        lastScheduled = row.last_scheduled === null
+          ? null
+          : JSON.parse(row.last_scheduled);
+      } catch {
+        // Treat a malformed fixture row as an empty optional value.
+      }
+      return {
+        agent: this.name,
+        messageCount: row.message_count,
+        connectionCount: row.connection_count,
+        scheduledRuns: row.scheduled_runs,
+        lastMessage: row.last_message,
+        lastScheduled,
+        lastConnectionId: row.last_connection_id,
+      };
+    }
+
+    // Older deployed revisions kept these fields in Agent.state. Read them
+    // once as a compatibility bridge, but never write session fields back
+    // into the public stateAndSql value.
+    const legacy = this.state;
+    if (!legacy || typeof legacy !== "object" ||
+        !Number.isSafeInteger(legacy.messageCount)) {
+      return initialSessionState(this.name);
+    }
     return {
       ...initialSessionState(this.name),
-      ...(this.state ?? {}),
+      messageCount: legacy.messageCount,
+      connectionCount: Number.isSafeInteger(legacy.connectionCount)
+        ? legacy.connectionCount
+        : 0,
+      scheduledRuns: Number.isSafeInteger(legacy.scheduledRuns)
+        ? legacy.scheduledRuns
+        : 0,
+      lastMessage: legacy.lastMessage ?? null,
+      lastScheduled: legacy.lastScheduled ?? null,
+      lastConnectionId: legacy.lastConnectionId ?? null,
     };
+  }
+
+  persistSessionState(state) {
+    this.sql`
+      INSERT OR REPLACE INTO conformance_agent_session_state
+        (id, message_count, connection_count, scheduled_runs,
+         last_message, last_scheduled, last_connection_id)
+      VALUES (
+        ${SESSION_STATE_ID}, ${state.messageCount}, ${state.connectionCount},
+        ${state.scheduledRuns}, ${state.lastMessage},
+        ${state.lastScheduled === null ? null : JSON.stringify(state.lastScheduled)},
+        ${state.lastConnectionId}
+      )
+    `;
   }
 
   onConnect(connection) {
@@ -73,7 +143,7 @@ export class ConformanceAgent extends Agent {
       connectionCount: state.connectionCount + 1,
       lastConnectionId: connection.id,
     };
-    this.setState(next);
+    this.persistSessionState(next);
     connection.setState({
       messageCount: next.messageCount,
       connectionCount: next.connectionCount,
@@ -105,7 +175,7 @@ export class ConformanceAgent extends Agent {
       lastMessage: value,
       lastConnectionId: connection.id,
     };
-    this.setState(next);
+    this.persistSessionState(next);
     this.sql`
       INSERT INTO conformance_agent_session_events
         (connection_id, message, message_count)
@@ -152,7 +222,7 @@ export class ConformanceAgent extends Agent {
       scheduledRuns: state.scheduledRuns + 1,
       lastScheduled: { id: schedule.id, payload },
     };
-    this.setState(next);
+    this.persistSessionState(next);
     this.sql`
       INSERT OR REPLACE INTO conformance_agent_schedule_runs
         (id, payload, scheduled_time)

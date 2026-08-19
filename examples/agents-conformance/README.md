@@ -15,9 +15,9 @@ both surfaces so deterministic checks can verify that `alpha` and `beta` never
 share rows.
 
 The Agent also exercises the pinned hibernating `Server` surface. A text
-message received on `/agents/agents/<name>` increments durable Agent state and
-an event row, so a cell can be evicted while the host WebSocket remains open
-and the next message wakes a fresh instance. `/conformance/session/<name>`
+message received on `/agents/agents/<name>` increments durable session state
+and an event row in the owning Agent's SQL database, so a cell can be evicted
+while the host WebSocket remains open and the next message wakes a fresh instance. `/conformance/session/<name>`
 reports that state and event log. `/conformance/schedule/<name>` exposes the
 numeric-delay form of `Agent.schedule()`; its `recordScheduledWork` callback
 updates durable state and the schedule-run table. This deliberately uses

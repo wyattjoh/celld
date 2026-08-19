@@ -48,7 +48,9 @@ test("the fixture declares hibernating sessions and alarm-backed delayed work", 
 
   assert.match(source, /onConnect\(connection\)/);
   assert.match(source, /onMessage\(connection, message\)/);
+  assert.match(source, /conformance_agent_session_state/);
   assert.match(source, /conformance_agent_session_events/);
+  assert.match(source, /persistSessionState\(next\)/);
   assert.match(source, /async scheduleWork\(input\)/);
   assert.match(source, /this\.schedule\(/);
   assert.match(source, /recordScheduledWork\(payload, schedule\)/);
