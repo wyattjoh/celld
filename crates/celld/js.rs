@@ -5220,8 +5220,8 @@ fn op_loader_fetch(
     let headers =
         serde_json::from_str(&args.get(5).to_rust_string_lossy(scope)).unwrap_or_default();
     let async_id = asyncrt::enqueue(async move {
-        let _execution = admit_code_mode_execution()?;
-        let _call = entry.lifecycle.acquire("worker").map_err(|error| {
+        let execution = admit_code_mode_execution()?;
+        let call = entry.lifecycle.acquire("worker").map_err(|error| {
             loader_interruption(
                 celld_logic::capability::InterruptionClass::WorkerDisposed,
                 error,
@@ -5247,11 +5247,25 @@ fn op_loader_fetch(
         };
         let driving = tokio::spawn(crate::runtime::drive_loaded_worker(slot, job));
         match receive.await {
-            Ok(Ok(response)) => Ok(encode_http_response(response, false)),
-            Ok(Err(error)) => Err(loader_result_error(
-                celld_logic::capability::InterruptionClass::CapabilityFailure,
-                error,
-            )),
+            Ok(Ok(response)) => {
+                tokio::spawn(async move {
+                    let _execution = execution;
+                    let _call = call;
+                    let _ = driving.await;
+                });
+                Ok(encode_http_response(response, false))
+            }
+            Ok(Err(error)) => {
+                tokio::spawn(async move {
+                    let _execution = execution;
+                    let _call = call;
+                    let _ = driving.await;
+                });
+                Err(loader_result_error(
+                    celld_logic::capability::InterruptionClass::CapabilityFailure,
+                    error,
+                ))
+            }
             Err(_) => {
                 let result = match driving.await {
                     Err(error) => Err(loader_interruption(
@@ -5266,6 +5280,7 @@ fn op_loader_fetch(
                 schedule_loader_entry_release(entry.id);
                 result
             }
+        }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -5302,8 +5317,8 @@ fn op_loader_rpc(
     let method = args.get(3).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(4)).unwrap_or_default();
     let async_id = asyncrt::enqueue(async move {
-        let _execution = admit_code_mode_execution()?;
-        let _call = entry.lifecycle.acquire("worker").map_err(|error| {
+        let execution = admit_code_mode_execution()?;
+        let call = entry.lifecycle.acquire("worker").map_err(|error| {
             loader_interruption(
                 celld_logic::capability::InterruptionClass::WorkerDisposed,
                 error,
@@ -5326,11 +5341,25 @@ fn op_loader_rpc(
         };
         let driving = tokio::spawn(crate::runtime::drive_loaded_worker(slot, job));
         match receive.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(loader_result_error(
-                celld_logic::capability::InterruptionClass::CapabilityFailure,
-                error,
-            )),
+            Ok(Ok(result)) => {
+                tokio::spawn(async move {
+                    let _execution = execution;
+                    let _call = call;
+                    let _ = driving.await;
+                });
+                Ok(result)
+            }
+            Ok(Err(error)) => {
+                tokio::spawn(async move {
+                    let _execution = execution;
+                    let _call = call;
+                    let _ = driving.await;
+                });
+                Err(loader_result_error(
+                    celld_logic::capability::InterruptionClass::CapabilityFailure,
+                    error,
+                ))
+            }
             Err(_) => {
                 let result = match driving.await {
                     Err(error) => Err(loader_interruption(
@@ -5345,6 +5374,7 @@ fn op_loader_rpc(
                 schedule_loader_entry_release(entry.id);
                 result
             }
+        }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -5693,16 +5723,29 @@ fn op_loader_capability_call(
         reply,
     };
     let async_id = asyncrt::enqueue(async move {
-        let _execution = execution;
-        let _worker_call = worker_call;
-        let _capability_call = capability_call;
         let driving = tokio::spawn(crate::runtime::drive(host_slot, job, None));
         match receive.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(loader_result_error(
-                celld_logic::capability::InterruptionClass::CapabilityFailure,
-                error,
-            )),
+            Ok(Ok(result)) => {
+                tokio::spawn(async move {
+                    let _execution = execution;
+                    let _worker_call = worker_call;
+                    let _capability_call = capability_call;
+                    let _ = driving.await;
+                });
+                Ok(result)
+            }
+            Ok(Err(error)) => {
+                tokio::spawn(async move {
+                    let _execution = execution;
+                    let _worker_call = worker_call;
+                    let _capability_call = capability_call;
+                    let _ = driving.await;
+                });
+                Err(loader_result_error(
+                    celld_logic::capability::InterruptionClass::CapabilityFailure,
+                    error,
+                ))
+            }
             Err(_) => {
                 let result = match driving.await {
                     Err(error) => Err(loader_interruption(
@@ -5717,6 +5760,7 @@ fn op_loader_capability_call(
                 schedule_loader_entry_release(entry.id);
                 result
             }
+        }
         }
     });
     rv.set(promise_for(scope, async_id));
