@@ -45,6 +45,14 @@ pub enum ErrorKind {
     HostLost,
     /// A disposed capability or worker was used.
     Disposed,
+    /// A capability token was not present in the host registry.
+    CapabilityUnknown,
+    /// A capability was presented by the wrong host owner.
+    CapabilityOwnerMismatch,
+    /// A capability was presented by the wrong loaded worker.
+    CapabilityWorkerMismatch,
+    /// A capability was used through the wrong operation family.
+    CapabilityKindMismatch,
 }
 
 impl ErrorKind {
@@ -60,6 +68,10 @@ impl ErrorKind {
             Self::Timeout => EXECUTION_TIMEOUT_CODE,
             Self::HostLost => "code_mode.host_lost",
             Self::Disposed => "code_mode.disposed",
+            Self::CapabilityUnknown => "code_mode.capability_unknown",
+            Self::CapabilityOwnerMismatch => "code_mode.capability_owner_mismatch",
+            Self::CapabilityWorkerMismatch => "code_mode.capability_worker_mismatch",
+            Self::CapabilityKindMismatch => "code_mode.capability_kind_mismatch",
         }
     }
 
@@ -463,6 +475,11 @@ mod tests {
         assert!(ErrorKind::Timeout.retryable());
         assert!(ErrorKind::HostLost.retryable());
         assert!(!ErrorKind::Disposed.retryable());
+        assert!(!ErrorKind::CapabilityUnknown.retryable());
+        assert_eq!(
+            ErrorKind::CapabilityOwnerMismatch.code(),
+            "code_mode.capability_owner_mismatch"
+        );
         assert_eq!(
             AdmissionError::Pressured.kind().code(),
             "code_mode.pressure"

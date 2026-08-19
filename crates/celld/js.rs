@@ -4561,6 +4561,43 @@ mod loader_capability_tests {
         assert!(!loader_belongs_to_cell(None, "Agent:a"));
     }
 
+    #[tokio::test]
+    async fn registry_revocation_removes_only_the_cell_and_waits_for_active_calls() {
+        let make_entry = |id: u64, cell: &str| {
+            let (_loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+            Arc::new(LoadedWorkerEntry {
+                host_key: 7,
+                host_cell: Some(cell.to_string()),
+                state: Mutex::new(Some(state)),
+                owner: id,
+                memory_bytes: 0,
+                host_slot: Weak::new(),
+                capabilities: HashMap::new(),
+                lifecycle: Arc::new(CapabilityLifecycle::live()),
+            })
+        };
+        let cell_a = make_entry(1, "Agent:a");
+        let cell_b = make_entry(2, "Agent:b");
+        let active = cell_a.lifecycle.acquire("capability").unwrap();
+        let mut registry = LoaderRegistry::new();
+        registry.insert(1, cell_a.clone());
+        registry.insert(2, cell_b.clone());
+
+        let victims = take_loader_entries_for_cell(&mut registry, 7, "Agent:a");
+        assert_eq!(victims.len(), 1);
+        assert_eq!(registry.len(), 1);
+        assert!(Arc::ptr_eq(&victims[0], &cell_a));
+        assert!(registry.contains_key(&2));
+        victims[0].lifecycle.dispose();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), victims[0].lifecycle.wait_idle())
+                .await
+                .is_err()
+        );
+        drop(active);
+        victims[0].lifecycle.wait_idle().await;
+    }
+
     #[test]
     fn eviction_only_selects_ready_idle_workers() {
         assert!(should_shed_loaded_worker(true, true));
@@ -4587,6 +4624,8 @@ struct LoadedCapability {
 
 struct LoadedWorkerEntry {
     id: u64,
+    /// Exact host isolate identity that minted the capability grants.
+    host_key: usize,
     /// Exact host cell that minted the capability grants, if any.
     host_cell: Option<String>,
     /// The receiver is dropped before the memory reservation is released, so
@@ -4661,6 +4700,23 @@ fn shed_idle_loaded_workers() {
     }
 }
 
+fn take_loader_entries_for_cell(
+    registry: &mut LoaderRegistry,
+    host_key: usize,
+    cell: &str,
+) -> Vec<Arc<LoadedWorkerEntry>> {
+    let ids: Vec<u64> = registry
+        .iter()
+        .filter(|(_, entry)| {
+            entry.host_key == host_key && loader_belongs_to_cell(entry.host_cell.as_deref(), cell)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| registry.remove(&id))
+        .collect()
+}
+
 /// Revoke every loaded worker whose capability host is this exact cell.
 ///
 /// Cell eviction is a host-authority boundary, not merely a residency change:
@@ -4671,27 +4727,10 @@ fn shed_idle_loaded_workers() {
 pub(crate) async fn revoke_loader_capabilities_for_cell(slot: &Arc<crate::pool::Slot>, cell: &str) {
     let victims = {
         let mut registry = loader_registry().lock().unwrap();
-        let ids: Vec<u64> = registry
-            .iter()
-            .filter(|(_, entry)| {
-                loader_belongs_to_cell(entry.host_cell.as_deref(), cell)
-                    && entry
-                        .host_slot
-                        .upgrade()
-                        .is_some_and(|host| Arc::ptr_eq(&host, slot))
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        let mut victims = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(entry) = registry.remove(&id) {
-                entry.lifecycle.dispose();
-                victims.push(entry);
-            }
-        }
-        victims
+        take_loader_entries_for_cell(&mut registry, Arc::as_ptr(slot) as usize, cell)
     };
     for entry in victims {
+        entry.lifecycle.dispose();
         release_loader_entry(entry).await;
     }
 }
@@ -4757,17 +4796,22 @@ fn throw_capability_error(
     scope: &mut v8::PinScope,
     error: celld_logic::capability::AuthorizationError,
 ) {
+    use celld_logic::capability::AuthorizationError;
+    let kind = match error {
+        AuthorizationError::Unknown => celld_logic::code_mode::ErrorKind::CapabilityUnknown,
+        AuthorizationError::OwnerMismatch => {
+            celld_logic::code_mode::ErrorKind::CapabilityOwnerMismatch
+        }
+        AuthorizationError::WorkerMismatch => {
+            celld_logic::code_mode::ErrorKind::CapabilityWorkerMismatch
+        }
+        AuthorizationError::KindMismatch => {
+            celld_logic::code_mode::ErrorKind::CapabilityKindMismatch
+        }
+        AuthorizationError::NotLive => celld_logic::code_mode::ErrorKind::Disposed,
+    };
     let message = capability_error(error);
-    if error == celld_logic::capability::AuthorizationError::NotLive {
-        loader_throw_code(
-            scope,
-            celld_logic::code_mode::ErrorKind::Disposed.code(),
-            false,
-            &message,
-        );
-    } else {
-        loader_throw(scope, &message);
-    }
+    loader_throw_code(scope, kind.code(), kind.retryable(), &message);
 }
 
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
@@ -5007,6 +5051,9 @@ fn op_loader_load(
     }
     let host_state = actor_runtime_state(scope);
     let host_cell = current_context().host_cell.lock().unwrap().clone();
+    let host_key = current_slot()
+        .as_ref()
+        .map_or(0, |slot| Arc::as_ptr(slot) as usize);
     let capability_sideband = args.get(2);
     let outbound_sideband = args.get(3);
     let host_scope = current_context().cell_scope();
@@ -5306,6 +5353,7 @@ fn op_loader_load(
         .expect("new loaded worker is live");
     let entry = Arc::new(LoadedWorkerEntry {
         id,
+        host_key,
         host_cell,
         state: Mutex::new(Some(state)),
         agent_scope,
@@ -5830,7 +5878,10 @@ fn op_loader_capability_call(
     let token = args.get(1).to_rust_string_lossy(scope);
     let kind_name = args.get(2).to_rust_string_lossy(scope);
     let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
-        return loader_throw(scope, "worker loader: unsupported capability kind");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::KindMismatch,
+        );
     };
     let path = match serde_json::from_str::<Vec<String>>(&args.get(3).to_rust_string_lossy(scope)) {
         Ok(path) if !path.is_empty() => path,
@@ -5845,7 +5896,10 @@ fn op_loader_capability_call(
         );
     };
     if actual_worker != requested_worker {
-        return loader_throw(scope, "worker loader: capability worker mismatch");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::WorkerMismatch,
+        );
     }
     let loaded = loader_registry()
         .lock()
@@ -5853,16 +5907,18 @@ fn op_loader_capability_call(
         .get(&requested_worker)
         .cloned();
     let Some(entry) = loaded else {
-        return loader_throw(
+        return loader_throw_code(
             scope,
-            &loader_interruption(
-                celld_logic::capability::InterruptionClass::WorkerDisposed,
-                "unknown worker",
-            ),
+            celld_logic::code_mode::ErrorKind::HostLost.code(),
+            true,
+            "worker loader: unknown worker",
         );
     };
     if state.loader_agent_scope.as_deref() != Some(entry.agent_scope.as_str()) {
-        return loader_throw(scope, "worker loader: capability Agent scope mismatch");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::OwnerMismatch,
+        );
     }
     let Some(capability) = entry
         .capabilities
@@ -5871,10 +5927,7 @@ fn op_loader_capability_call(
         .get(&token)
         .cloned()
     else {
-        return loader_throw(
-            scope,
-            &capability_error(celld_logic::capability::AuthorizationError::Unknown),
-        );
+        return throw_capability_error(scope, celld_logic::capability::AuthorizationError::Unknown);
     };
     if let Err(error) = celld_logic::capability::authorize(
         Some(capability.grant),
@@ -5901,29 +5954,23 @@ fn op_loader_capability_call(
     };
     let execution = match admit_code_mode_execution() {
         Ok(execution) => execution,
-        Err(error) => return loader_throw(scope, &error),
+        Err(error) => return loader_throw_admission(scope, &error),
     };
     let worker_call = match entry.lifecycle.acquire("worker") {
         Ok(call) => call,
-        Err(error) => {
-            return loader_throw(
+        Err(_) => {
+            return throw_capability_error(
                 scope,
-                &loader_interruption(
-                    celld_logic::capability::InterruptionClass::WorkerDisposed,
-                    error,
-                ),
+                celld_logic::capability::AuthorizationError::NotLive,
             )
         }
     };
     let (capability_call, cancel) = match capability.lifecycle.acquire_cancellable("capability") {
         Ok(call) => call,
-        Err(error) => {
-            return loader_throw(
+        Err(_) => {
+            return throw_capability_error(
                 scope,
-                &loader_interruption(
-                    celld_logic::capability::InterruptionClass::CapabilityFailure,
-                    error,
-                ),
+                celld_logic::capability::AuthorizationError::NotLive,
             )
         }
     };
@@ -6059,7 +6106,10 @@ fn op_loader_capability_drop(
         );
     };
     if state.loader_agent_scope.as_deref() != Some(entry.agent_scope.as_str()) {
-        return loader_throw(scope, "worker loader: capability Agent scope mismatch");
+        return throw_capability_error(
+            scope,
+            celld_logic::capability::AuthorizationError::OwnerMismatch,
+        );
     }
     let Some(capability) = entry
         .capabilities
@@ -6068,7 +6118,7 @@ fn op_loader_capability_drop(
         .get(&token)
         .cloned()
     else {
-        return loader_throw(scope, "worker loader: unknown capability");
+        return throw_capability_error(scope, celld_logic::capability::AuthorizationError::Unknown);
     };
     if let Err(error) = celld_logic::capability::authorize(
         Some(capability.grant),
@@ -6151,7 +6201,7 @@ fn op_loader_capability_target(
         .get(&token)
         .filter(|capability| capability.owner == owner && capability.kind == kind)
     else {
-        return loader_throw(scope, "worker loader: unknown or mismatched capability");
+        return throw_capability_error(scope, celld_logic::capability::AuthorizationError::Unknown);
     };
     rv.set(v8::Local::new(scope, &capability.target));
 }
