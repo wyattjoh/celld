@@ -92,6 +92,10 @@ test("the fixture wires a filesystem-only Workspace to each Agent cell", async (
   assert.match(source, /loader\.capability\("library", library\)/);
   assert.match(source, /\/conformance\/shell\/alpha/);
   assert.match(source, /\/conformance\/javascript\/alpha/);
+  assert.match(source, /operation === "loader-modules"/);
+  assert.match(source, /workspace\/nested\/loader-helper\.js/);
+  assert.match(source, /workspace\/add\.wasm/);
+  assert.match(source, /import \{ WorkerEntrypoint \} from "cloudflare:workers"/);
 });
 
 test("the source-unmodified AIChatAgent seam persists complete HTTP streams", async () => {

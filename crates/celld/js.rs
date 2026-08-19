@@ -3649,6 +3649,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_rpc" => op_loader_rpc,
         "__loader_capability_call" => op_loader_capability_call,
         "__loader_capability_grant" => op_loader_capability_grant,
+        "__loader_capability_revoke" => op_loader_capability_revoke,
         "__loader_capability_drop" => op_loader_capability_drop,
         "__loader_capability_target" => op_loader_capability_target,
         "__loader_drop" => op_loader_drop,
@@ -5009,6 +5010,65 @@ fn op_loader_capability_call(
     rv.set(promise_for(scope, async_id));
 }
 
+/// Revoke a one-call capability created for an RPC argument. Unlike the
+/// loaded-worker disposal op below, this is called by the host after the RPC
+/// settles (or fails during serialization), so the temporary target cannot
+/// accumulate across failed calls.
+fn op_loader_capability_revoke(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let worker = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let token = args.get(1).to_rust_string_lossy(scope);
+    let kind_name = args.get(2).to_rust_string_lossy(scope);
+    let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+        return;
+    };
+    let state = actor_runtime_state(scope);
+    if state.loader_worker_id.is_some() {
+        return;
+    }
+    let entry = loader_registry().lock().unwrap().get(&worker).cloned();
+    let Some(entry) = entry else {
+        return;
+    };
+    if entry.owner != state.owner_id || !entry.lifecycle.is_live() {
+        return;
+    }
+    let Some(capability) = entry
+        .capabilities
+        .lock()
+        .expect("loaded-worker capability registry poisoned")
+        .get(&token)
+        .cloned()
+    else {
+        return;
+    };
+    if capability.grant.kind != kind || !capability.lifecycle.is_live() {
+        return;
+    }
+    capability.lifecycle.dispose();
+    let host_slot = entry.host_slot.clone();
+    let owner = entry.owner;
+    let entry_for_remove = entry.clone();
+    asyncrt::op_handle().spawn(async move {
+        capability.lifecycle.wait_idle().await;
+        if let Some(slot) = host_slot.upgrade() {
+            let release_token = token.clone();
+            slot.turn(move |worker| {
+                worker.release_loader_capabilities(owner, std::slice::from_ref(&release_token))
+            })
+            .await;
+        }
+        entry_for_remove
+            .capabilities
+            .lock()
+            .expect("loaded-worker capability registry poisoned")
+            .remove(&token);
+    });
+}
+
 /// Dispose one capability without disposing its loaded worker. Existing calls
 /// are allowed to settle; the host target is released once they do.
 fn op_loader_capability_drop(
@@ -5070,6 +5130,7 @@ fn op_loader_capability_drop(
     capability.lifecycle.dispose();
     let host_slot = entry.host_slot.clone();
     let owner = entry.owner;
+    let entry_for_remove = entry.clone();
     asyncrt::op_handle().spawn(async move {
         if !capability.lifecycle.wait_idle_bounded().await {
             capability.lifecycle.cancel_in_flight();
@@ -5082,14 +5143,19 @@ fn op_loader_capability_drop(
                 return;
             }
         }
-        let Some(slot) = host_slot.upgrade() else {
-            return;
-        };
-        let _ = slot
-            .try_turn(move |worker| {
-                worker.release_loader_capabilities(owner, std::slice::from_ref(&token))
-            })
-            .await;
+        if let Some(slot) = host_slot.upgrade() {
+            let release_token = token.clone();
+            let _ = slot
+                .try_turn(move |worker| {
+                    worker.release_loader_capabilities(owner, std::slice::from_ref(&release_token))
+                })
+                .await;
+        }
+        entry_for_remove
+            .capabilities
+            .lock()
+            .expect("loaded-worker capability registry poisoned")
+            .remove(&token);
     });
 }
 

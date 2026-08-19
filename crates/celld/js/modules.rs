@@ -44,7 +44,15 @@ pub(super) fn compile_module<'s>(
 /// different isolate — not a wrong answer but an invalid one. The registry
 /// belongs to the isolate because its contents do.
 #[derive(Default)]
-pub(super) struct ModuleRegistry(Mutex<HashMap<String, v8::Global<v8::Module>>>);
+pub(super) struct ModuleRegistry(Mutex<ModuleRegistryState>);
+
+#[derive(Default)]
+struct ModuleRegistryState {
+    modules: HashMap<String, v8::Global<v8::Module>>,
+    /// Canonical module name by V8 script id. Referrer-aware resolution uses
+    /// this instead of ambiguous basename aliases.
+    canonical_names: HashMap<i32, String>,
+}
 
 fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
     scope
@@ -366,11 +374,22 @@ pub(super) fn register_stubs(
     src: &str,
     modules: &[(String, ModuleSource)],
 ) {
-    modreg(scope).0.lock().unwrap().clear();
+    {
+        let registry = modreg(scope);
+        let mut registry = registry.0.lock().unwrap();
+        registry.modules.clear();
+        registry.canonical_names.clear();
+    }
     let reg = |spec: String, source: String, scope: &mut v8::PinScope| {
         if let Some(m) = compile_module(scope, &spec, &source) {
+            let script_id = m.script_id();
             let g = v8::Global::new(scope, m);
-            modreg(scope).0.lock().unwrap().insert(spec, g);
+            let registry = modreg(scope);
+            let mut registry = registry.0.lock().unwrap();
+            registry.modules.insert(spec.clone(), g);
+            if let Some(script_id) = script_id {
+                registry.canonical_names.entry(script_id).or_insert(spec);
+            }
         } else {
             tracing::warn!(%spec, "module stub failed to compile");
         }
@@ -398,7 +417,7 @@ pub(super) fn register_stubs(
         reg(spec.clone(), s, scope);
     }
     tracing::debug!(
-        mods = modreg(scope).0.lock().unwrap().len(),
+        mods = modreg(scope).0.lock().unwrap().modules.len(),
         "registered import stubs + text modules"
     );
 }
@@ -411,24 +430,26 @@ fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str) {
         tracing::warn!(%name, "sibling module failed to compile");
         return;
     };
+    let script_id = m.script_id();
     let g = v8::Global::new(scope, m);
     let registry = modreg(scope);
-    let mut reg = registry.0.lock().unwrap();
-    reg.insert(name.to_string(), g.clone());
-    reg.insert(format!("./{name}"), g.clone());
-    // Worker Loader module maps may carry a Workspace-relative directory
-    // prefix (for example `workspace/helper.js`). The V8 resolver gives this
-    // callback the authored relative specifier without the referrer, so keep
-    // the unambiguous basename aliases used by a single-directory module
-    // graph. Exact names remain available when two directories share a name.
+    let mut registry = registry.0.lock().unwrap();
+    registry.modules.insert(name.to_string(), g.clone());
+    registry.modules.insert(format!("./{name}"), g.clone());
+    // Keep the old root/basename aliases for Worker Loader's bare module
+    // spelling, while referrer-aware resolution below handles nested relative
+    // imports without making basename collisions authoritative.
     if let Some((_, basename)) = name.rsplit_once('/') {
-        if !reg.contains_key(basename) {
-            reg.insert(basename.to_string(), g.clone());
+        if !registry.modules.contains_key(basename) {
+            registry.modules.insert(basename.to_string(), g.clone());
         }
         let relative = format!("./{basename}");
-        if !reg.contains_key(&relative) {
-            reg.insert(relative, g);
+        if !registry.modules.contains_key(&relative) {
+            registry.modules.insert(relative, g.clone());
         }
+    }
+    if let Some(script_id) = script_id {
+        registry.canonical_names.insert(script_id, name.to_string());
     }
 }
 
@@ -588,7 +609,7 @@ pub(super) fn register_loader_modules(
     };
     for (_name, source) in es_modules() {
         for (spec, names) in scan_external_imports(source) {
-            if modreg(scope).0.lock().unwrap().contains_key(&spec) {
+            if modreg(scope).0.lock().unwrap().modules.contains_key(&spec) {
                 continue;
             }
             let s = if names.contains("*") {
@@ -598,8 +619,14 @@ pub(super) fn register_loader_modules(
                 stub_source(&spec, &names)
             };
             if let Some(m) = compile_module(scope, &spec, &s) {
+                let script_id = m.script_id();
                 let g = v8::Global::new(scope, m);
-                modreg(scope).0.lock().unwrap().insert(spec, g);
+                let registry = modreg(scope);
+                let mut registry = registry.0.lock().unwrap();
+                registry.modules.insert(spec.clone(), g);
+                if let Some(script_id) = script_id {
+                    registry.canonical_names.entry(script_id).or_insert(spec);
+                }
             }
         }
     }
@@ -608,27 +635,53 @@ pub(super) fn register_loader_modules(
     }
 }
 
-/// Module resolve callback: serve a registered stub for `cloudflare:*`/`node:*`.
-/// celld bundles are single-file, so anything else is genuinely unresolvable.
+fn normalize_module_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// Module resolve callback: serve a registered stub for `cloudflare:*`/`node:*`
+/// and resolve relative loader imports against the referrer's canonical module
+/// name. The old basename aliases remain a compatibility fallback for callers
+/// that use a bare module name, but relative nested imports never depend on
+/// them.
 pub(super) fn resolve_external<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
     _a: v8::Local<'s, v8::FixedArray>,
-    _r: v8::Local<'s, v8::Module>,
+    referrer: v8::Local<'s, v8::Module>,
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
-    let spec = specifier.to_rust_string_lossy(scope);
+    let requested = specifier.to_rust_string_lossy(scope);
     let registry = modreg(scope);
-    let m = registry
-        .0
-        .lock()
-        .unwrap()
-        .get(&spec)
-        .map(|g| v8::Local::new(scope, g));
-    if m.is_none() {
-        tracing::warn!(%spec, "resolve: no stub for specifier");
+    let registry = registry.0.lock().unwrap();
+    let mut candidates = Vec::with_capacity(2);
+    if requested.starts_with('.') {
+        if let Some(script_id) = referrer.script_id() {
+            if let Some(canonical) = registry.canonical_names.get(&script_id) {
+                let parent = canonical.rsplit_once('/').map_or("", |(parent, _)| parent);
+                candidates.push(normalize_module_path(&format!("{parent}/{requested}")));
+            }
+        }
     }
-    m
+    candidates.push(requested.clone());
+    let module = candidates
+        .iter()
+        .find_map(|candidate| registry.modules.get(candidate))
+        .map(|g| v8::Local::new(scope, g));
+    if module.is_none() {
+        tracing::warn!(specifier = %requested, "resolve: no module for specifier");
+    }
+    module
 }
 
 /// The (guarded setup script, backing-object expression) pair for a builtin
@@ -723,6 +776,7 @@ fn dynamic_namespace<'s>(
         .0
         .lock()
         .unwrap()
+        .modules
         .get(&key)
         .map(|g| v8::Local::new(scope, g));
     if let Some(module) = cached {
@@ -742,7 +796,15 @@ fn dynamic_namespace<'s>(
         return Err(anyhow!("dynamic module for {spec} failed to evaluate"));
     }
     let g = v8::Global::new(scope, module);
-    modreg(scope).0.lock().unwrap().insert(key, g);
+    let registry = modreg(scope);
+    let mut registry = registry.0.lock().unwrap();
+    registry.modules.insert(key, g);
+    if let Some(script_id) = module.script_id() {
+        registry
+            .canonical_names
+            .entry(script_id)
+            .or_insert_with(|| spec.to_string());
+    }
     Ok(module.get_module_namespace())
 }
 

@@ -1844,11 +1844,21 @@ globalThis.__makeLoader = () => {
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
         const handle = await handlePromise;
-        const encodedArgs = materializeCapabilities(args, handle.id);
-        return __rpcDes(
-          await __loader_rpc(
-            handle.id, handle.token, entrypoint, path[0],
-            __rpcOut(encodedArgs, false)));
+        const grants = [];
+        try {
+          const encodedArgs = materializeCapabilities(args, handle.id,
+            new WeakMap(), grants);
+          return __rpcDes(
+            await __loader_rpc(
+              handle.id, handle.token, entrypoint, path[0],
+              __rpcOut(encodedArgs, false)));
+        } finally {
+          for (const [token, kind] of grants) {
+            try {
+              __loader_capability_revoke(handle.id, token, kind);
+            } catch {}
+          }
+        }
       })(),
     };
     return new Proxy(target, {
@@ -1951,9 +1961,13 @@ globalThis.__makeLoader = () => {
   // Materialize each descriptor in the host isolate, then send only the
   // opaque worker-bound token through structured clone. The target object
   // never enters the JSON/clone envelope.
-  const materializeCapabilities = (value, workerId, seen = new WeakMap()) => {
+  const materializeCapabilities = (
+    value, workerId, seen = new WeakMap(), grants = [],
+  ) => {
     const descriptor = capabilityDescriptor(value);
     if (descriptor !== null) {
+      const prior = seen.get(value);
+      if (prior !== undefined) return prior;
       if (typeof descriptor.kind !== "string" ||
           descriptor.target === null ||
           (typeof descriptor.target !== "object" &&
@@ -1963,13 +1977,16 @@ globalThis.__makeLoader = () => {
       }
       const token = __loader_capability_grant(
         workerId, descriptor.kind, descriptor.target);
-      return {
+      const marker = {
         __celld$loaderCapability: {
           worker: String(workerId),
           token,
           kind: descriptor.kind,
         },
       };
+      seen.set(value, marker);
+      grants.push([token, descriptor.kind]);
+      return marker;
     }
     if (value === null || typeof value !== "object") return value;
     const prior = seen.get(value);
@@ -1978,7 +1995,7 @@ globalThis.__makeLoader = () => {
       const copy = [];
       seen.set(value, copy);
       for (const item of value)
-        copy.push(materializeCapabilities(item, workerId, seen));
+        copy.push(materializeCapabilities(item, workerId, seen, grants));
       return copy;
     }
     const prototype = Object.getPrototypeOf(value);
@@ -1986,7 +2003,7 @@ globalThis.__makeLoader = () => {
     const copy = {};
     seen.set(value, copy);
     for (const [key, child] of Object.entries(value))
-      copy[key] = materializeCapabilities(child, workerId, seen);
+      copy[key] = materializeCapabilities(child, workerId, seen, grants);
     return copy;
   };
   // Keep capability targets out of JSON. The explicit marker is required so

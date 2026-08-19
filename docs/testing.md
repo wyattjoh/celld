@@ -41,7 +41,8 @@ loaded-worker source seam, the Workspace capability allowlist, no-egress
 policy, unsupported-command result, and timeout/interruption wording. The
 Worker JavaScript seam adds focused contract checks for a fresh loaded worker,
 structured input/output, explicit Workspace sibling and file capabilities,
-forwarded bounded framed stdio, cancellation, and unsupported result shapes.
+forwarded bounded framed stdio, nested sibling plus Wasm loader modules,
+transient capability release, cancellation, and unsupported result shapes.
 Neither backend adds native process, host filesystem, TCP, or an alternate
 Workspace store. The Rust storage fixture separately asserts that file-row
 mutations advance

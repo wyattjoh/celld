@@ -15,6 +15,7 @@ test("Worker Loader uses an explicit capability sideband and opaque proxy", asyn
   assert.match(harness, /__celldCapability/);
   assert.match(harness, /__loader_capability_call/);
   assert.match(harness, /__loader_capability_grant/);
+  assert.match(harness, /__loader_capability_revoke/);
   assert.match(harness, /__loader_capability_drop/);
   assert.match(harness, /__loader_capability_target/);
   assert.match(harness, /__loader_load\(JSON\.stringify\(config\), wasm, capabilities\)/);
@@ -78,6 +79,8 @@ test("host env injection materializes only opaque loaded-worker proxies", async 
   assert.match(bootstrap, /loaded module is untrusted/);
   assert.match(bootstrap, /delete globalThis.__makeLoaderCapability/);
   assert.match(runtime, /op_loader_capability_grant/);
+  assert.match(runtime, /op_loader_capability_revoke/);
+  assert.match(runtime, /\.remove\(&token\)/);
 });
 
 test("capability interruption classes and clone-only transport are explicit", async () => {
@@ -98,6 +101,10 @@ test("the pinned Worker JavaScript fixture uses only the explicit library bridge
   assert.match(fixture, /loader\.capability\("library", library\)/);
   assert.match(fixture, /node:fs\/promises/);
   assert.match(fixture, /DEFAULT_JAVASCRIPT_SOURCE/);
+  assert.match(fixture, /LOADER_MODULE_SOURCE/);
+  assert.match(fixture, /add\.wasm/);
+  assert.match(fixture, /workspace\/nested\/loader-helper\.js/);
+  assert.match(fixture, /operation === "loader-modules"/);
   assert.match(fixture, /\/conformance\/javascript\//);
 });
 

@@ -53,6 +53,25 @@ export default async function (input) {
   return { input, suffix, content };
 }
 `;
+const WASM_ADD = Uint8Array.from([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+  0x03, 0x02, 0x01, 0x00,
+  0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00,
+  0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+]);
+const LOADER_MODULE_SOURCE = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { label } from "./nested/loader-helper.js";
+import wasm from "./add.wasm";
+
+export default class extends WorkerEntrypoint {
+  async run(input) {
+    const { instance } = new WebAssembly.Instance(wasm);
+    return { input, label, sum: instance.exports.add(20, 22) };
+  }
+}
+`;
 
 /**
  * Adapt the pinned Computer loader contract to celld's explicit capability
@@ -714,9 +733,13 @@ export class ConformanceAgent extends withWorkspace(
       throw new TypeError("javascript requires one of the pinned agent names");
     }
     const operation = input?.operation ?? "run";
-    if (operation !== "run" && operation !== "cancel") {
-      throw new TypeError("javascript operation must be run or cancel");
+    if (operation !== "run" && operation !== "cancel" &&
+        operation !== "loader-modules") {
+      throw new TypeError(
+        "javascript operation must be run, cancel, or loader-modules",
+      );
     }
+    if (operation === "loader-modules") return this.loaderModules(input);
     await this.setName(name);
 
     const workspace = await getWorkspace(this);
@@ -770,6 +793,49 @@ export class ConformanceAgent extends withWorkspace(
       stdout: result.stdout,
       stderr: result.stderr,
     };
+  }
+
+  /**
+   * Exercise the generic Worker Loader module seam used by the pinned
+   * Computer backend. The Computer 0.2.1 backend accepts text-only configured
+   * modules, so this focused mode verifies nested sibling resolution and the
+   * loader's supported Wasm sideband without pretending the package exposes a
+   * Workspace Wasm mount.
+   */
+  async loaderModules(input) {
+    const name = input?.name;
+    if (typeof name !== "string" || !AGENT_NAMES.has(name)) {
+      throw new TypeError("loader-modules requires one of the pinned agent names");
+    }
+    await this.setName(name);
+    const loader = this.env?.LOADER;
+    if (!loader) {
+      throw new Error(
+        "Worker Loader is unavailable; set CELLD_WORKER_LOADER=LOADER",
+      );
+    }
+    const worker = loader.load({
+      mainModule: "workspace/main.js",
+      modules: {
+        "workspace/main.js": LOADER_MODULE_SOURCE,
+        "workspace/nested/loader-helper.js":
+          "export const label = \":loader-sibling\";\\n",
+        "workspace/add.wasm": { wasm: WASM_ADD },
+      },
+      compatibilityDate: "2026-01-01",
+      compatibilityFlags: ["js_rpc"],
+      globalOutbound: null,
+    });
+    try {
+      return {
+        agent: this.name,
+        value: await worker
+          .getEntrypoint()
+          .run(input?.input ?? { value: 40 }),
+      };
+    } finally {
+      worker.dispose();
+    }
   }
 
   /**
