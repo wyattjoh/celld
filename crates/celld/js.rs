@@ -3858,16 +3858,25 @@ impl CapabilityLifecycle {
 
     fn release_call(&self) {
         if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Multiple lifecycle waiters may be releasing the same host
+            // reference (worker disposal and capability disposal), so wake
+            // all of them after the final call settles.
             self.idle.notify_waiters();
         }
     }
 
     async fn wait_idle(&self) {
         loop {
+            // Pin and enable before checking the count. `enable` registers
+            // this waiter with Notify, closing the check/await race even when
+            // the last call settles between these two lines.
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.in_flight.load(Ordering::Acquire) == 0 {
                 return;
             }
-            self.idle.notified().await;
+            notified.await;
         }
     }
 }
@@ -3894,6 +3903,25 @@ mod loader_capability_tests {
         assert!(lifecycle.acquire("workspace").is_err());
         drop(call);
         assert_eq!(lifecycle.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn all_idle_waiters_observe_the_last_release() {
+        let lifecycle = Arc::new(CapabilityLifecycle::live());
+        let call = lifecycle.acquire("workspace").expect("live capability");
+        lifecycle.dispose();
+        let first = lifecycle.clone();
+        let second = lifecycle.clone();
+        let first_wait = tokio::spawn(async move { first.wait_idle().await });
+        let second_wait = tokio::spawn(async move { second.wait_idle().await });
+        tokio::task::yield_now().await;
+        drop(call);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_wait.await.expect("first wait_idle task");
+            second_wait.await.expect("second wait_idle task");
+        })
+        .await
+        .expect("all wait_idle wakeups");
     }
 }
 
