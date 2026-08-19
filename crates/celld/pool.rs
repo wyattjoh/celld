@@ -73,6 +73,26 @@ impl Slot {
     /// isolate across an await is unwritable rather than a rule a comment
     /// asks callers to remember.
     pub async fn turn<T>(self: &Arc<Self>, f: impl FnOnce(&mut js::Worker) -> T) -> T {
+        self.turn_inner(f, false)
+            .await
+            .expect("entered isolate after it was freed")
+    }
+
+    /// Run cleanup on an isolate that may have been retired concurrently.
+    ///
+    /// A weak host-slot reference is deliberately not an ownership claim: a
+    /// pool can free the V8 worker after its last cell leaves. Cleanup must
+    /// observe that state instead of panicking while trying to drop stale
+    /// persistent handles.
+    pub async fn try_turn<T>(self: &Arc<Self>, f: impl FnOnce(&mut js::Worker) -> T) -> Option<T> {
+        self.turn_inner(f, true).await
+    }
+
+    async fn turn_inner<T>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&mut js::Worker) -> T,
+        optional: bool,
+    ) -> Option<T> {
         struct Counted<'a>(&'a Slot);
         impl Drop for Counted<'_> {
             fn drop(&mut self) {
@@ -84,10 +104,11 @@ impl Slot {
         let mut worker = self.worker.lock().await;
         let worker = match worker.as_mut() {
             Some(worker) => worker,
+            None if optional => return None,
             None => panic!("entered isolate {} after it was freed", self.id),
         };
         let _host_slot = js::enter_slot(self);
-        f(worker)
+        Some(f(worker))
     }
 
     /// Mark a request as living in this isolate. Held for the request's whole

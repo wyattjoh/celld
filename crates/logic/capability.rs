@@ -66,6 +66,41 @@ pub enum AuthorizationError {
     NotLive,
 }
 
+/// The stable class of an interruption crossing the loaded-worker boundary.
+///
+/// These names are part of the runtime error contract. Callers can decide
+/// whether a retry is safe without parsing an implementation-specific detail
+/// or mistaking a lost host cell for a capability denial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptionClass {
+    /// The caller stopped waiting for the capability operation.
+    Cancelled,
+    /// The bounded handler budget expired before the operation settled.
+    TimedOut,
+    /// The isolate or its response channel failed while the operation ran.
+    IsolateFailure,
+    /// The capability rejected the operation or its payload.
+    CapabilityFailure,
+    /// The host cell lost ownership before the operation could run.
+    HostCellLost,
+    /// The loaded worker was disposed or finalized.
+    WorkerDisposed,
+}
+
+impl InterruptionClass {
+    /// Stable lowercase spelling used in bounded runtime errors and tests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::IsolateFailure => "isolate_failure",
+            Self::CapabilityFailure => "capability_failure",
+            Self::HostCellLost => "host_cell_lost",
+            Self::WorkerDisposed => "worker_disposed",
+        }
+    }
+}
+
 /// Check the immutable identity fields and liveness for one call.
 pub fn authorize(
     grant: Option<CapabilityGrant>,
@@ -193,5 +228,22 @@ mod tests {
         assert!(lifetime.finish());
         assert!(lifetime.releasable());
         assert_eq!(lifetime.begin(), Err(AuthorizationError::NotLive));
+    }
+
+    #[test]
+    fn interruption_classes_have_stable_distinct_names() {
+        let classes = [
+            InterruptionClass::Cancelled,
+            InterruptionClass::TimedOut,
+            InterruptionClass::IsolateFailure,
+            InterruptionClass::CapabilityFailure,
+            InterruptionClass::HostCellLost,
+            InterruptionClass::WorkerDisposed,
+        ];
+        let names: std::collections::BTreeSet<_> =
+            classes.into_iter().map(InterruptionClass::as_str).collect();
+        assert_eq!(names.len(), classes.len());
+        assert!(names.contains("host_cell_lost"));
+        assert!(names.contains("worker_disposed"));
     }
 }

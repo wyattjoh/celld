@@ -1566,40 +1566,67 @@ const __wrapServiceResponse = (res, url) => {
 const __loaderCapabilitySafe = (value) =>
   typeof value === "string" && value.length > 0 && value.length <= 128 &&
   value !== "__proto__" && value !== "prototype" && value !== "constructor";
+// Capture the native ops before loaded-worker bootstrap removes their public
+// factory. Proxies retain these lexical references, while generated code gets
+// no callable primitive with which to mint a second proxy.
+const __loaderCapabilityCall = (...args) =>
+  __loader_capability_call(...args);
+const __loaderCapabilityDrop = (...args) =>
+  __loader_capability_drop(...args);
+const __loaderCapabilityFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry(([workerId, token, kind]) =>
+      __loaderCapabilityDrop(workerId, token, kind))
+  : null;
 
 globalThis.__makeLoaderCapability = (workerId, token, kind) => {
   let disposed = false;
+  let root;
+  const unregisterToken = {};
   const drop = () => {
     if (disposed) return;
     disposed = true;
-    __loader_capability_drop(workerId, token, kind);
+    if (__loaderCapabilityFinalizer && root)
+      __loaderCapabilityFinalizer.unregister(unregisterToken);
+    __loaderCapabilityDrop(workerId, token, kind);
   };
-  const make = (path) => new Proxy(function () {}, {
-    get: (_base, prop) => {
-      if (prop === "then") return undefined;
-      if (prop === "dispose" || prop === Symbol.dispose) return drop;
-      if (typeof prop !== "string") return undefined;
-      return make([...path, prop]);
-    },
-    apply: (_base, _this, args) => {
-      if (disposed)
-        return Promise.reject(new Error(
-          "worker loader: capability proxy is disposed"));
-      if (path.length === 0)
-        return Promise.reject(new TypeError(
-          "worker loader: capability root is not callable"));
-      let encoded;
-      try {
-        encoded = __rpcOut(args, false);
-      } catch (error) {
-        return Promise.reject(error);
-      }
-      return __loader_capability_call(
-        workerId, token, kind, JSON.stringify(path), encoded,
-      ).then(__rpcDes);
-    },
-  });
-  return make([]);
+  const make = (path) => {
+    // A nested method proxy keeps the root alive. The root finalizer therefore
+    // cannot dispose a capability while `workspace.fs.readFile` is retained.
+    const keepRoot = root;
+    const proxy = new Proxy(function () {}, {
+      get: (_base, prop) => {
+        void keepRoot;
+        if (prop === "then") return undefined;
+        if (prop === "dispose" || prop === Symbol.dispose) return drop;
+        if (typeof prop !== "string") return undefined;
+        return make([...path, prop]);
+      },
+      apply: (_base, _this, args) => {
+        if (disposed)
+          return Promise.reject(new Error(
+            "worker loader: capability proxy is disposed"));
+        if (path.length === 0)
+          return Promise.reject(new TypeError(
+            "worker loader: capability root is not callable"));
+        let encoded;
+        try {
+          encoded = __rpcOut(args, false);
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        return __loaderCapabilityCall(
+          workerId, token, kind, JSON.stringify(path), encoded,
+        ).then(__rpcDes);
+      },
+    });
+    return proxy;
+  };
+  root = make([]);
+  if (__loaderCapabilityFinalizer)
+    __loaderCapabilityFinalizer.register(
+      root, [workerId, token, kind], unregisterToken,
+    );
+  return root;
 };
 
 globalThis.__dispatchLoaderCapability =
@@ -1633,18 +1660,20 @@ globalThis.__dispatchLoaderCapability =
 
 globalThis.__makeLoader = () => {
   // `get(name, …)` is memoized by name to one isolate; `load()` is anonymous.
-  // A stub holds a Promise<id> so `getCode` may be async and load lazily.
+  // A stub holds a Promise<handle> so `getCode` may be async and load lazily.
+  // The handle's random control token is never exposed on the stub surface.
   const byName = new Map();
-  const makeEntrypoint = (idPromise, entrypoint) => {
+  const makeEntrypoint = (handlePromise, entrypoint) => {
     const target = {
       async fetch(input, init) {
-        const id = await idPromise;
+        const handle = await handlePromise;
         const req = new Request(input, init);
         const headers = JSON.stringify(Array.from(req.headers));
         const body_ = req._bodyBytes === null
           ? await req._consume() : req._bodyBytes;
         const r = JSON.parse(
-          await __loader_fetch(id, req.url, req.method, body_, headers));
+          await __loader_fetch(
+            handle.id, handle.token, req.url, req.method, body_, headers));
         const body = r.streamId !== undefined
           ? new CelldHttpBodyStream(r.streamId)
           : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
@@ -1666,9 +1695,11 @@ globalThis.__makeLoader = () => {
           throw new Error(
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
-        const id = await idPromise;
+        const handle = await handlePromise;
         return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false)));
+          await __loader_rpc(
+            handle.id, handle.token, entrypoint, path[0],
+            __rpcOut(args, false)));
       })(),
     };
     return new Proxy(target, {
@@ -1684,22 +1715,29 @@ globalThis.__makeLoader = () => {
   // finalizer drops the worker's isolate so it does not leak. Named get()
   // workers are retained by `byName` (memoized) and so are not registered.
   const finalizer = typeof FinalizationRegistry === "function"
-    ? new FinalizationRegistry((id) => __loader_drop(id))
+    ? new FinalizationRegistry((handle) =>
+        __loader_drop(handle.id, handle.token))
     : null;
-  const makeStub = (idPromise, evictable) => {
+  const makeStub = (handlePromise, evictable) => {
     // Explicit disposal evicts the worker deterministically; the finalizer is
     // a GC backstop for anonymous stubs that are dropped without disposing.
     // __loader_drop is idempotent, so the two paths cannot double-free.
-    const drop = () => { idPromise.then((id) => __loader_drop(id), () => {}); };
+    const drop = () => {
+      handlePromise.then(
+        (handle) => __loader_drop(handle.id, handle.token), () => {},
+      );
+    };
     const stub = {
       getEntrypoint(name = null, _options = {}) {
-        return makeEntrypoint(idPromise, name === null ? "default" : name);
+        return makeEntrypoint(
+          handlePromise, name === null ? "default" : name,
+        );
       },
       dispose: drop,
     };
     if (typeof Symbol.dispose === "symbol") stub[Symbol.dispose] = drop;
     if (evictable && finalizer)
-      idPromise.then((id) => finalizer.register(stub, id), () => {});
+      handlePromise.then((handle) => finalizer.register(stub, handle), () => {});
     return stub;
   };
   // JSON.stringify silently drops binary values, so each non-string module —

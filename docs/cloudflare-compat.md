@@ -247,11 +247,21 @@ const worker = env.LOADER.load({
 `WORKSPACE` is an opaque proxy; host objects and credentials never cross the
 isolate. Calls are single structured-clone method calls such as
 `WORKSPACE.fs.readFile(path, "utf8")`. celld checks the host owner, loaded
-worker, capability kind, and liveness before every call. `dispose()` on the
-worker or capability rejects new calls and releases host references after
-in-flight calls settle. Ordinary JSON `env` values and normal Worker
-`fetch()` behavior remain unchanged. A non-null `globalOutbound` Fetcher,
-awaitable properties, and pipelined capability calls remain unsupported.
+worker, capability kind, and liveness before every call. Capability and worker
+handles use process-random control values; numeric worker ids, copied proxy
+shapes, and stale tokens are not authority. A host cell losing ownership
+revokes the workers it minted before its storage closes, and node shutdown
+drains the remaining registry. `dispose()` on the worker or capability is
+idempotent, rejects new calls, and releases host references after in-flight
+calls settle. Loaded-worker cleanup is bounded by the normal handler budget;
+interruption errors identify `cancelled`, `timed_out`, `isolate_failure`,
+`capability_failure`, `host_cell_lost`, or `worker_disposed` where applicable.
+Capability arguments and results are clone-only: streams, stream handles,
+backpressure, and disposable result graphs are deliberately unsupported here,
+so there is no hidden stream reference that needs a close/cancel handshake.
+Ordinary JSON `env` values and normal Worker `fetch()` behavior remain
+unchanged. A non-null `globalOutbound` Fetcher, awaitable properties, and
+pipelined capability calls remain unsupported.
 
 ## Computer filesystem-only Workspace
 

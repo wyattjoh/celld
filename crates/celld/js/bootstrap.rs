@@ -356,6 +356,13 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                     capability.kind.as_str(),
                 ));
             }
+            // The loaded module is untrusted. It receives the already-minted
+            // proxies, never the factory or a child-loader primitive that
+            // could be used to probe the process-wide registry.
+            lines.push_str(
+                "delete globalThis.__makeLoaderCapability;\n\
+                 delete globalThis.__makeLoader;\n",
+            );
         }
         lines.push_str("})();");
         lines

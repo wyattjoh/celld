@@ -3193,6 +3193,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             ),
         }
     }
+    // Loaded workers are process-scoped rather than cell-scoped. Drain their
+    // registry explicitly before the V8 platform disappears; a bounded wait
+    // preserves the shutdown deadline without leaving a callable authority
+    // in the process during teardown.
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if tokio::time::timeout(remaining, celld::js::shutdown_loader_registry())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            event = "loaded_worker_shutdown_timeout",
+            "loaded-worker cleanup reached the shutdown deadline"
+        );
+    }
     // Exit without unwinding. Returning from here drops the tokio runtime
     // and the V8 platform underneath tasks and isolates that are still
     // alive -- on a deadline-cut drain that teardown segfaults (status 139

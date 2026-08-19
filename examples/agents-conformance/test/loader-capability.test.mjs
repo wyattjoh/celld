@@ -19,6 +19,9 @@ test("Worker Loader uses an explicit capability sideband and opaque proxy", asyn
   assert.match(harness, /__loader_load\(JSON\.stringify\(config\), wasm, capabilities\)/);
   assert.match(harness, /if \(prop === "then"\) return undefined/);
   assert.match(harness, /only Workspace fs method calls are supported/);
+  assert.match(harness, /__loaderCapabilityFinalizer/);
+  assert.match(harness, /nested method proxy keeps the root alive/);
+  assert.match(harness, /handle\.token/);
 });
 
 test("runtime checks capability identity and denies ambient loaded-worker egress", async () => {
@@ -30,6 +33,12 @@ test("runtime checks capability identity and denies ambient loaded-worker egress
   assert.match(runtime, /capability is disposed/);
   assert.match(runtime, /globalOutbound: null/);
   assert.match(runtime, /EgressPolicy::Deny/);
+  assert.match(runtime, /random_loader_token/);
+  assert.match(runtime, /host_loader_entry/);
+  assert.match(runtime, /loaded workers cannot control sibling workers/);
+  assert.match(runtime, /HostCellLost/);
+  assert.match(runtime, /try_turn/);
+  assert.match(runtime, /shutdown_loader_registry/);
 });
 
 test("host env injection materializes only opaque loaded-worker proxies", async () => {
@@ -40,4 +49,19 @@ test("host env injection materializes only opaque loaded-worker proxies", async 
   assert.match(runtime, /release_loader_capabilities/);
   assert.match(runtime, /release_loader_entry/);
   assert.match(runtime, /in-flight calls settle/);
+  assert.match(runtime, /revoke_loader_entries_for_scope/);
+  assert.match(runtime, /wait_idle_bounded/);
+  assert.match(bootstrap, /loaded module is untrusted/);
+  assert.match(bootstrap, /delete globalThis.__makeLoaderCapability/);
+});
+
+test("capability interruption classes and clone-only transport are explicit", async () => {
+  const logic = await source("crates/logic/capability.rs");
+  const docs = await source("docs/cloudflare-compat.md");
+  for (const name of [
+    "cancelled", "timed_out", "isolate_failure", "capability_failure",
+    "host_cell_lost", "worker_disposed",
+  ]) assert.match(logic, new RegExp(name));
+  assert.match(docs, /streams, stream handles,\s+backpressure/);
+  assert.match(docs, /losing ownership/);
 });
