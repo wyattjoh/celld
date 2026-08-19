@@ -2831,6 +2831,7 @@ fn start_cell_event<'s>(
         .lock()
         .unwrap()
         .push((scope.to_string(), writes_before.unwrap_or(0)));
+    *context.host_cell.lock().unwrap() = Some(scope.to_string());
     if capture_frames {
         ws_capture_begin();
     }
@@ -4404,6 +4405,21 @@ mod loader_capability_tests {
     }
 
     #[tokio::test]
+    async fn host_driver_barrier_keeps_disposed_capability_reserved() {
+        let lifecycle = Arc::new(CapabilityLifecycle::live());
+        let call = lifecycle.acquire("capability").expect("live capability");
+        lifecycle.dispose();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), lifecycle.wait_idle())
+                .await
+                .is_err()
+        );
+        assert!(!lifecycle.is_idle());
+        drop(call);
+        assert!(lifecycle.is_idle());
+    }
+
+    #[tokio::test]
     async fn all_idle_waiters_observe_the_last_release() {
         let lifecycle = Arc::new(CapabilityLifecycle::live());
         let call = lifecycle.acquire("workspace").expect("live capability");
@@ -4539,6 +4555,13 @@ mod loader_capability_tests {
     }
 
     #[test]
+    fn host_cell_revocation_is_scoped_to_the_minting_cell() {
+        assert!(loader_belongs_to_cell(Some("Agent:a"), "Agent:a"));
+        assert!(!loader_belongs_to_cell(Some("Agent:b"), "Agent:a"));
+        assert!(!loader_belongs_to_cell(None, "Agent:a"));
+    }
+
+    #[test]
     fn eviction_only_selects_ready_idle_workers() {
         assert!(should_shed_loaded_worker(true, true));
         assert!(!should_shed_loaded_worker(false, true));
@@ -4564,6 +4587,8 @@ struct LoadedCapability {
 
 struct LoadedWorkerEntry {
     id: u64,
+    /// Exact host cell that minted the capability grants, if any.
+    host_cell: Option<String>,
     /// The receiver is dropped before the memory reservation is released, so
     /// a disposed Ready slot or Loading state cannot overlap a new admission.
     state: Mutex<Option<tokio::sync::watch::Receiver<LoaderState>>>,
@@ -4594,6 +4619,10 @@ fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
 
 fn should_shed_loaded_worker(ready: bool, idle: bool) -> bool {
     ready && idle
+}
+
+fn loader_belongs_to_cell(host_cell: Option<&str>, cell: &str) -> bool {
+    host_cell == Some(cell)
 }
 
 fn shed_idle_loaded_workers() {
@@ -4632,22 +4661,24 @@ fn shed_idle_loaded_workers() {
     }
 }
 
-/// Revoke every loaded worker whose capability host is this exact isolate.
+/// Revoke every loaded worker whose capability host is this exact cell.
 ///
 /// Cell eviction is a host-authority boundary, not merely a residency change:
 /// a surviving shared slot may host another cell, but it must not retain the
 /// old cell's Workspace targets. In-flight host calls keep their guards until
-/// the host driver settles; new calls fail closed at the lifecycle edge.
-pub(crate) fn revoke_loader_capabilities_for_slot(slot: &Arc<crate::pool::Slot>) {
+/// the host driver settles; this async barrier waits for those calls before the
+/// caller closes the cell's storage.
+pub(crate) async fn revoke_loader_capabilities_for_cell(slot: &Arc<crate::pool::Slot>, cell: &str) {
     let victims = {
         let mut registry = loader_registry().lock().unwrap();
         let ids: Vec<u64> = registry
             .iter()
             .filter(|(_, entry)| {
-                entry
-                    .host_slot
-                    .upgrade()
-                    .is_some_and(|host| Arc::ptr_eq(&host, slot))
+                loader_belongs_to_cell(entry.host_cell.as_deref(), cell)
+                    && entry
+                        .host_slot
+                        .upgrade()
+                        .is_some_and(|host| Arc::ptr_eq(&host, slot))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -4660,10 +4691,8 @@ pub(crate) fn revoke_loader_capabilities_for_slot(slot: &Arc<crate::pool::Slot>)
         }
         victims
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        for entry in victims {
-            handle.spawn(release_loader_entry(entry));
-        }
+    for entry in victims {
+        release_loader_entry(entry).await;
     }
 }
 
@@ -4976,6 +5005,8 @@ fn op_loader_load(
             );
         }
     }
+    let host_state = actor_runtime_state(scope);
+    let host_cell = current_context().host_cell.lock().unwrap().clone();
     let capability_sideband = args.get(2);
     let outbound_sideband = args.get(3);
     let host_scope = current_context().cell_scope();
@@ -5275,6 +5306,7 @@ fn op_loader_load(
         .expect("new loaded worker is live");
     let entry = Arc::new(LoadedWorkerEntry {
         id,
+        host_cell,
         state: Mutex::new(Some(state)),
         agent_scope,
         owner,
@@ -7716,6 +7748,10 @@ pub struct IoContext {
     /// Empty for stateless Worker code, which owns no cell and gates
     /// nothing.
     egress: Mutex<Vec<(String, u64)>>,
+    /// The host cell that owns this request's loaded-worker capabilities.
+    /// Stored on the request context so interleaved events in one shared
+    /// isolate cannot accidentally attribute a grant to another cell.
+    host_cell: Mutex<Option<String>>,
 }
 
 impl IoContext {
@@ -7728,6 +7764,7 @@ impl IoContext {
             pending_sockets: Mutex::new(Vec::new()),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
+            host_cell: Mutex::new(None),
         })
     }
 

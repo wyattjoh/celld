@@ -318,7 +318,7 @@ test("Code Mode admission bounds are distinct and pressure preserves cell author
   assert.match(runtime, /CELLD_LOADED_WORKER_TIMEOUT_S/);
   assert.match(runtime, /memory admission limit exceeded/);
   assert.match(runtime, /pressure shedding rejects new Code Mode work/);
-  assert.match(runtime, /revoke_loader_capabilities_for_slot/);
+  assert.match(runtime, /revoke_loader_capabilities_for_cell/);
   assert.match(runtime, /EXECUTION_TIMEOUT_WIRE_ERROR/);
   assert.match(runtime, /drive_loaded_worker/);
   assert.match(main, /set_code_mode_pressure/);

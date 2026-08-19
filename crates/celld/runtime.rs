@@ -1113,7 +1113,7 @@ impl RuntimeManager {
         // is closed. Active capability jobs retain their guards until their
         // host driver settles; new calls fail at the revocation edge.
         for handle in &stopped {
-            crate::js::revoke_loader_capabilities_for_slot(handle.residency.slot());
+            crate::js::revoke_loader_capabilities_for_cell(handle.residency.slot(), cell).await;
         }
         for handle in stopped {
             let slot = handle.residency.slot().clone();
