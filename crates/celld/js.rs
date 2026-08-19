@@ -1854,6 +1854,10 @@ pub struct InFlight {
     writes_before: Option<u64>,
     request_id: Option<RequestId>,
     active_request_id: Option<RequestId>,
+    /// Internal capability disposal can interrupt a host event without
+    /// pretending that a client disconnected.
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    internal_cancelled: bool,
     reply: Option<Answer>,
     /// `waitUntil` work still running after the response was sent. The
     /// request stays in flight until it settles, as the single-request loop
@@ -1976,7 +1980,7 @@ impl InFlight {
     /// handler's — a budget overrun, a disconnect — so it does not count
     /// against the retry limit. A handler that threw is recorded by
     /// `settle`, which knows that it did, before it reaches this.
-    fn fail(&mut self, error: anyhow::Error) {
+    pub(crate) fn fail(&mut self, error: anyhow::Error) {
         if let Some(reply) = self.reply.take() {
             self.settle_alarm(false, false);
             if self.trace.is_some() {
@@ -2032,7 +2036,16 @@ impl InFlight {
 
     /// Give up on a handler that will not settle.
     pub fn time_out(&mut self, budget: Duration) {
-        self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+        let error = if self.cancel.is_some() || self.internal_cancelled {
+            anyhow!(
+                "worker loader: timed_out: capability exceeded {}s budget",
+                budget.as_secs()
+            )
+        } else {
+            anyhow!("handler exceeded {}s budget", budget.as_secs())
+        };
+        self.cancel.take();
+        self.fail(error);
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
@@ -2047,6 +2060,24 @@ impl InFlight {
     /// Has the client been answered? `waitUntil` work can still be running.
     pub fn answered(&self) -> bool {
         self.reply.is_none()
+    }
+
+    /// Borrow the internal cancellation edge, if this is a capability host
+    /// event. The runtime waits on it alongside the JS op set.
+    pub(crate) fn capability_cancel(&mut self) -> Option<&mut tokio::sync::oneshot::Receiver<()>> {
+        self.cancel.as_mut()
+    }
+
+    /// Mark the internal cancellation edge as consumed by the runtime.
+    pub(crate) fn mark_internal_cancelled(&mut self) {
+        self.cancel.take();
+        self.internal_cancelled = true;
+    }
+
+    /// Whether this entry was interrupted by capability disposal rather than
+    /// by an external client disconnect.
+    pub(crate) fn was_internal_cancelled(&self) -> bool {
+        self.internal_cancelled
     }
 
     /// Whether a client can still disconnect from this request. A request
@@ -2397,8 +2428,9 @@ fn begin<'s>(
             kind,
             path,
             args,
+            cancel,
             reply,
-        } => return begin_capability(tc, owner, token, kind, path, args, reply),
+        } => return begin_capability(tc, owner, token, kind, path, args, cancel, reply),
         crate::WorkerJob::Rpc {
             entrypoint,
             method,
@@ -2445,6 +2477,8 @@ fn begin<'s>(
                 writes_before: None,
                 request_id,
                 active_request_id,
+                cancel: None,
+                internal_cancelled: false,
                 reply: Some(Answer::Fetch(reply)),
                 background: None,
                 ops: std::collections::HashSet::new(),
@@ -2511,6 +2545,8 @@ fn begin_entrypoint_rpc(
                 writes_before: None,
                 request_id: None,
                 active_request_id: None,
+                cancel: None,
+                internal_cancelled: false,
                 reply: Some(Answer::Rpc(reply)),
                 background: None,
                 ops: std::collections::HashSet::new(),
@@ -2541,6 +2577,7 @@ fn begin_capability(
     kind: String,
     path: Vec<String>,
     args: Vec<u8>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
     let context = IoContext::new();
@@ -2577,6 +2614,8 @@ fn begin_capability(
                 writes_before: None,
                 request_id: None,
                 active_request_id: None,
+                cancel: Some(cancel),
+                internal_cancelled: false,
                 reply: Some(Answer::Capability(reply)),
                 background: None,
                 ops: std::collections::HashSet::new(),
@@ -2716,6 +2755,8 @@ fn start_cell_event<'s>(
                 // so there is nothing for the shell to finish; `cancel`
                 // aborts by the job's own id.
                 active_request_id: None,
+                cancel: None,
+                internal_cancelled: false,
                 reply: Some(answer),
                 background: None,
                 ops: std::collections::HashSet::new(),
@@ -3015,7 +3056,12 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight) {
     let background = end_event_context(tc).ok().flatten();
     entry.background = background.map(|promise| v8::Global::new(tc, promise));
     drop(guard);
-    entry.fail(anyhow!("The client has disconnected"));
+    let error = if entry.was_internal_cancelled() {
+        anyhow!("worker loader: cancelled: capability disposal interrupted the host call")
+    } else {
+        anyhow!("The client has disconnected")
+    };
+    entry.fail(error);
     // A cancelled handler with no waitUntil work has nothing left to drive.
     // Drop its host ops now, so their guards cancel routed work. Explicit
     // waitUntil work keeps its ops and continues after the client disconnects.
@@ -3829,6 +3875,10 @@ struct CapabilityLifecycle {
     state: AtomicBool,
     in_flight: AtomicUsize,
     idle: tokio::sync::Notify,
+    /// Cancellation senders for calls that must be interrupted before a host
+    /// persistent handle can be released.
+    cancellations: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    next_call: AtomicU64,
 }
 
 impl CapabilityLifecycle {
@@ -3837,6 +3887,8 @@ impl CapabilityLifecycle {
             state: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
             idle: tokio::sync::Notify::new(),
+            cancellations: Mutex::new(HashMap::new()),
+            next_call: AtomicU64::new(1),
         }
     }
 
@@ -3850,6 +3902,28 @@ impl CapabilityLifecycle {
     }
 
     fn acquire(self: &Arc<Self>, what: &str) -> Result<CapabilityCallGuard, String> {
+        self.acquire_inner(what, None).map(|(guard, _)| guard)
+    }
+
+    fn acquire_cancellable(
+        self: &Arc<Self>,
+        what: &str,
+    ) -> Result<(CapabilityCallGuard, tokio::sync::oneshot::Receiver<()>), String> {
+        let (guard, receiver) = self.acquire_inner(what, Some(()))?;
+        Ok((guard, receiver.expect("cancellable lifecycle call")))
+    }
+
+    fn acquire_inner(
+        self: &Arc<Self>,
+        what: &str,
+        cancellable: Option<()>,
+    ) -> Result<
+        (
+            CapabilityCallGuard,
+            Option<tokio::sync::oneshot::Receiver<()>>,
+        ),
+        String,
+    > {
         if !self.is_live() {
             return Err(format!("worker loader: {what} capability is disposed"));
         }
@@ -3860,7 +3934,34 @@ impl CapabilityLifecycle {
             self.release_call();
             return Err(format!("worker loader: {what} capability is disposed"));
         }
-        Ok(CapabilityCallGuard(self.clone()))
+        let (cancel_id, receiver) = if cancellable.is_some() {
+            let id = self.next_call.fetch_add(1, Ordering::Relaxed);
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.cancellations.lock().unwrap().insert(id, sender);
+            (Some(id), Some(receiver))
+        } else {
+            (None, None)
+        };
+        Ok((
+            CapabilityCallGuard {
+                lifecycle: self.clone(),
+                cancel_id,
+            },
+            receiver,
+        ))
+    }
+
+    fn cancel_in_flight(&self) {
+        let senders = self
+            .cancellations
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, sender)| sender)
+            .collect::<Vec<_>>();
+        for sender in senders {
+            let _ = sender.send(());
+        }
     }
 
     fn release_call(&self) {
@@ -3901,11 +4002,17 @@ impl CapabilityLifecycle {
     }
 }
 
-struct CapabilityCallGuard(Arc<CapabilityLifecycle>);
+struct CapabilityCallGuard {
+    lifecycle: Arc<CapabilityLifecycle>,
+    cancel_id: Option<u64>,
+}
 
 impl Drop for CapabilityCallGuard {
     fn drop(&mut self) {
-        self.0.release_call();
+        if let Some(id) = self.cancel_id.take() {
+            self.lifecycle.cancellations.lock().unwrap().remove(&id);
+        }
+        self.lifecycle.release_call();
     }
 }
 
@@ -3943,6 +4050,20 @@ mod loader_capability_tests {
         .await
         .expect("all wait_idle wakeups");
     }
+
+    #[tokio::test]
+    async fn disposal_interrupts_a_cancellable_capability_call() {
+        let lifecycle = Arc::new(CapabilityLifecycle::live());
+        let (_call, mut cancel) = lifecycle
+            .acquire_cancellable("workspace")
+            .expect("live cancellable capability");
+        lifecycle.dispose();
+        lifecycle.cancel_in_flight();
+        tokio::time::timeout(Duration::from_secs(1), &mut cancel)
+            .await
+            .expect("capability cancellation")
+            .expect("cancellation sender");
+    }
 }
 
 struct LoadedCapability {
@@ -3951,6 +4072,7 @@ struct LoadedCapability {
 }
 
 struct LoadedWorkerEntry {
+    id: u64,
     state: tokio::sync::watch::Receiver<LoaderState>,
     owner: celld_logic::capability::OwnerId,
     /// A random bearer guard for host-side fetch/RPC/dispose operations. The
@@ -4346,6 +4468,7 @@ fn op_loader_load(
     let lifecycle = Arc::new(CapabilityLifecycle::live());
     let control_token = random_loader_token("worker");
     let entry = Arc::new(LoadedWorkerEntry {
+        id,
         state,
         owner,
         control_token: control_token.clone(),
@@ -4440,16 +4563,20 @@ fn op_loader_fetch(
                 celld_logic::capability::InterruptionClass::CapabilityFailure,
                 error,
             )),
-            Err(_) => match driving.await {
-                Err(error) => Err(loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    format!("loaded worker task died: {error}"),
-                )),
-                Ok(()) => Err(loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    "loaded worker dropped response",
-                )),
-            },
+            Err(_) => {
+                let result = match driving.await {
+                    Err(error) => Err(loader_interruption(
+                        celld_logic::capability::InterruptionClass::IsolateFailure,
+                        format!("loaded worker task died: {error}"),
+                    )),
+                    Ok(()) => Err(loader_interruption(
+                        celld_logic::capability::InterruptionClass::IsolateFailure,
+                        "loaded worker dropped response",
+                    )),
+                };
+                schedule_loader_entry_release(entry.id);
+                result
+            }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -4501,16 +4628,20 @@ fn op_loader_rpc(
                 celld_logic::capability::InterruptionClass::CapabilityFailure,
                 error,
             )),
-            Err(_) => match driving.await {
-                Err(error) => Err(loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    format!("loaded worker task died: {error}"),
-                )),
-                Ok(()) => Err(loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    "loaded worker dropped response",
-                )),
-            },
+            Err(_) => {
+                let result = match driving.await {
+                    Err(error) => Err(loader_interruption(
+                        celld_logic::capability::InterruptionClass::IsolateFailure,
+                        format!("loaded worker task died: {error}"),
+                    )),
+                    Ok(()) => Err(loader_interruption(
+                        celld_logic::capability::InterruptionClass::IsolateFailure,
+                        "loaded worker dropped response",
+                    )),
+                };
+                schedule_loader_entry_release(entry.id);
+                result
+            }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -4518,23 +4649,31 @@ fn op_loader_rpc(
 
 async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
     if !entry.lifecycle.wait_idle_bounded().await {
-        tracing::warn!(
-            event = "loaded_worker_release_timeout",
-            owner = entry.owner,
-            "loaded worker calls did not quiesce before the handler budget"
-        );
-        return;
+        for capability in entry.capabilities.values() {
+            capability.lifecycle.cancel_in_flight();
+        }
+        if !entry.lifecycle.wait_idle_bounded().await {
+            tracing::warn!(
+                event = "loaded_worker_release_timeout",
+                owner = entry.owner,
+                "loaded worker calls did not quiesce before the handler budget"
+            );
+            return;
+        }
     }
     let mut tokens = Vec::with_capacity(entry.capabilities.len());
     for (token, capability) in &entry.capabilities {
         capability.lifecycle.dispose();
         if !capability.lifecycle.wait_idle_bounded().await {
-            tracing::warn!(
-                event = "capability_release_timeout",
-                owner = entry.owner,
-                "capability calls did not quiesce before the handler budget"
-            );
-            return;
+            capability.lifecycle.cancel_in_flight();
+            if !capability.lifecycle.wait_idle_bounded().await {
+                tracing::warn!(
+                    event = "capability_release_timeout",
+                    owner = entry.owner,
+                    "capability calls did not quiesce before the handler budget"
+                );
+                return;
+            }
         }
         tokens.push(token.clone());
     }
@@ -4588,12 +4727,23 @@ pub async fn shutdown_loader_registry() {
     }
 }
 
-async fn release_loader_entry_by_id(id: u64) {
-    let Some(entry) = loader_registry()
+fn retire_loader_entry(id: u64) -> Option<Arc<LoadedWorkerEntry>> {
+    loader_registry()
         .lock()
         .expect("loader registry poisoned")
         .remove(&id)
-    else {
+}
+
+fn schedule_loader_entry_release(id: u64) {
+    let Some(entry) = retire_loader_entry(id) else {
+        return;
+    };
+    entry.lifecycle.dispose();
+    asyncrt::op_handle().spawn(release_loader_entry(entry));
+}
+
+async fn release_loader_entry_by_id(id: u64) {
+    let Some(entry) = retire_loader_entry(id) else {
         return;
     };
     entry.lifecycle.dispose();
@@ -4674,7 +4824,7 @@ fn op_loader_capability_call(
             )
         }
     };
-    let capability_call = match capability.lifecycle.acquire("capability") {
+    let (capability_call, cancel) = match capability.lifecycle.acquire_cancellable("capability") {
         Ok(call) => call,
         Err(error) => {
             return loader_throw(
@@ -4687,6 +4837,7 @@ fn op_loader_capability_call(
         }
     };
     let Some(host_slot) = entry.host_slot.upgrade() else {
+        schedule_loader_entry_release(entry.id);
         return loader_throw(
             scope,
             &loader_interruption(
@@ -4704,6 +4855,7 @@ fn op_loader_capability_call(
         kind: job_kind,
         path,
         args: call_args,
+        cancel,
         reply,
     };
     let async_id = asyncrt::enqueue(async move {
@@ -4716,16 +4868,20 @@ fn op_loader_capability_call(
                 celld_logic::capability::InterruptionClass::CapabilityFailure,
                 error,
             )),
-            Err(_) => match driving.await {
-                Err(error) => Err(loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    format!("capability host task died: {error}"),
-                )),
-                Ok(()) => Err(loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    "capability host dropped result",
-                )),
-            },
+            Err(_) => {
+                let result = match driving.await {
+                    Err(error) => Err(loader_interruption(
+                        celld_logic::capability::InterruptionClass::IsolateFailure,
+                        format!("capability host task died: {error}"),
+                    )),
+                    Ok(()) => Err(loader_interruption(
+                        celld_logic::capability::InterruptionClass::IsolateFailure,
+                        "capability host dropped result",
+                    )),
+                };
+                schedule_loader_entry_release(entry.id);
+                result
+            }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -4788,12 +4944,15 @@ fn op_loader_capability_drop(
     let owner = entry.owner;
     asyncrt::op_handle().spawn(async move {
         if !capability.lifecycle.wait_idle_bounded().await {
-            tracing::warn!(
-                event = "capability_release_timeout",
-                owner,
-                "capability disposal exceeded the handler budget"
-            );
-            return;
+            capability.lifecycle.cancel_in_flight();
+            if !capability.lifecycle.wait_idle_bounded().await {
+                tracing::warn!(
+                    event = "capability_release_timeout",
+                    owner,
+                    "capability disposal exceeded the handler budget"
+                );
+                return;
+            }
         }
         let Some(slot) = host_slot.upgrade() else {
             return;
@@ -4856,7 +5015,13 @@ fn op_loader_drop(
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let control_token = args.get(1).to_rust_string_lossy(scope);
     if let Err(error) = host_loader_entry(scope, id, &control_token) {
-        return loader_throw(scope, &error);
+        // A finalizer may already be queued when explicit disposal removes
+        // the entry. Dropping an already-disposed handle is a harmless replay;
+        // all authority-bearing fetch/RPC paths remain fail-closed.
+        if !error.ends_with("worker_disposed: unknown worker") {
+            return loader_throw(scope, &error);
+        }
+        return;
     }
     if let Some(entry) = loader_registry()
         .lock()

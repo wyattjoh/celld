@@ -1546,7 +1546,18 @@ async fn drive_affiliated(
     let budget = js::handler_budget();
     let mut ops = Ops::new();
 
-    let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
+    let mut job = Some(job);
+    let first = slot
+        .try_turn(|worker| worker.turn_begin(job.take().expect("first turn job"), trace))
+        .await;
+    let Some((begun, started)) = first else {
+        if let Some(job) = job {
+            job.fail(anyhow!(
+                "worker loader: host_cell_lost: host isolate is no longer live"
+            ));
+        }
+        return;
+    };
     adopt(&mut ops, started);
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else { return };
@@ -1555,12 +1566,28 @@ async fn drive_affiliated(
     }
 
     while !entry.finished() {
-        let started = match wake(&mut ops, &entry, budget).await {
-            Wake::Op(op, result) => {
-                slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
-                    .await
-            }
-            Wake::Cancelled => slot.turn(|worker| worker.turn_cancel(&mut entry)).await,
+        let started = match wake(&mut ops, &mut entry, budget).await {
+            Wake::Op(op, result) => match slot
+                .try_turn(|worker| worker.turn_deliver(&mut entry, op, result))
+                .await
+            {
+                Some(started) => started,
+                None => {
+                    entry.fail(anyhow!(
+                        "worker loader: host_cell_lost: host isolate is no longer live"
+                    ));
+                    break;
+                }
+            },
+            Wake::Cancelled => match slot.try_turn(|worker| worker.turn_cancel(&mut entry)).await {
+                Some(started) => started,
+                None => {
+                    entry.fail(anyhow!(
+                        "worker loader: host_cell_lost: host isolate is no longer live"
+                    ));
+                    break;
+                }
+            },
             Wake::Expired => {
                 entry.time_out(budget);
                 break;
@@ -1569,7 +1596,15 @@ async fn drive_affiliated(
                 entry.stuck();
                 break;
             }
-            Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
+            Wake::Poll => match slot.try_turn(|worker| worker.turn_poll(&mut entry)).await {
+                Some(started) => started,
+                None => {
+                    entry.fail(anyhow!(
+                        "worker loader: host_cell_lost: host isolate is no longer live"
+                    ));
+                    break;
+                }
+            },
         };
         adopt(&mut ops, started);
         if let Some(timing) = &mut timing {
@@ -1602,7 +1637,7 @@ enum Wake {
 /// This is the whole of what a request does between turns, and it is
 /// deliberately the only place that waits: everything else in `drive` either
 /// holds the isolate or is arithmetic.
-async fn wake(ops: &mut Ops, entry: &js::InFlight, budget: Duration) -> Wake {
+async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
     loop {
         let Some(left) = entry.remaining(budget) else {
             // Answered already, so this is `waitUntil` work: not charged the
@@ -1635,7 +1670,19 @@ async fn wake(ops: &mut Ops, entry: &js::InFlight, budget: Duration) -> Wake {
             if left.is_zero() {
                 return Wake::Idle;
             }
-            tokio::time::sleep(capped.min(CANCELLATION_TICK)).await;
+            let internal_cancelled = if let Some(cancel) = entry.capability_cancel() {
+                tokio::select! {
+                    _ = cancel => true,
+                    _ = tokio::time::sleep(capped.min(CANCELLATION_TICK)) => false,
+                }
+            } else {
+                tokio::time::sleep(capped.min(CANCELLATION_TICK)).await;
+                false
+            };
+            if internal_cancelled {
+                entry.mark_internal_cancelled();
+                return Wake::Cancelled;
+            }
             // Re-read the flag on this path too. A request with nothing
             // outstanding can still have its client hang up, and only the
             // branch below used to look.
@@ -1644,7 +1691,19 @@ async fn wake(ops: &mut Ops, entry: &js::InFlight, budget: Duration) -> Wake {
             }
             return Wake::Poll;
         }
-        match tokio::time::timeout(capped, ops.next()).await {
+        let wait = if let Some(cancel) = entry.capability_cancel() {
+            tokio::select! {
+                _ = cancel => None,
+                result = tokio::time::timeout(capped, ops.next()) => Some(result),
+            }
+        } else {
+            Some(tokio::time::timeout(capped, ops.next()).await)
+        };
+        let Some(wait) = wait else {
+            entry.mark_internal_cancelled();
+            return Wake::Cancelled;
+        };
+        match wait {
             Ok(Some((op, result))) => return Wake::Op(op, result),
             Ok(None) => return Wake::Idle,
             Err(_) if js::take_request_cancellation(entry.request_id()) => return Wake::Cancelled,
@@ -1986,7 +2045,7 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
         return;
     };
     while !entry.finished() {
-        let started = match wake(&mut ops, &entry, budget).await {
+        let started = match wake(&mut ops, &mut entry, budget).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
                     .await
@@ -2153,7 +2212,7 @@ pub(crate) async fn drive_cell(
     };
 
     while !entry.finished() {
-        let (started, moves) = match wake(&mut ops, &entry, budget).await {
+        let (started, moves) = match wake(&mut ops, &mut entry, budget).await {
             Wake::Op(op, result) => {
                 slot.turn(|worker| {
                     let started = worker.turn_deliver(&mut entry, op, result);

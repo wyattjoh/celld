@@ -1721,8 +1721,15 @@ globalThis.__makeLoader = () => {
   const makeStub = (handlePromise, evictable) => {
     // Explicit disposal evicts the worker deterministically; the finalizer is
     // a GC backstop for anonymous stubs that are dropped without disposing.
-    // __loader_drop is idempotent, so the two paths cannot double-free.
+    // Unregistering makes explicit disposal and finalization one idempotent
+    // lifecycle, rather than two calls that race on a removed registry entry.
+    let disposed = false;
+    const unregisterToken = {};
     const drop = () => {
+      if (disposed) return;
+      disposed = true;
+      if (evictable && finalizer)
+        finalizer.unregister(unregisterToken);
       handlePromise.then(
         (handle) => __loader_drop(handle.id, handle.token), () => {},
       );
@@ -1737,7 +1744,9 @@ globalThis.__makeLoader = () => {
     };
     if (typeof Symbol.dispose === "symbol") stub[Symbol.dispose] = drop;
     if (evictable && finalizer)
-      handlePromise.then((handle) => finalizer.register(stub, handle), () => {});
+      handlePromise.then(
+        (handle) => finalizer.register(stub, handle, unregisterToken), () => {},
+      );
     return stub;
   };
   // JSON.stringify silently drops binary values, so each non-string module —

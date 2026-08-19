@@ -203,8 +203,22 @@ pub enum WorkerJob {
         kind: String,
         path: Vec<String>,
         args: Vec<u8>,
+        /// Disposal interrupts a capability host event that has not settled.
+        cancel: tokio::sync::oneshot::Receiver<()>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
+}
+
+impl WorkerJob {
+    /// Fail a queued job when its target isolate was retired before the first
+    /// turn. This is transport-only; no lifecycle policy lives in the job.
+    pub fn fail(self, error: anyhow::Error) {
+        match self {
+            Self::Fetch { reply, .. } => drop(reply.send(Err(error))),
+            Self::Rpc { reply, .. } => drop(reply.send(Err(error))),
+            Self::Capability { reply, .. } => drop(reply.send(Err(error))),
+        }
+    }
 }
 
 /// Temporary host seam required by the verbatim JS adapter. The runtime
