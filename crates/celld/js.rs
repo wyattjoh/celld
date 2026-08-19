@@ -5722,44 +5722,27 @@ fn op_loader_capability_call(
         cancel,
         reply,
     };
+    // Keep all three reservations on the host task, not on the loaded
+    // worker's op future. A loaded-worker timeout abandons that future, but
+    // the host capability mutation must continue to its authoritative result
+    // before disposal may release its target or memory reservation.
+    tokio::spawn(async move {
+        let _execution = execution;
+        let _worker_call = worker_call;
+        let _capability_call = capability_call;
+        crate::runtime::drive(host_slot, job, None).await;
+    });
     let async_id = asyncrt::enqueue(async move {
-        let driving = tokio::spawn(crate::runtime::drive(host_slot, job, None));
         match receive.await {
-            Ok(Ok(result)) => {
-                tokio::spawn(async move {
-                    let _execution = execution;
-                    let _worker_call = worker_call;
-                    let _capability_call = capability_call;
-                    let _ = driving.await;
-                });
-                Ok(result)
-            }
-            Ok(Err(error)) => {
-                tokio::spawn(async move {
-                    let _execution = execution;
-                    let _worker_call = worker_call;
-                    let _capability_call = capability_call;
-                    let _ = driving.await;
-                });
-                Err(loader_result_error(
-                    celld_logic::capability::InterruptionClass::CapabilityFailure,
-                    error,
-                ))
-            }
-            Err(_) => {
-                let result = match driving.await {
-                    Err(error) => Err(loader_interruption(
-                        celld_logic::capability::InterruptionClass::IsolateFailure,
-                        format!("capability host task died: {error}"),
-                    )),
-                    Ok(()) => Err(loader_interruption(
-                        celld_logic::capability::InterruptionClass::IsolateFailure,
-                        "capability host dropped result",
-                    )),
-                };
-                schedule_loader_entry_release(entry.id);
-                result
-            }
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(loader_result_error(
+                celld_logic::capability::InterruptionClass::CapabilityFailure,
+                error,
+            )),
+            Err(_) => Err(loader_interruption(
+                celld_logic::capability::InterruptionClass::IsolateFailure,
+                "capability host dropped result",
+            )),
         }
         }
     });
