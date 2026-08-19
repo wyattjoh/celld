@@ -1443,6 +1443,9 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
         .arg("--conditions=workerd,worker,browser")
         .arg("--external:node:*")
         .arg("--external:cloudflare:*")
+        // Worker-compatible packages may still spell Node builtins as bare
+        // imports. Keep the runtime's complete builtin registry external so
+        // esbuild's browser platform does not resolve host-only polyfills.
         .args(
             crate::js::BARE_NODE_BUILTINS
                 .iter()

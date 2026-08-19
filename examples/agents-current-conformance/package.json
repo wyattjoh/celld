@@ -1,0 +1,17 @@
+{
+  "name": "celld-agents-current-conformance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:compatibility": "node scripts/check-compatibility.mjs",
+    "e2e": "node scripts/e2e.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "agents": "0.21.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

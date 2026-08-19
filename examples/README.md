@@ -17,10 +17,13 @@ Durable Object surface supported by `celld`:
 - `cron/` — a cron trigger that writes each tick into a Durable Object
 - `rpc/` — JS RPC: Durable Object methods, a named entrypoint, callbacks,
   `RpcTarget`, and promise pipelining
-- `agents-conformance/` — pinned, source-unmodified Cloudflare Agents SDK
-  routing two named agents, durable state/SQL, hibernating sessions,
+- `agents-conformance/` — pinned, source-unmodified legacy Cloudflare Agents
+  SDK routing two named agents, durable state/SQL, hibernating sessions,
   alarm-backed delayed work, a filesystem-only Workspace, and an
   HTTP-streamed AIChatAgent response
+- `agents-current-conformance/` — deterministic, credential-free current
+  `agents@0.21.0` SDK tracer for standard named HTTP/WebSocket routing and
+  state/SQL persistence across idle eviction and reopen
 - `wasm/` — a Durable Object counter in Rust, compiled to Wasm with
   [workers-rs](https://github.com/cloudflare/workers-rs); needs a build
   step first (see its [README](wasm/README.md))

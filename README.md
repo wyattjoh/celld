@@ -133,6 +133,13 @@ single-node lab explicitly disables the startup storage-provider probe. Never
 reuse this Compose topology, its credentials, or that probe override for a
 production fleet.
 
+For the current published Agents SDK routing contract, use the separate
+credential-free [`agents-current-conformance`](examples/agents-current-conformance/README.md)
+target. It pins `agents@0.21.0`, exercises the standard named HTTP/WebSocket
+routes, and verifies state/SQL after idle eviction and reopen. The existing
+Compose workflow intentionally remains on the legacy target so its contract is
+not changed.
+
 ## Run it
 
 celld uses the standard AWS credential chain. Deploy to an S3-compatible

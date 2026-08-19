@@ -77,6 +77,24 @@ by category:
 | TCP sockets (`cloudflare:sockets`) | **No.** Known silent gap: `connect()` currently gives an inert stub. It does not throw. |
 | EventSource, MessageChannel, BroadcastChannel | **No.** The classes exist so that bundles load, but they do nothing. |
 
+## Current Agents SDK conformance
+
+The separate [`agents-current-conformance`](../examples/agents-current-conformance/README.md)
+target pins the published `agents@0.21.0` package and a reviewed lockfile peer
+lane. It is a credential-free tracer: two named `Agent` instances are resolved
+with `getAgentByName`, standard HTTP and WebSocket paths are delegated through
+`routeAgentRequest`, and `setState`/`this.sql` records are read after an idle
+eviction and reopen. The legacy `@cloudflare/agents@0.0.16` target remains in
+[`agents-conformance`](../examples/agents-conformance/README.md) and is tested
+separately.
+
+The current SDK's unused MIME/email dependency lane contains a bare `path`
+import. `celld deploy` keeps that builtin external, and the runtime resolves it
+through the same registry as `node:path`; this is a minimal bundling
+adaptation, not a Node filesystem capability. Unsupported current SDK features
+are recorded as unsupported in the target's compatibility matrix rather than
+silently emulated.
+
 ## RPC
 
 celld implements the Workers [JS RPC

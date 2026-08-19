@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "target": {
+    "compatibilityDate": "2026-01-01",
+    "compatibilityFlags": ["js_rpc"]
+  },
+  "packages": {
+    "agents": {
+      "version": "0.21.0",
+      "integrity": "sha512-8A048JJFMog7t68NrIQOT9CGcQ9O+h8NpP/Udw2kd4fAHvDn2T/+3Do85XT+xGj2VpciGbW+58RwLpVM9AA9eA=="
+    },
+    "zod": {
+      "version": "4.4.3",
+      "integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="
+    },
+    "esbuild": {
+      "version": "0.28.2",
+      "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
+    }
+  },
+  "lockfileSha256": "209c17bf8bf53fd37cd6c89eb7e1fb6ecafc4c563593370e217c47512f68a51e",
+  "matrix": "compatibility-matrix.md"
+}
