@@ -1108,6 +1108,13 @@ impl RuntimeManager {
                 }
             }
         }
+        // A shared isolate may outlive this cell, so evicting the cell must
+        // revoke its loaded-worker capability grants before the storage handle
+        // is closed. Active capability jobs retain their guards until their
+        // host driver settles; new calls fail at the revocation edge.
+        for handle in &stopped {
+            crate::js::revoke_loader_capabilities_for_slot(handle.residency.slot());
+        }
         for handle in stopped {
             let slot = handle.residency.slot().clone();
             // Remove this Agent's loaded-worker registry entries before
@@ -1534,7 +1541,7 @@ pub(crate) async fn drive_loaded_worker(slot: Arc<crate::pool::Slot>, job: crate
         job,
         None,
         js::loaded_worker_budget(),
-        Some(celld_logic::code_mode::EXECUTION_TIMEOUT_ERROR),
+        Some(celld_logic::code_mode::EXECUTION_TIMEOUT_WIRE_ERROR),
     )
     .await;
 }

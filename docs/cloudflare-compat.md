@@ -234,14 +234,14 @@ additionally bounds retained workers with `CELLD_MAX_LOADED_WORKERS` (default
 response with `CELLD_LOADED_WORKER_TIMEOUT_S` (defaulting to the normal handler
 budget). `CELLD_MAX_LOADED_WORKER_MEMORY_MB` can set a node-wide Code Mode
 reservation ceiling; otherwise the reservation is derived from the per-isolate
-V8 heap limit and worker ceiling. Each bound has a distinct refusal error, and
-pressure shedding rejects only new Code Mode work. Idle loaded workers may be
-evicted under pressure, while active calls finish their lifecycle and host
-mutations still use the owning cell's normal output gate. A loaded worker
-serves `fetch()` and single RPC method calls. Capability values use an opaque
-sideband; host objects and credentials never enter the loaded Worker's JSON
-environment. The sideband supports the pinned Workspace, Library, Tools, and
-Fetcher proxy surfaces:
+V8 heap limit and worker ceiling. Each bound has a distinct refusal error with
+a stable `code` and `retryable` property, and pressure shedding rejects only
+new Code Mode work. Idle loaded workers may be evicted under pressure, while
+active calls finish their lifecycle and host mutations still use the owning
+cell's normal output gate. A loaded worker serves `fetch()` and single RPC
+method calls. Capability values use an opaque sideband; host objects and
+credentials never enter the loaded Worker's JSON environment. The sideband
+supports the pinned Workspace, Library, Tools, and Fetcher proxy surfaces:
 
 ```js
 const outbound = env.LOADER.fetcher(env.HTTP_GATEWAY, {

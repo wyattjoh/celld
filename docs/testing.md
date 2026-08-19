@@ -52,9 +52,11 @@ eviction, restart, or ownership-transfer behavior on a fleet.
 
 Code Mode admission is tested in the pure logic crate rather than by sleeping
 against V8: code bytes, env bytes, retained workers, execution concurrency,
-reserved memory, and pressure each have a distinct deterministic refusal. The
-runtime tests cover disposal races, idle-worker shedding, and release after
-in-flight capability calls. Pressure sheds only disposable loaded-worker work;
+reserved memory, and pressure each have a distinct deterministic refusal;
+retryability is asserted from typed categories rather than message parsing. The
+runtime tests cover bounded Loading waits, disposal races, host-task retention,
+idle-worker shedding, and release after in-flight capability calls. Pressure
+sheds only disposable loaded-worker work;
 the authoritative Agent cell and its acknowledged Workspace mutations remain
 under the ordinary cell and output-gate tests.
 

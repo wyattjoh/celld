@@ -1137,6 +1137,27 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
         Err(e) => {
             let s = v8::String::new(tc, &e).unwrap();
             let ex = v8::Exception::error(tc, s);
+            if let Some((code, retryable)) = e
+                .strip_prefix('[')
+                .and_then(|value| value.split_once(';'))
+                .and_then(|(code, rest)| {
+                    let retryable = rest
+                        .strip_prefix(" retryable=")?
+                        .strip_prefix("true]")
+                        .map(|_| true)
+                        .or_else(|| rest.strip_prefix(" retryable=false]").map(|_| false))?;
+                    Some((code, retryable))
+                })
+            {
+                if let Some(object) = ex.to_object(tc) {
+                    let code_key = v8::String::new(tc, "code").unwrap();
+                    let code_value = v8::String::new(tc, code).unwrap();
+                    let retryable_key = v8::String::new(tc, "retryable").unwrap();
+                    let retryable_value = v8::Boolean::new(tc, retryable);
+                    let _ = object.set(tc, code_key.into(), code_value.into());
+                    let _ = object.set(tc, retryable_key.into(), retryable_value.into());
+                }
+            }
             r.reject(tc, ex);
         }
     }
@@ -4073,9 +4094,17 @@ fn code_mode_admission() -> &'static Mutex<celld_logic::code_mode::Admission> {
         .get_or_init(|| Mutex::new(celld_logic::code_mode::Admission::new(code_mode_limits())))
 }
 
+fn code_mode_failure(kind: celld_logic::code_mode::ErrorKind, message: &str) -> String {
+    format!(
+        "[{}; retryable={}] {message}",
+        kind.code(),
+        kind.retryable()
+    )
+}
+
 fn code_mode_error(error: celld_logic::code_mode::AdmissionError) -> String {
     use celld_logic::code_mode::AdmissionError;
-    match error {
+    let message = match error {
         AdmissionError::CodeSize { actual, limit } => format!(
             "Dynamic Worker code size ({actual} bytes) exceeds the maximum allowed size of {limit} bytes."
         ),
@@ -4099,7 +4128,8 @@ fn code_mode_error(error: celld_logic::code_mode::AdmissionError) -> String {
         AdmissionError::Pressured => {
             "worker loader: pressure shedding rejects new Code Mode work".into()
         }
-    }
+    };
+    code_mode_failure(error.kind(), &message)
 }
 
 fn admit_loader_worker(code_bytes: usize, env_bytes: usize) -> Result<u64, String> {
@@ -4366,6 +4396,14 @@ mod loader_capability_tests {
     }
 
     #[tokio::test]
+    async fn loading_worker_admission_has_a_deterministic_timeout_boundary() {
+        let (_loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+        let result =
+            tokio::time::timeout(Duration::from_millis(1), loaded_worker_slot(state)).await;
+        assert!(result.is_err(), "a stalled compile must not wait forever");
+    }
+
+    #[tokio::test]
     async fn all_idle_waiters_observe_the_last_release() {
         let lifecycle = Arc::new(CapabilityLifecycle::live());
         let call = lifecycle.acquire("workspace").expect("live capability");
@@ -4495,9 +4533,16 @@ mod loader_capability_tests {
         ];
         let distinct = errors.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(distinct.len(), errors.len());
-        assert!(errors
-            .iter()
-            .all(|error| error.contains("worker loader") || error.starts_with("Dynamic Worker")));
+        assert!(errors.iter().all(|error| error.contains("code_mode.")));
+        assert!(errors.iter().any(|error| error.contains("retryable=true")));
+        assert!(errors.iter().any(|error| error.contains("retryable=false")));
+    }
+
+    #[test]
+    fn eviction_only_selects_ready_idle_workers() {
+        assert!(should_shed_loaded_worker(true, true));
+        assert!(!should_shed_loaded_worker(false, true));
+        assert!(!should_shed_loaded_worker(true, false));
     }
 
     #[test]
@@ -4510,7 +4555,6 @@ mod loader_capability_tests {
         drop(call);
         assert!(lifecycle.is_idle());
     }
-    }
 }
 
 struct LoadedCapability {
@@ -4520,7 +4564,9 @@ struct LoadedCapability {
 
 struct LoadedWorkerEntry {
     id: u64,
-    state: tokio::sync::watch::Receiver<LoaderState>,
+    /// The receiver is dropped before the memory reservation is released, so
+    /// a disposed Ready slot or Loading state cannot overlap a new admission.
+    state: Mutex<Option<tokio::sync::watch::Receiver<LoaderState>>>,
     /// The Agent cell scope that owns this loaded worker and its brokers.
     agent_scope: String,
     owner: celld_logic::capability::OwnerId,
@@ -4546,22 +4592,68 @@ fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
     LOADER_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+fn should_shed_loaded_worker(ready: bool, idle: bool) -> bool {
+    ready && idle
+}
+
 fn shed_idle_loaded_workers() {
+    let victims =
+        {
+            let mut registry = loader_registry().lock().unwrap();
+            let ids: Vec<u64> =
+                registry
+                    .iter()
+                    .filter(|(_, entry)| {
+                        should_shed_loaded_worker(
+                            entry.state.lock().unwrap().as_ref().is_some_and(|state| {
+                                matches!(*state.borrow(), LoaderState::Ready(_))
+                            }),
+                            entry.lifecycle.is_idle(),
+                        )
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+            let mut victims = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(entry) = registry.remove(&id) {
+                    // Dispose under the registry lock. A caller that cloned the
+                    // entry before this removal may still finish, but no new call
+                    // can acquire a lifecycle reservation after this edge.
+                    entry.lifecycle.dispose();
+                    victims.push(entry);
+                }
+            }
+            victims
+        };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        for entry in victims {
+            handle.spawn(release_loader_entry(entry));
+        }
+    }
+}
+
+/// Revoke every loaded worker whose capability host is this exact isolate.
+///
+/// Cell eviction is a host-authority boundary, not merely a residency change:
+/// a surviving shared slot may host another cell, but it must not retain the
+/// old cell's Workspace targets. In-flight host calls keep their guards until
+/// the host driver settles; new calls fail closed at the lifecycle edge.
+pub(crate) fn revoke_loader_capabilities_for_slot(slot: &Arc<crate::pool::Slot>) {
     let victims = {
         let mut registry = loader_registry().lock().unwrap();
         let ids: Vec<u64> = registry
             .iter()
             .filter(|(_, entry)| {
-                entry.lifecycle.is_idle() && matches!(*entry.state.borrow(), LoaderState::Ready(_))
+                entry
+                    .host_slot
+                    .upgrade()
+                    .is_some_and(|host| Arc::ptr_eq(&host, slot))
             })
             .map(|(id, _)| *id)
             .collect();
         let mut victims = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(entry) = registry.remove(&id) {
-                // Dispose under the registry lock. A caller that cloned the
-                // entry before this removal may still finish, but no new call
-                // can acquire a lifecycle reservation after this edge.
                 entry.lifecycle.dispose();
                 victims.push(entry);
             }
@@ -4587,7 +4679,6 @@ fn random_loader_token(prefix: &str) -> String {
 
 fn next_capability_token() -> String {
     random_loader_token("cap")
-}
 }
 
 fn capability_error(error: celld_logic::capability::AuthorizationError) -> String {
@@ -4633,6 +4724,23 @@ fn loader_result_error(
     }
 }
 
+fn throw_capability_error(
+    scope: &mut v8::PinScope,
+    error: celld_logic::capability::AuthorizationError,
+) {
+    let message = capability_error(error);
+    if error == celld_logic::capability::AuthorizationError::NotLive {
+        loader_throw_code(
+            scope,
+            celld_logic::code_mode::ErrorKind::Disposed.code(),
+            false,
+            &message,
+        );
+    } else {
+        loader_throw(scope, &message);
+    }
+}
+
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
     let message = v8::String::new(scope, message).unwrap();
     let exception = v8::Exception::error(scope, message);
@@ -4660,6 +4768,29 @@ fn loader_string_array(
         values.push(value.to_rust_string_lossy(scope));
     }
     Ok(values)
+}
+
+fn loader_throw_code(scope: &mut v8::PinScope, code: &str, retryable: bool, message: &str) {
+    let message = v8::String::new(scope, message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    if let Some(object) = exception.to_object(scope) {
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code_value = v8::String::new(scope, code).unwrap();
+        let retryable_key = v8::String::new(scope, "retryable").unwrap();
+        let retryable_value = v8::Boolean::new(scope, retryable);
+        let _ = object.set(scope, code_key.into(), code_value.into());
+        let _ = object.set(scope, retryable_key.into(), retryable_value.into());
+    }
+    scope.throw_exception(exception);
+}
+
+fn loader_throw_admission(scope: &mut v8::PinScope, error: &str) {
+    let code = error
+        .strip_prefix('[')
+        .and_then(|error| error.split_once(';'))
+        .map(|(code, _)| code)
+        .unwrap_or("code_mode.admission");
+    loader_throw_code(scope, code, error.contains("retryable=true"), error);
 }
 
 async fn loaded_worker_slot(
@@ -4812,12 +4943,15 @@ fn op_loader_load(
         })
         .unwrap_or(usize::MAX);
     if code_size > MAX_DYNAMIC_WORKER_CODE_SIZE {
-        return loader_throw(
+        let message = format!(
+            "Dynamic Worker code size ({code_size} bytes) exceeds the \
+             maximum allowed size of {MAX_DYNAMIC_WORKER_CODE_SIZE} bytes."
+        );
+        return loader_throw_code(
             scope,
-            &format!(
-                "Dynamic Worker code size ({code_size} bytes) exceeds the \
-                 maximum allowed size of {MAX_DYNAMIC_WORKER_CODE_SIZE} bytes."
-            ),
+            celld_logic::code_mode::ErrorKind::CodeSize.code(),
+            false,
+            &message,
         );
     }
     // Plain JSON `env` values merge onto the loaded worker's env. Explicit
@@ -4829,13 +4963,16 @@ fn op_loader_load(
         .map(|v| v.to_string());
     if let Some(env) = &loader_env {
         if env.len() > MAX_DYNAMIC_WORKER_ENV_SIZE {
-            return loader_throw(
+            let message = format!(
+                "Dynamic Worker env size ({} bytes) exceeds the maximum \
+                 allowed size of {MAX_DYNAMIC_WORKER_ENV_SIZE} bytes.",
+                env.len()
+            );
+            return loader_throw_code(
                 scope,
-                &format!(
-                    "Dynamic Worker env size ({} bytes) exceeds the maximum \
-                     allowed size of {MAX_DYNAMIC_WORKER_ENV_SIZE} bytes.",
-                    env.len()
-                ),
+                celld_logic::code_mode::ErrorKind::EnvSize.code(),
+                false,
+                &message,
             );
         }
     }
@@ -5095,7 +5232,7 @@ fn op_loader_load(
     let memory_bytes =
         match admit_loader_worker(code_size, loader_env.as_ref().map_or(0, String::len)) {
             Ok(memory_bytes) => memory_bytes,
-            Err(error) => return loader_throw(scope, &error),
+            Err(error) => return loader_throw_admission(scope, &error),
         };
     if !host_capabilities.is_empty() {
         host_state
@@ -5133,9 +5270,12 @@ fn op_loader_load(
     let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
     let lifecycle = Arc::new(CapabilityLifecycle::live());
     let control_token = random_loader_token("worker");
+    let load_call = lifecycle
+        .acquire("load")
+        .expect("new loaded worker is live");
     let entry = Arc::new(LoadedWorkerEntry {
         id,
-        state,
+        state: Mutex::new(Some(state)),
         agent_scope,
         owner,
         control_token: control_token.clone(),
@@ -5146,26 +5286,42 @@ fn op_loader_load(
         lifecycle: lifecycle.clone(),
     });
     loader_registry().lock().unwrap().insert(id, entry);
+    let cleanup_handle = handle.clone();
     handle.spawn(async move {
-        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config, &[]))
-            .await
-        {
-            Ok(Ok(worker)) => {
+        let mut compiling = tokio::task::spawn_blocking(move || Worker::load_config(config, &[]));
+        let state = match tokio::time::timeout(loaded_worker_budget(), &mut compiling).await {
+            Ok(Ok(Ok(worker))) => {
                 if lifecycle.is_live() {
                     loaded.send_replace(LoaderState::Ready(crate::pool::Slot::standalone(worker)));
                 }
-                // A finalizer or pressure shed may have disposed the
-                // entry while compilation was running. In that race the
-                // newly built isolate is dropped here; the disposer that
-                // owns the registry entry releases its reservation and
-                // host capability roots after its in-flight calls settle.
+                // A finalizer or host-cell eviction may have disposed the
+                // entry while compilation was running. Dropping the worker
+                // here is safe; the load guard is released at task end.
+                drop(load_call);
                 return;
             }
-            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
-            Err(error) => LoaderState::Failed(Arc::from(format!(
+            Ok(Ok(Err(error))) => LoaderState::Failed(Arc::from(format!("{error}"))),
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!(
                 "worker loader: load task failed: {error}"
             ))),
+            Err(_) => {
+                lifecycle.dispose();
+                loaded.send_replace(LoaderState::Failed(Arc::from(
+                    celld_logic::code_mode::EXECUTION_TIMEOUT_WIRE_ERROR,
+                )));
+                // spawn_blocking cannot be cancelled. Keep both the load
+                // reservation and the compile join handle alive until the
+                // compiler actually drops its V8 isolate, then let the
+                // registry cleanup release memory in the normal order.
+                cleanup_handle.spawn(async move {
+                    let _ = compiling.await;
+                    drop(load_call);
+                    release_loader_entry_by_id(id).await;
+                });
+                return;
+            }
         };
+        drop(load_call);
         lifecycle.dispose();
         loaded.send_replace(state);
         release_loader_entry_by_id(id).await;
@@ -5227,14 +5383,26 @@ fn op_loader_fetch(
                 error,
             )
         })?;
-        let slot = loaded_worker_slot(entry.state.clone())
-            .await
-            .map_err(|error| {
-                loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    error,
+        let state = entry
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                code_mode_failure(
+                    celld_logic::code_mode::ErrorKind::Disposed,
+                    "worker loader: worker state was disposed",
                 )
             })?;
+        let slot = tokio::time::timeout(loaded_worker_budget(), loaded_worker_slot(state))
+            .await
+            .map_err(|_| {
+                code_mode_failure(
+                    celld_logic::code_mode::ErrorKind::Timeout,
+                    celld_logic::code_mode::EXECUTION_TIMEOUT_ERROR,
+                )
+            })??;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::Fetch {
             queued_at: Instant::now(),
@@ -5281,7 +5449,6 @@ fn op_loader_fetch(
                 result
             }
         }
-        }
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -5324,14 +5491,26 @@ fn op_loader_rpc(
                 error,
             )
         })?;
-        let slot = loaded_worker_slot(entry.state.clone())
-            .await
-            .map_err(|error| {
-                loader_interruption(
-                    celld_logic::capability::InterruptionClass::IsolateFailure,
-                    error,
+        let state = entry
+            .state
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                code_mode_failure(
+                    celld_logic::code_mode::ErrorKind::Disposed,
+                    "worker loader: worker state was disposed",
                 )
             })?;
+        let slot = tokio::time::timeout(loaded_worker_budget(), loaded_worker_slot(state))
+            .await
+            .map_err(|_| {
+                code_mode_failure(
+                    celld_logic::code_mode::ErrorKind::Timeout,
+                    celld_logic::code_mode::EXECUTION_TIMEOUT_ERROR,
+                )
+            })??;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::Rpc {
             entrypoint,
@@ -5374,7 +5553,6 @@ fn op_loader_rpc(
                 schedule_loader_entry_release(entry.id);
                 result
             }
-        }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -5439,6 +5617,10 @@ async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
             );
         }
     }
+    // Drop the watch receiver before releasing the reservation. It may retain
+    // a Ready slot (or a Loading sender) and therefore V8 memory even after
+    // the registry entry is gone.
+    drop(entry.state.lock().unwrap().take());
     // The reservation is released last: host-side persistent handles and all
     // in-flight capability calls are gone before another worker may claim the
     // same memory budget.
@@ -5669,17 +5851,20 @@ fn op_loader_capability_call(
         kind,
         entry.lifecycle.is_live() && capability.lifecycle.is_live(),
     ) {
-        return loader_throw(scope, &capability_error(error));
+        return throw_capability_error(scope, error);
     }
 
     let Some(host_slot) = entry.host_slot.upgrade() else {
         schedule_loader_entry_release(entry.id);
-        return loader_throw(
+        let message = loader_interruption(
+            celld_logic::capability::InterruptionClass::HostCellLost,
+            "capability host is no longer live",
+        );
+        return loader_throw_code(
             scope,
-            &loader_interruption(
-                celld_logic::capability::InterruptionClass::HostCellLost,
-                "capability host is no longer live",
-            ),
+            celld_logic::code_mode::ErrorKind::HostLost.code(),
+            true,
+            &message,
         );
     };
     let execution = match admit_code_mode_execution() {
@@ -5743,7 +5928,6 @@ fn op_loader_capability_call(
                 celld_logic::capability::InterruptionClass::IsolateFailure,
                 "capability host dropped result",
             )),
-        }
         }
     });
     rv.set(promise_for(scope, async_id));
@@ -5865,7 +6049,7 @@ fn op_loader_capability_drop(
         // `dispose()` racing it must not turn a successful release into a
         // new authority-bearing error.
         if error != celld_logic::capability::AuthorizationError::NotLive {
-            return loader_throw(scope, &capability_error(error));
+            return throw_capability_error(scope, error);
         }
         return;
     }

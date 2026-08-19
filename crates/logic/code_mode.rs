@@ -16,8 +16,66 @@ pub const DEFAULT_MAX_ENV_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_EXECUTIONS: usize = 64;
 /// Default loaded-worker execution timeout in milliseconds.
 pub const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 300_000;
+/// Stable error code returned when a loaded-worker response outlives its budget.
+pub const EXECUTION_TIMEOUT_CODE: &str = "code_mode.timeout";
 /// Stable error returned when a loaded-worker response outlives its budget.
 pub const EXECUTION_TIMEOUT_ERROR: &str = "worker loader: execution time limit exceeded";
+/// Stable wire error returned by the runtime timeout path.
+pub const EXECUTION_TIMEOUT_WIRE_ERROR: &str =
+    "[code_mode.timeout; retryable=true] worker loader: execution time limit exceeded";
+
+/// Machine-readable Code Mode failure categories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The generated module payload is permanently too large.
+    CodeSize,
+    /// The generated plain JSON environment is permanently too large.
+    EnvSize,
+    /// The retained worker ceiling is temporarily full.
+    WorkerLimit,
+    /// The execution concurrency ceiling is temporarily full.
+    ConcurrencyLimit,
+    /// The process-memory reservation is temporarily unavailable.
+    MemoryLimit,
+    /// The node is currently shedding new Code Mode work.
+    Pressure,
+    /// The execution budget expired; callers may retry deliberately.
+    Timeout,
+    /// The owning host cell or isolate is no longer available.
+    HostLost,
+    /// A disposed capability or worker was used.
+    Disposed,
+}
+
+impl ErrorKind {
+    /// Return the stable wire/error code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::CodeSize => "code_mode.code_size",
+            Self::EnvSize => "code_mode.env_size",
+            Self::WorkerLimit => "code_mode.worker_limit",
+            Self::ConcurrencyLimit => "code_mode.concurrency_limit",
+            Self::MemoryLimit => "code_mode.memory_limit",
+            Self::Pressure => "code_mode.pressure",
+            Self::Timeout => EXECUTION_TIMEOUT_CODE,
+            Self::HostLost => "code_mode.host_lost",
+            Self::Disposed => "code_mode.disposed",
+        }
+    }
+
+    /// Whether a caller may retry after the condition changes.
+    pub const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::WorkerLimit
+                | Self::ConcurrencyLimit
+                | Self::MemoryLimit
+                | Self::Pressure
+                | Self::Timeout
+                | Self::HostLost
+        )
+    }
+}
 
 /// Configured Code Mode admission limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +175,20 @@ pub enum AdmissionError {
     },
     /// The node is shedding new Code Mode work under pressure.
     Pressured,
+}
+
+impl AdmissionError {
+    /// Return the machine-readable category for this refusal.
+    pub const fn kind(self) -> ErrorKind {
+        match self {
+            Self::CodeSize { .. } => ErrorKind::CodeSize,
+            Self::EnvSize { .. } => ErrorKind::EnvSize,
+            Self::WorkerLimit { .. } => ErrorKind::WorkerLimit,
+            Self::ConcurrencyLimit { .. } => ErrorKind::ConcurrencyLimit,
+            Self::MemoryLimit { .. } => ErrorKind::MemoryLimit,
+            Self::Pressured => ErrorKind::Pressure,
+        }
+    }
 }
 
 /// Pure Code Mode admission state.
@@ -379,6 +451,21 @@ mod tests {
                 pressured: true,
                 ..Usage::default()
             }
+        );
+    }
+
+    #[test]
+    fn error_kinds_expose_retryability_without_parsing_messages() {
+        assert!(!ErrorKind::CodeSize.retryable());
+        assert!(!ErrorKind::EnvSize.retryable());
+        assert!(ErrorKind::Pressure.retryable());
+        assert!(ErrorKind::ConcurrencyLimit.retryable());
+        assert!(ErrorKind::Timeout.retryable());
+        assert!(ErrorKind::HostLost.retryable());
+        assert!(!ErrorKind::Disposed.retryable());
+        assert_eq!(
+            AdmissionError::Pressured.kind().code(),
+            "code_mode.pressure"
         );
     }
 
