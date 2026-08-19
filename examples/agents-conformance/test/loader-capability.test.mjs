@@ -25,6 +25,15 @@ test("Worker Loader uses an explicit capability sideband and opaque proxy", asyn
   assert.match(harness, /handle\.token/);
 });
 
+test("Ticket 06 direct Workspace paths remain compatible with Worker Shell views", async () => {
+  const harness = await source("crates/celld/js/harness.js");
+  const docs = await source("docs/cloudflare-compat.md");
+  assert.match(harness, /const directFsPath = path\.length === 2 && path\[0\] === "fs"/);
+  assert.match(harness, /const shellFsPath = path\.length === 3/);
+  assert.match(harness, /path\[0\] === "getWorkspace" && path\[1\] === "fs"/);
+  assert.match(docs, /WORKSPACE\.fs\.readFile\(path, "utf8"\)/);
+});
+
 test("runtime checks capability identity and denies ambient loaded-worker egress", async () => {
   const runtime = await source("crates/celld/js.rs");
   const driver = await source("crates/celld/runtime.rs");

@@ -1700,17 +1700,21 @@ globalThis.__dispatchLoaderCapability =
     // opaque capability view. All subsequent calls stay on the explicit
     // Workspace fs allowlist; other host APIs and outbound brokers remain
     // unavailable to loaded code.
+    const directFsPath = path.length === 2 && path[0] === "fs";
+    const shellFsPath = path.length === 3 &&
+      path[0] === "getWorkspace" && path[1] === "fs";
+    const workspaceRootPath = path.length === 1 && path[0] === "getWorkspace";
     if (kind !== "workspace" ||
-        (path.length !== 1 && path.length !== 3) ||
-        path[0] !== "getWorkspace" ||
-        (path.length === 3 && path[1] !== "fs"))
+        (!workspaceRootPath && !directFsPath && !shellFsPath))
       throw new TypeError(
         "worker loader: Workspace capability only exposes getWorkspace and fs methods");
-    if (path.length === 3 && !new Set([
+    const methodName = directFsPath || shellFsPath
+      ? path[path.length - 1] : null;
+    if (methodName !== null && !new Set([
       "readFile", "exists", "stat", "statOrNull", "lstat", "lstatOrNull",
       "readdir", "find", "ls", "grep", "readlink", "writeFile", "mkdir",
       "rm", "chmod", "symlink",
-    ]).has(path[2]))
+    ]).has(methodName))
       throw new TypeError(
         "worker loader: Workspace capability method is unsupported");
     if (path.length === 1) {
