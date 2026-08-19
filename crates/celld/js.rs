@@ -4574,13 +4574,17 @@ mod loader_capability_tests {
         let make_entry = |id: u64, cell: &str| {
             let (_loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
             Arc::new(LoadedWorkerEntry {
+                id,
                 host_key: 7,
                 host_cell: Some(cell.to_string()),
                 state: Mutex::new(Some(state)),
+                agent_scope: cell.to_string(),
                 owner: id,
+                control_token: String::new(),
                 memory_bytes: 0,
                 host_slot: Weak::new(),
-                capabilities: HashMap::new(),
+                host_scope: None,
+                capabilities: Mutex::new(HashMap::new()),
                 lifecycle: Arc::new(CapabilityLifecycle::live()),
             })
         };
