@@ -1881,7 +1881,20 @@ globalThis.__dispatchLoaderCapability =
       if (typeof method !== "function")
         throw new TypeError("worker loader: Fetcher broker has no fetch() method");
       try {
-        return __readResponse(await Reflect.apply(method, target, [request]));
+        const response = await Reflect.apply(method, target, [request]);
+        if (response instanceof Response && response._bodyBytes === null) {
+          // Broker responses are materialized before crossing the host
+          // boundary so process-global stream ids never become loaded-worker
+          // authority handles.
+          const body = await response._consume();
+          return {
+            status: response.status,
+            headersJson: JSON.stringify(Array.from(response.headers)),
+            bodyBytes: body,
+            bodyStreamId: 0,
+          };
+        }
+        return __readResponse(response);
       } catch {
         // Broker implementation errors stay host-side; never copy gateway
         // credentials or internal URLs into a loaded-worker exception.
@@ -1923,11 +1936,21 @@ globalThis.__dispatchLoaderCapability =
     }
   }, false);
 
+const __loaderClearers = [];
+globalThis.__clearLoaderAgent = (agentScope) => {
+  for (const clear of __loaderClearers) clear(agentScope);
+};
+
 globalThis.__makeLoader = () => {
   // `get(name, …)` is memoized by name to one isolate; `load()` is anonymous.
   // A stub holds a Promise<handle> so `getCode` may be async and load lazily.
   // The handle's random control token is never exposed on the stub surface.
   const byName = new Map();
+  __loaderClearers.push((agentScope) => {
+    const prefix = `${agentScope}\u0000`;
+    for (const key of byName.keys())
+      if (key.startsWith(prefix)) byName.delete(key);
+  });
   const makeEntrypoint = (handlePromise, entrypoint) => {
     const target = {
       async fetch(input, init) {

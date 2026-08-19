@@ -133,6 +133,36 @@ test("tool catalogs are normalized to host-approved metadata", async () => {
   );
 });
 
+test("Agent eviction invalidates named loader workers before reactivation", async () => {
+  const harness = await source("crates/celld/js/harness.js");
+  const start = harness.indexOf("const __loaderClearers = [];");
+  const end = harness.indexOf("\nglobalThis.__makeServiceBinding", start);
+  assert.ok(start >= 0 && end > start, "loader cache implementation is present");
+  let loads = 0;
+  const context = vm.createContext({
+    Array, ArrayBuffer, FinalizationRegistry, JSON, Map, Object, Promise,
+    Set, Symbol, Uint8Array, URL,
+    __actorEventStack: ["Agent:alpha"],
+    __loaderCapabilitySafe: () => true,
+    __loader_load: () => ++loads,
+    __loader_drop() {},
+  });
+  vm.runInContext(`${harness.slice(start, end)}\n` +
+    "globalThis.__testLoader = __makeLoader();", context);
+  const code = {
+    mainModule: "worker.js",
+    modules: { "worker.js": "export default { fetch() {} };" },
+  };
+  context.__testLoader.get("named", () => code);
+  await Promise.resolve();
+  await Promise.resolve();
+  context.__clearLoaderAgent("Agent:alpha");
+  context.__testLoader.get("named", () => code);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(loads, 2, "reactivation must load a fresh named worker");
+});
+
 test("runtime checks capability identity and denies ambient loaded-worker egress", async () => {
   const runtime = await source("crates/celld/js.rs");
   const driver = await source("crates/celld/runtime.rs");
@@ -167,6 +197,9 @@ test("runtime checks capability identity and denies ambient loaded-worker egress
   assert.match(runtime, /worker stub Agent scope mismatch/);
   assert.match(runtime, /HOST_ONLY/);
   assert.match(runtime, /evict_loader_agent/);
+  assert.match(runtime, /struct StreamOwner/);
+  assert.match(runtime, /response stream owner mismatch/);
+  assert.match(runtime, /current_stream_owner/);
 });
 
 test("loaded Workers replace raw host authority ops", async () => {
@@ -189,15 +222,20 @@ test("normal Workers retain inherited outbound behavior while brokers stay expli
   assert.match(harness, /config\.globalOutbound !== undefined && config\.globalOutbound !== null/);
   assert.match(harness, /delete config\.globalOutbound/);
   assert.match(harness, /__loaderOutbound !== null/);
+  assert.match(harness, /process-global stream ids never become loaded-worker\s+\/\/\s+authority handles/);
   assert.match(runtime, /None => actor_runtime_state\(scope\)\.egress/);
 });
 
 test("host env injection materializes only opaque loaded-worker proxies", async () => {
   const bootstrap = await source("crates/celld/js/bootstrap.rs");
+  const harness = await source("crates/celld/js/harness.js");
   const runtime = await source("crates/celld/js.rs");
   assert.match(bootstrap, /__makeLoaderCapability/);
   assert.match(bootstrap, /__setLoaderOutbound/);
   assert.match(bootstrap, /loader_capabilities/);
+  assert.match(harness, /__clearLoaderAgent/);
+  assert.match(harness, /byName.delete/);
+  assert.match(runtime, /clear_loader_agent/);
   assert.match(runtime, /worker loader: host internal operation is unavailable/);
   assert.match(runtime, /CapabilityKind::Tools/);
   assert.match(runtime, /release_loader_capabilities/);

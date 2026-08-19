@@ -625,6 +625,21 @@ static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 /// this marker. The value stays distinctive, so a reader that does compare
 /// the value cannot match a plausible body.
 const HTTP_STREAM_DONE: &str = "__celld_http_stream_end__";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamOwner {
+    owner: celld_logic::capability::OwnerId,
+    worker: celld_logic::capability::WorkerId,
+}
+
+fn current_stream_owner(scope: &mut v8::PinScope) -> Option<StreamOwner> {
+    let state = actor_runtime_state(scope);
+    state.loader_worker_id.map(|worker| StreamOwner {
+        owner: state.owner_id,
+        worker,
+    })
+}
+
 enum HttpStreamSource {
     Response(reqwest::Response),
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
@@ -632,6 +647,7 @@ enum HttpStreamSource {
 }
 struct HttpStreamEntry {
     created: Instant,
+    owner: Option<StreamOwner>,
     source: Option<HttpStreamSource>,
     cancelled: tokio::sync::watch::Sender<bool>,
 }
@@ -639,7 +655,11 @@ static HTTP_STREAMS: OnceLock<std::sync::Mutex<HashMap<u64, HttpStreamEntry>>> =
 fn http_streams() -> &'static std::sync::Mutex<HashMap<u64, HttpStreamEntry>> {
     HTTP_STREAMS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
-fn register_http_stream(stream_id: u64, source: HttpStreamSource) {
+fn stream_owner_allowed(actual: Option<StreamOwner>, expected: Option<StreamOwner>) -> bool {
+    actual == expected
+}
+
+fn register_http_stream(stream_id: u64, source: HttpStreamSource, owner: Option<StreamOwner>) {
     let (cancelled, _) = tokio::sync::watch::channel(false);
     let mut streams = http_streams().lock().unwrap();
     streams.retain(|_, stream| stream.created.elapsed() < Duration::from_secs(60));
@@ -647,6 +667,7 @@ fn register_http_stream(stream_id: u64, source: HttpStreamSource) {
         stream_id,
         HttpStreamEntry {
             created: Instant::now(),
+            owner,
             source: Some(source),
             cancelled,
         },
@@ -654,6 +675,7 @@ fn register_http_stream(stream_id: u64, source: HttpStreamSource) {
 }
 struct ResponseStreamWriter {
     created: Instant,
+    owner: Option<StreamOwner>,
     writer: tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
     finished: tokio::sync::watch::Sender<bool>,
 }
@@ -693,7 +715,7 @@ fn encode_http_response(mut response: HttpResponse, ws_target: bool) -> String {
     }
     if let Some(stream) = response.stream.take() {
         let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-        register_http_stream(stream_id, HttpStreamSource::Stream(stream));
+        register_http_stream(stream_id, HttpStreamSource::Stream(stream), None);
         obj["streamId"] = serde_json::json!(stream_id);
     } else {
         match std::str::from_utf8(&response.body) {
@@ -2350,6 +2372,29 @@ impl Worker {
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
         ops
+    }
+
+    /// Clear named Worker Loader entries for an Agent before its cell
+    /// residency is returned. Without this callback, `loader.get()` would
+    /// keep a revoked worker id in its host-side memoization map.
+    pub(crate) fn clear_loader_agent(&mut self, agent_scope: &str) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let cs = &mut v8::ContextScope::new(hs, realm.context);
+        let global = cs.get_current_context().global(cs);
+        let key = v8::String::new(cs, "__clearLoaderAgent").unwrap();
+        let Some(function): Option<v8::Local<v8::Function>> = global
+            .get(cs, key.into())
+            .and_then(|value| value.try_into().ok())
+        else {
+            return;
+        };
+        let scope = v8::String::new(cs, agent_scope).unwrap();
+        let _ = function.call(cs, v8::undefined(cs).into(), &[scope.into()]);
     }
 
     /// Release host-side capability targets while this isolate is entered.
@@ -4210,7 +4255,10 @@ mod loader_capability_tests {
                       __op_fetch("GET", "https://ambient.example/",
                         undefined, "[]", "follow");
                     } catch (error) { ambient = error.message; }
-                    return new Response(`${raw}|${ambient}`);
+                    let stream;
+                    try { __http_stream_cancel(9001); }
+                    catch (error) { stream = error.message; }
+                    return new Response(`${raw}|${ambient}|${stream}`);
                   },
                 };
             "#
@@ -4229,6 +4277,8 @@ mod loader_capability_tests {
         config.loader_worker_id = Some(1);
         config.loader_agent_scope = Some("Agent:alpha".into());
         let mut worker = Worker::load_config(Arc::new(config), &[]).expect("loaded test worker");
+        let (_stream_writer, stream_receiver) = tokio::sync::mpsc::channel(1);
+        register_http_stream(9001, HttpStreamSource::Receiver(stream_receiver), None);
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::Fetch {
             queued_at: Instant::now(),
@@ -4248,8 +4298,9 @@ mod loader_capability_tests {
         assert_eq!(response.status, 200);
         assert_eq!(
             String::from_utf8(response.body).unwrap(),
-            "worker loader: host internal operation is unavailable to loaded workers|This worker is not permitted to access the internet via global functions like fetch(). It must use capabilities (such as bindings in 'env') to talk to the outside world."
+            "worker loader: host internal operation is unavailable to loaded workers|This worker is not permitted to access the internet via global functions like fetch(). It must use capabilities (such as bindings in 'env') to talk to the outside world.|worker loader: response stream owner mismatch"
         );
+        http_streams().lock().unwrap().remove(&9001);
     }
 }
 
@@ -5243,7 +5294,7 @@ fn op_loader_capability_grant(
 /// residency is returned to the pool. Removing the registry entries first
 /// rejects new calls; `release_loader_entry` then waits for in-flight calls
 /// before dropping host V8 roots on the owning slot.
-pub(crate) fn evict_loader_agent(slot: &Arc<crate::pool::Slot>, agent_scope: &str) {
+pub(crate) async fn evict_loader_agent(slot: &Arc<crate::pool::Slot>, agent_scope: &str) {
     let entries = {
         let mut registry = loader_registry().lock().unwrap();
         let ids = registry
@@ -5257,6 +5308,8 @@ pub(crate) fn evict_loader_agent(slot: &Arc<crate::pool::Slot>, agent_scope: &st
             .filter_map(|id| registry.remove(&id))
             .collect::<Vec<_>>()
     };
+    let scope = agent_scope.to_string();
+    slot.turn(|worker| worker.clear_loader_agent(&scope)).await;
     for entry in entries {
         entry.lifecycle.dispose();
         tokio::spawn(release_loader_entry(entry));
@@ -5927,6 +5980,7 @@ fn op_fetch(
     // un-act. That covers a write this handler made and a value it only read,
     // because the third party cannot tell the two apart.
     let gate = egress_gate_request();
+    let stream_owner = current_stream_owner(scope);
     let id = asyncrt::enqueue(async move {
         let span_started = trace.as_ref().map(|_| crate::telemetry::now_unix_us());
         let mut span = trace.as_ref().zip(child).map(|(parent, child)| {
@@ -5979,7 +6033,7 @@ fn op_fetch(
                     })
                     .collect::<Vec<_>>();
                 let stream_id = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-                register_http_stream(stream_id, HttpStreamSource::Response(resp));
+                register_http_stream(stream_id, HttpStreamSource::Response(resp), stream_owner);
                 Ok(serde_json::json!({
                     "status": status, "streamId": stream_id, "headers": headers,
                 })
@@ -6065,13 +6119,13 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
 /// Host-native tee for an outbound response. Both branches are represented by
 /// stream IDs, so one can be returned through Axum while JS independently
 /// scans the other for observability or usage accounting.
-fn tee_http_stream(mut source: HttpStreamSource) -> (u64, u64) {
+fn tee_http_stream(mut source: HttpStreamSource, owner: Option<StreamOwner>) -> (u64, u64) {
     let (tx1, rx1) = tokio::sync::mpsc::channel(16);
     let (tx2, rx2) = tokio::sync::mpsc::channel(16);
     let id1 = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
     let id2 = NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-    register_http_stream(id1, HttpStreamSource::Receiver(rx1));
-    register_http_stream(id2, HttpStreamSource::Receiver(rx2));
+    register_http_stream(id1, HttpStreamSource::Receiver(rx1), owner);
+    register_http_stream(id2, HttpStreamSource::Receiver(rx2), owner);
     asyncrt::op_handle().spawn(async move {
         loop {
             match next_http_stream_chunk(&mut source).await {
@@ -6100,16 +6154,23 @@ fn op_http_stream_read(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let source = http_streams()
-        .lock()
-        .unwrap()
-        .get_mut(&stream_id)
-        .and_then(|stream| {
-            stream
-                .source
-                .take()
-                .map(|source| (source, stream.cancelled.subscribe()))
-        });
+    let expected_owner = current_stream_owner(scope);
+    let mut streams = http_streams().lock().unwrap();
+    let Some(stream) = streams.get_mut(&stream_id) else {
+        drop(streams);
+        let id = asyncrt::enqueue(async { Ok(serde_json::json!({ "done": true }).to_string()) });
+        rv.set(promise_for(scope, id));
+        return;
+    };
+    if !stream_owner_allowed(stream.owner, expected_owner) {
+        drop(streams);
+        return loader_throw(scope, "worker loader: response stream owner mismatch");
+    }
+    let source = stream
+        .source
+        .take()
+        .map(|source| (source, stream.cancelled.subscribe()));
+    drop(streams);
     let id = asyncrt::enqueue(async move {
         let Some((mut source, mut cancelled)) = source else {
             return Ok(asyncrt::OpOut::Str(HTTP_STREAM_DONE.into()));
@@ -6146,18 +6207,28 @@ fn op_http_stream_tee(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let source = http_streams()
-        .lock()
-        .unwrap()
-        .remove(&stream_id)
-        .and_then(|stream| stream.source);
+    let expected_owner = current_stream_owner(scope);
+    let mut streams = http_streams().lock().unwrap();
+    let Some(stream) = streams.get(&stream_id) else {
+        drop(streams);
+        let message = v8::String::new(scope, "response stream is no longer available").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    if !stream_owner_allowed(stream.owner, expected_owner) {
+        drop(streams);
+        return loader_throw(scope, "worker loader: response stream owner mismatch");
+    }
+    let source = streams.remove(&stream_id).and_then(|stream| stream.source);
+    drop(streams);
     let Some(source) = source else {
         let message = v8::String::new(scope, "response stream is no longer available").unwrap();
         let exception = v8::Exception::type_error(scope, message);
         scope.throw_exception(exception);
         return;
     };
-    let ids = tee_http_stream(source);
+    let ids = tee_http_stream(source, expected_owner);
     let json = serde_json::to_string(&ids).unwrap();
     rv.set(v8::String::new(scope, &json).unwrap().into());
 }
@@ -6168,7 +6239,15 @@ fn op_http_stream_cancel(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    if let Some(stream) = http_streams().lock().unwrap().remove(&stream_id) {
+    let expected_owner = current_stream_owner(scope);
+    let mut streams = http_streams().lock().unwrap();
+    let Some(stream) = streams.get(&stream_id) else {
+        return;
+    };
+    if !stream_owner_allowed(stream.owner, expected_owner) {
+        return loader_throw(scope, "worker loader: response stream owner mismatch");
+    }
+    if let Some(stream) = streams.remove(&stream_id) {
         let _ = stream.cancelled.send(true);
     }
 }
@@ -6182,13 +6261,15 @@ fn op_response_stream_create(
     let (writer, receiver) = tokio::sync::mpsc::channel(1);
     let (finished, _) = tokio::sync::watch::channel(false);
     let now = Instant::now();
-    register_http_stream(stream_id, HttpStreamSource::Receiver(receiver));
+    let owner = current_stream_owner(scope);
+    register_http_stream(stream_id, HttpStreamSource::Receiver(receiver), owner);
     let mut writers = response_stream_writers().lock().unwrap();
     writers.retain(|_, stream| stream.created.elapsed() < Duration::from_secs(60));
     writers.insert(
         stream_id,
         ResponseStreamWriter {
             created: now,
+            owner,
             writer,
             finished,
         },
@@ -6202,6 +6283,7 @@ fn op_response_stream_write(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let expected_owner = current_stream_owner(scope);
     let bytes = args
         .get(1)
         .try_cast::<v8::ArrayBufferView>()
@@ -6215,9 +6297,12 @@ fn op_response_stream_write(
         .lock()
         .unwrap()
         .get_mut(&stream_id)
-        .map(|stream| {
+        .and_then(|stream| {
+            if !stream_owner_allowed(stream.owner, expected_owner) {
+                return None;
+            }
             stream.created = Instant::now();
-            stream.writer.clone()
+            Some(stream.writer.clone())
         });
     let id = asyncrt::enqueue(async move {
         let Some(bytes) = bytes else {
@@ -6241,10 +6326,12 @@ fn op_response_stream_closed(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let expected_owner = current_stream_owner(scope);
     let (writer, mut finished) = response_stream_writers()
         .lock()
         .unwrap()
         .get(&stream_id)
+        .filter(|stream| stream_owner_allowed(stream.owner, expected_owner))
         .map(|stream| (stream.writer.clone(), stream.finished.subscribe()))
         .unzip();
     let id = asyncrt::enqueue(async move {
@@ -6271,8 +6358,16 @@ fn op_response_stream_close(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let expected_owner = current_stream_owner(scope);
     let error = args.get(1).to_rust_string_lossy(scope);
-    let stream = response_stream_writers().lock().unwrap().remove(&stream_id);
+    let mut writers = response_stream_writers().lock().unwrap();
+    if writers
+        .get(&stream_id)
+        .is_some_and(|stream| !stream_owner_allowed(stream.owner, expected_owner))
+    {
+        return loader_throw(scope, "worker loader: response stream owner mismatch");
+    }
+    let stream = writers.remove(&stream_id);
     let id = asyncrt::enqueue(async move {
         if let Some(stream) = stream {
             let _ = stream.finished.send(true);

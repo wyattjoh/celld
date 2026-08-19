@@ -1114,7 +1114,7 @@ impl RuntimeManager {
             // returning the cell to the pool. New capability and stub calls
             // then fail immediately; the asynchronous release waits for
             // in-flight calls before dropping host V8 roots.
-            js::evict_loader_agent(&slot, cell);
+            js::evict_loader_agent(&slot, cell).await;
             // Give the cell back rather than shutting the isolate down: it
             // serves other cells. Taking the isolate for this turn is the
             // barrier — an event of this cell either finished its turn

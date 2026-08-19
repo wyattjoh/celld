@@ -269,9 +269,11 @@ credentials never cross the isolate. `WORKSPACE.fs.readFile(path, "utf8")` and
 grant is limited to one method hop on its supplied target. A Fetcher
 capability exposes only `fetch()`, and its non-empty allowlist is checked by
 origin and path before the host target is called. Responses cross back as
-bounded structured-clone data/streams, while arbitrary capability arguments
-and results remain clone-only: streams, stream handles, backpressure, and
-disposable result graphs are unsupported. The target stays rooted in the
+bounded structured-clone data/streams; broker response bodies are materialized
+before crossing the host boundary, and every runtime stream handle is
+owner-bound before it can be read, canceled, or tee'd. Arbitrary capability
+arguments and results remain clone-only: streams, stream handles, backpressure,
+and disposable result graphs are unsupported. The target stays rooted in the
 owning Agent isolate, so provider credentials and fleet bindings remain
 host-side.
 
