@@ -1755,9 +1755,12 @@ globalThis.__makeLoaderCapability = (
       return make([...path, prop]);
     },
     apply: (_base, _this, args) => {
-      if (disposed)
-        return Promise.reject(new Error(
-          "worker loader: capability proxy is disposed"));
+      if (disposed) {
+        const error = new Error("worker loader: capability proxy is disposed");
+        error.code = "code_mode.disposed";
+        error.retryable = false;
+        return Promise.reject(error);
+      }
       if (path.length === 0)
         return Promise.reject(new TypeError(
           "worker loader: capability root is not callable"));

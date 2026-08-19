@@ -4520,6 +4520,14 @@ mod loader_capability_tests {
     }
 
     #[test]
+    fn runtime_admission_guard_releases_after_a_deterministic_call() {
+        let guard = admit_code_mode_execution().expect("runtime admission");
+        drop(guard);
+        let guard = admit_code_mode_execution().expect("released runtime admission");
+        drop(guard);
+    }
+
+    #[test]
     fn runtime_maps_each_code_mode_admission_failure_to_a_distinct_error() {
         use celld_logic::code_mode::AdmissionError;
         let errors = [
@@ -5457,6 +5465,23 @@ fn op_loader_fetch(
     let control_token = args.get(1).to_rust_string_lossy(scope);
     let entry = match host_loader_entry(scope, id, &control_token) {
         Ok(entry) => entry,
+        Err(error) if error.ends_with("worker_disposed: unknown worker") => {
+            return loader_throw_code(
+                scope,
+                celld_logic::code_mode::ErrorKind::HostLost.code(),
+                true,
+                &error,
+            );
+        }
+        Err(error)
+            if error
+                == capability_error(celld_logic::capability::AuthorizationError::OwnerMismatch) =>
+        {
+            return throw_capability_error(
+                scope,
+                celld_logic::capability::AuthorizationError::OwnerMismatch,
+            );
+        }
         Err(error) => return loader_throw(scope, &error),
     };
     let agent_scope = args.get(6).to_rust_string_lossy(scope);
@@ -5567,6 +5592,23 @@ fn op_loader_rpc(
     let control_token = args.get(1).to_rust_string_lossy(scope);
     let entry = match host_loader_entry(scope, id, &control_token) {
         Ok(entry) => entry,
+        Err(error) if error.ends_with("worker_disposed: unknown worker") => {
+            return loader_throw_code(
+                scope,
+                celld_logic::code_mode::ErrorKind::HostLost.code(),
+                true,
+                &error,
+            );
+        }
+        Err(error)
+            if error
+                == capability_error(celld_logic::capability::AuthorizationError::OwnerMismatch) =>
+        {
+            return throw_capability_error(
+                scope,
+                celld_logic::capability::AuthorizationError::OwnerMismatch,
+            );
+        }
         Err(error) => return loader_throw(scope, &error),
     };
     let agent_scope = args.get(5).to_rust_string_lossy(scope);

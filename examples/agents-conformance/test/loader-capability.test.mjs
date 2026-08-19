@@ -179,6 +179,8 @@ test("Agent eviction invalidates named loader workers before reactivation", asyn
 test("runtime checks capability identity and denies ambient loaded-worker egress", async () => {
   const runtime = await source("crates/celld/js.rs");
   const driver = await source("crates/celld/runtime.rs");
+  assert.match(runtime, /code_mode_failure\(/);
+  assert.match(runtime, /ErrorKind::HostLost/);
   assert.match(runtime, /capability::authorize/);
   assert.match(runtime, /capability owner mismatch/);
   assert.match(runtime, /capability worker mismatch/);
@@ -242,6 +244,8 @@ test("normal Workers retain inherited outbound behavior while brokers stay expli
 test("host env injection materializes only opaque loaded-worker proxies", async () => {
   const bootstrap = await source("crates/celld/js/bootstrap.rs");
   const harness = await source("crates/celld/js/harness.js");
+  assert.match(harness, /code_mode\.disposed/);
+  assert.match(harness, /retryable = false/);
   const runtime = await source("crates/celld/js.rs");
   assert.match(bootstrap, /__makeLoaderCapability/);
   assert.match(bootstrap, /__setLoaderOutbound/);
