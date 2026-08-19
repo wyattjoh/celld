@@ -9,7 +9,11 @@ The fixture declares one `ConformanceAgent` Durable Object class and addresses
 stable names `alpha` and `beta` in the same deployment. Its callable
 `conformance({ name })` method returns only structured-cloneable data.
 `routeAgentRequest` is also exercised at the standard Agent path:
-`/agents/agents/<name>`.
+`/agents/agents/<name>`. The state/SQL path writes and reads one state value
+and one SQL row per name at `/conformance/state/<name>`; the response exposes
+both surfaces so deterministic checks can verify that `alpha` and `beta` never
+share rows. Full bucket restore, ownership-transfer, and output-gate coverage
+belongs to the live-fleet runtime harness.
 
 ## Verify the target
 
@@ -42,11 +46,18 @@ Start or restart celld against the same bucket, then check the public listener:
 curl -fsS http://127.0.0.1:8080/conformance/call/alpha
 curl -fsS http://127.0.0.1:8080/conformance/call/beta
 curl -fsS http://127.0.0.1:8080/conformance/names
+curl -fsS -X POST http://127.0.0.1:8080/conformance/state/alpha \
+  -H 'content-type: application/json' -d '{"value":"alpha-state","revision":1}'
+curl -fsS -X POST http://127.0.0.1:8080/conformance/state/beta \
+  -H 'content-type: application/json' -d '{"value":"beta-state","revision":1}'
+curl -fsS http://127.0.0.1:8080/conformance/state/alpha
+curl -fsS http://127.0.0.1:8080/conformance/state/beta
 curl -fsS http://127.0.0.1:8080/agents/agents/alpha
 curl -fsS http://127.0.0.1:8080/agents/agents/beta
 ```
 
 The two callable responses contain `agent: "alpha"` and `agent: "beta"`
-respectively. The route responses identify `surface: "routeAgentRequest"`.
-The initial supported/adapted/unsupported decisions are in
-[`compatibility-matrix.md`](compatibility-matrix.md).
+respectively. State reads return the selected Agent state and only that Agent's
+SQL row after local activation and reopen. The route responses identify
+`surface: "routeAgentRequest"`. The supported/adapted/unsupported decisions are
+in [`compatibility-matrix.md`](compatibility-matrix.md).

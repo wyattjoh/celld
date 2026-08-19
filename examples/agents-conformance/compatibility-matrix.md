@@ -1,6 +1,6 @@
 # Agents compatibility target
 
-This fixture is the pinned, source-unmodified compatibility seam for ticket 01.
+This fixture is the pinned, source-unmodified compatibility seam extended by ticket 02.
 The package versions, lockfile integrity values, and lockfile digest are checked
 by `npm run check:compatibility`; changing an upstream version without a
 reviewed target update fails before deployment.
@@ -33,7 +33,8 @@ The status describes the celld contract at this fixture seam:
 | `@cloudflare/agents@0.0.16` `getAgentByName` | calls both `alpha` and `beta` | supported | each name is resolved through the declared `agents` Durable Object namespace |
 | `@cloudflare/agents@0.0.16` structured-cloneable callable method | `conformance({ name })` returns nested arrays and objects | supported | no function, stream, class, or live RPC capability crosses the cell boundary |
 | `@cloudflare/agents@0.0.16` `routeAgentRequest` | `/agents/agents/alpha` and `/agents/agents/beta` | adapted | PartyServer routing is source-unmodified; celld supplies the namespace and request dispatch |
-| `@cloudflare/agents@0.0.16` state, SQL, alarms, and WebSockets | not exercised by this ticket | adapted | reserved for the lifecycle tickets; no broader parity claim is made here |
+| `@cloudflare/agents@0.0.16` state and embedded SQL | `/conformance/state/alpha` and `/conformance/state/beta` write/read independently | adapted | the fixture uses celld's private per-cell SQLite path; deterministic reopen coverage is present, while bucket restore, ownership-transfer, and output-gate evidence remain runtime-test work |
+| `@cloudflare/agents@0.0.16` alarms and WebSockets | not exercised by this ticket | adapted | reserved for later lifecycle tickets; no broader parity claim is made here |
 | `@cloudflare/computer@0.2.1` filesystem-only Workspace | not exercised by this ticket | unsupported | durable Workspace integration is ticket 05 |
 | `@cloudflare/computer@0.2.1` Worker JavaScript backend | not exercised by this ticket | unsupported | loader capability integration is ticket 08 |
 | `@cloudflare/computer@0.2.1` Worker Shell backend | not exercised by this ticket | unsupported | loader capability integration is ticket 09 |

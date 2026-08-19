@@ -74,6 +74,32 @@ jobs:
           path: out/celld-${{ matrix.target }}.gz
           if-no-files-found: error
 
+  agents-conformance:
+    name: Agents conformance fixture
+    if: github.event_name != 'release'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/agents-conformance/package-lock.json
+
+      - name: Install fixture dependencies
+        working-directory: examples/agents-conformance
+        run: npm ci --ignore-scripts
+
+      - name: Run fixture tests
+        working-directory: examples/agents-conformance
+        run: npm test
+
+      - name: Enforce pinned compatibility target
+        working-directory: examples/agents-conformance
+        run: npm run check:compatibility
+
   # The Dockerfile must build and its test stage pass before anything can
   # be published; nothing is pushed at candidate time.
   container-check:

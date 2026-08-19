@@ -33,6 +33,15 @@ test("the checked-in Agents and Computer target is exact", () => {
   });
 });
 
+test("the fixture declares private Agent state and SQL lifecycle surfaces", async () => {
+  const source = await readFile(join(ROOT, "index.js"), "utf8");
+  assert.match(source, /stateAndSql\(input\)/);
+  assert.match(source, /conformance_agent_records/);
+  assert.ok(source.includes('url.pathname.match(/^\\/conformance\\/state\\/([^/]+)$/)'));
+  assert.match(source, /this\.setState\(\{ agent: name, value, revision \}\)/);
+  assert.match(source, /SELECT id, value, revision/);
+});
+
 test("a direct upstream version change fails with a stable error", async () => {
   const root = await copyFixture();
   const path = join(root, "package.json");

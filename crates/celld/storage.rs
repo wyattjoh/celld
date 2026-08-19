@@ -3778,3 +3778,99 @@ mod internal_table_names {
         let _ = std::fs::remove_file(&file);
     }
 }
+
+#[cfg(test)]
+mod named_agent_lifecycle {
+    use super::*;
+
+    #[test]
+    fn cell_databases_keep_private_state_and_sql_after_reopen() {
+        install_for_test();
+        let root = std::env::temp_dir().join(format!(
+            "celld-agent-state-{}-{}",
+            std::process::id(),
+            NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let alpha = "ConformanceAgent:alpha";
+        let beta = "ConformanceAgent:beta";
+        let alpha_path = root.join("alpha.sqlite");
+        let beta_path = root.join("beta.sqlite");
+
+        open(alpha, alpha_path.to_str().unwrap()).expect("open alpha");
+        open(beta, beta_path.to_str().unwrap()).expect("open beta");
+        put_serialized(alpha, "state", b"alpha-state").expect("store alpha state");
+        put_serialized(beta, "state", b"beta-state").expect("store beta state");
+        sql_exec(
+            alpha,
+            "CREATE TABLE records (id TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            &[],
+        )
+        .expect("create alpha table");
+        sql_exec(
+            beta,
+            "CREATE TABLE records (id TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            &[],
+        )
+        .expect("create beta table");
+        let alpha_before = write_position(alpha).expect("alpha write position");
+        sql_exec(
+            alpha,
+            "INSERT INTO records (id, value) VALUES (?1, ?2)",
+            &[serde_json::json!(alpha), serde_json::json!("alpha-row")],
+        )
+        .expect("write alpha SQL");
+        assert!(write_position(alpha).unwrap() > alpha_before);
+        sql_exec(
+            beta,
+            "INSERT INTO records (id, value) VALUES (?1, ?2)",
+            &[serde_json::json!(beta), serde_json::json!("beta-row")],
+        )
+        .expect("write beta SQL");
+
+        let (_, alpha_rows, _) =
+            sql_exec(alpha, "SELECT id, value FROM records", &[]).expect("read alpha SQL");
+        let (_, beta_rows, _) =
+            sql_exec(beta, "SELECT id, value FROM records", &[]).expect("read beta SQL");
+        assert_eq!(
+            alpha_rows,
+            vec![vec![
+                serde_json::json!(alpha),
+                serde_json::json!("alpha-row")
+            ]]
+        );
+        assert_eq!(
+            beta_rows,
+            vec![vec![serde_json::json!(beta), serde_json::json!("beta-row")]]
+        );
+
+        close(alpha);
+        close(beta);
+        open(alpha, alpha_path.to_str().unwrap()).expect("restore alpha");
+        open(beta, beta_path.to_str().unwrap()).expect("restore beta");
+        assert!(
+            matches!(get_stored(alpha, "state"), Ok(Some(StoredValue::V8(value))) if value == b"alpha-state")
+        );
+        assert!(
+            matches!(get_stored(beta, "state"), Ok(Some(StoredValue::V8(value))) if value == b"beta-state")
+        );
+        let (_, alpha_rows, _) =
+            sql_exec(alpha, "SELECT id, value FROM records", &[]).expect("read restored alpha SQL");
+        let (_, beta_rows, _) =
+            sql_exec(beta, "SELECT id, value FROM records", &[]).expect("read restored beta SQL");
+        assert_eq!(
+            alpha_rows,
+            vec![vec![
+                serde_json::json!(alpha),
+                serde_json::json!("alpha-row")
+            ]]
+        );
+        assert_eq!(
+            beta_rows,
+            vec![vec![serde_json::json!(beta), serde_json::json!("beta-row")]]
+        );
+        close(alpha);
+        close(beta);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
