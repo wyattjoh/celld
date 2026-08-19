@@ -289,9 +289,13 @@ sideband modules are supported. Ordinary JSON `env` values and normal Worker
 `fetch()` behavior remain unchanged. `globalOutbound: null` always denies
 ambient `fetch()`; omitting `globalOutbound` preserves the existing
 parent/normal-Worker outbound policy. A non-null ordinary object is rejected
-instead of being serialized or treated as unrestricted networking. Awaitable
-properties and pipelined capability calls remain unsupported. Unsupported
-values fail with `DataCloneError` rather than crossing as host objects.
+instead of being serialized or treated as unrestricted networking. Loaded
+isolates replace raw host storage, DO, service, alarm, and loader-stub native
+operations with bounded denials. When an Agent cell is evicted or its
+activation ends, its loaded-worker registry entries are revoked immediately and
+host references are released after in-flight calls settle. Awaitable properties
+and pipelined capability calls remain unsupported. Unsupported values fail
+with `DataCloneError` rather than crossing as host objects.
 
 ## Computer filesystem-only Workspace
 

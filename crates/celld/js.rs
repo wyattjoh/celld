@@ -3266,7 +3266,7 @@ impl Worker {
             let tc = std::pin::pin!(v8::TryCatch::new(cs));
             let scope = &mut tc.init();
 
-            install_ops(scope, context);
+            install_ops(scope, context, config.loader_worker_id.is_some());
             install_prelude(scope)?; // Web Platform APIs
             install_harness(scope)?; // DO object model + minimal Response
             inject_loader_outbound(scope, &config)?;
@@ -3600,6 +3600,18 @@ impl Worker {
 
 // ---- native ops exposed to JS ----
 
+/// Reject a host-only native op from generated code in a loaded worker.
+fn op_loader_denied(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    loader_throw(
+        scope,
+        "worker loader: host internal operation is unavailable to loaded workers",
+    );
+}
+
 /// Host ops, defined non-enumerable. They are runtime internals: a bundle
 /// walking `globalThis` must not find them, let alone `new` one — `for (const
 /// k in globalThis) new globalThis[k]()` used to reach `__actor_abort` and
@@ -3615,7 +3627,7 @@ macro_rules! ops {
     };
 }
 
-fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
+fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>, loaded_worker: bool) {
     let global = context.global(scope);
     ops! { scope, global,
         "__heap_limit_excessively_exceeded" =>
@@ -3759,6 +3771,84 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
             storage_ops::op_sql_set_interrupt_fault_for_test,
         "__sql_register_nomem_function_for_test" =>
             storage_ops::op_sql_register_nomem_function_for_test,
+    }
+    if loaded_worker {
+        // Native ops are deliberately installed non-enumerable, not private:
+        // generated code can still address a known name. Replace every host
+        // authority op in a loaded isolate with one bounded denial so raw cell,
+        // service, DO, alarm, and loader-stub handles cannot bypass env
+        // capabilities. The loader capability call/drop and ordinary timer,
+        // crypto, clone, and response-read ops remain available.
+        const HOST_ONLY: &[&str] = &[
+            "__ws_send",
+            "__ws_send_binary",
+            "__ws_close",
+            "__ws_alloc",
+            "__ws_accept",
+            "__ws_accept_regular",
+            "__ws_list",
+            "__ws_attachment_set",
+            "__ws_auto_response_set",
+            "__ws_auto_response_get",
+            "__ws_auto_response_ts",
+            "__ws_connect",
+            "__ws_next",
+            "__ws_upgrade",
+            "__storage_get",
+            "__storage_get_many",
+            "__sql_exec",
+            "__sql_ingest",
+            "__sql_cursor_start",
+            "__sql_cursor_next",
+            "__sql_cursor_close",
+            "__sql_database_size",
+            "__storage_transaction_control",
+            "__storage_put",
+            "__storage_put_many",
+            "__storage_queue_put",
+            "__storage_queue_put_many",
+            "__storage_put_serialized",
+            "__storage_queue_put_serialized",
+            "__storage_flush_pending_puts",
+            "__storage_cancel_pending_puts",
+            "__storage_delete",
+            "__storage_delete_many",
+            "__storage_list",
+            "__storage_sync_list_start",
+            "__storage_sync_list_next",
+            "__storage_delete_all",
+            "__actor_abort",
+            "__process_exit",
+            "__alarm_set",
+            "__alarm_get",
+            "__alarm_delete",
+            "__loader_load",
+            "__loader_fetch",
+            "__loader_rpc",
+            "__loader_capability_target",
+            "__loader_capability_allowlist",
+            "__loader_drop",
+            "__loader_count",
+            "__do_call",
+            "__writePosition",
+            "__gateWrite",
+            "__svc_call",
+            "__svc_call_cancellable",
+            "__svc_rpc",
+            "__do_call_cancellable",
+            "__do_call_cancel",
+            "__do_id",
+            "__rpc_call",
+            "__asset_fetch",
+            "__gate_acquire",
+            "__gate_wait",
+            "__gate_release",
+        ];
+        let denied = v8::Function::new(scope, op_loader_denied).unwrap();
+        for name in HOST_ONLY {
+            let key = v8::String::new(scope, name).unwrap();
+            global.set(scope, key.into(), denied.into());
+        }
     }
 }
 
@@ -4099,6 +4189,67 @@ mod loader_capability_tests {
             .await
             .expect("capability cancellation")
             .expect("cancellation sender");
+    }
+
+    #[test]
+    fn loaded_worker_replaces_raw_host_storage_and_denies_ambient_fetch() {
+        static ENGINE: std::sync::Once = std::sync::Once::new();
+        ENGINE.call_once(|| {
+            v8::V8::set_flags_from_string("--expose-gc");
+            Engine::init();
+        });
+        let mut config = WorkerConfig::new(WorkerConfigOptions {
+            src: r#"
+                export default {
+                  fetch() {
+                    let raw;
+                    try { __storage_get("Agent:alpha", "secret"); }
+                    catch (error) { raw = error.message; }
+                    let ambient;
+                    try {
+                      __op_fetch("GET", "https://ambient.example/",
+                        undefined, "[]", "follow");
+                    } catch (error) { ambient = error.message; }
+                    return new Response(`${raw}|${ambient}`);
+                  },
+                };
+            "#
+            .into(),
+            script_name: "__loader-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            ai_binding: None,
+            vars: Vec::new(),
+            node: String::new(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        })
+        .with_egress(EgressPolicy::Deny);
+        config.loader_worker_id = Some(1);
+        config.loader_agent_scope = Some("Agent:alpha".into());
+        let mut worker = Worker::load_config(Arc::new(config), &[]).expect("loaded test worker");
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::Fetch {
+            queued_at: Instant::now(),
+            url: "https://ambient.example/".into(),
+            method: "GET".into(),
+            body: Vec::new(),
+            headers: Vec::new(),
+            request_id: None,
+            reply,
+        };
+        let (_in_flight, ops) = worker.turn_begin(job, None);
+        assert!(ops.is_empty(), "raw host denial should not enqueue an op");
+        let response = receive
+            .blocking_recv()
+            .expect("loaded worker fetch reply")
+            .expect("loaded worker fetch result");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "worker loader: host internal operation is unavailable to loaded workers|This worker is not permitted to access the internet via global functions like fetch(). It must use capabilities (such as bindings in 'env') to talk to the outside world."
+        );
     }
 }
 
@@ -4736,22 +4887,34 @@ fn op_loader_load(
     rv.set(handle.into());
 }
 
-/// `__loader_fetch(id, controlToken, url, method, body, headersJson)` ->
+/// `__loader_fetch(id, controlToken, url, method, body, headersJson, agentScope)` ->
 /// Promise<json>. The host-side control token binds the operation to the
 /// Worker Loader stub that minted it; a numeric id alone is not authority.
-///
-/// loaded-worker analog of `__svc_call`: encodes the response the same way.
+/// Host stubs must present the active Agent scope; loaded workers cannot
+/// invoke this host-only operation directly. The response is encoded the same
+/// way as `__svc_call`.
 fn op_loader_fetch(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    let state = actor_runtime_state(scope);
+    if state.loader_worker_id.is_some() {
+        return loader_throw(
+            scope,
+            "worker loader: loaded workers cannot invoke worker stubs",
+        );
+    }
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let control_token = args.get(1).to_rust_string_lossy(scope);
     let entry = match host_loader_entry(scope, id, &control_token) {
         Ok(entry) => entry,
         Err(error) => return loader_throw(scope, &error),
     };
+    let agent_scope = args.get(6).to_rust_string_lossy(scope);
+    if entry.agent_scope != agent_scope {
+        return loader_throw(scope, "worker loader: worker stub Agent scope mismatch");
+    }
     let url = args.get(2).to_rust_string_lossy(scope);
     let method = args.get(3).to_rust_string_lossy(scope);
     let body = view_bytes(args.get(4)).unwrap_or_default();
@@ -4808,20 +4971,33 @@ fn op_loader_fetch(
     rv.set(promise_for(scope, async_id));
 }
 
-/// `__loader_rpc(id, entrypoint, method, argsSc)` -> Promise<Uint8Array>. The
-/// loaded-worker analog of `__svc_rpc`: a named-entrypoint method call whose
-/// args and result are V8 structured-clone bytes.
+/// `__loader_rpc(id, entrypoint, method, argsSc, agentScope)` ->
+/// Promise<Uint8Array>. The loaded-worker analog of `__svc_rpc`: a
+/// named-entrypoint method call whose args and result are V8 structured-clone
+/// bytes. Host stubs are scoped to their active Agent and loaded workers
+/// cannot invoke this host-only operation directly.
 fn op_loader_rpc(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    let state = actor_runtime_state(scope);
+    if state.loader_worker_id.is_some() {
+        return loader_throw(
+            scope,
+            "worker loader: loaded workers cannot invoke worker stubs",
+        );
+    }
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let control_token = args.get(1).to_rust_string_lossy(scope);
     let entry = match host_loader_entry(scope, id, &control_token) {
         Ok(entry) => entry,
         Err(error) => return loader_throw(scope, &error),
     };
+    let agent_scope = args.get(5).to_rust_string_lossy(scope);
+    if entry.agent_scope != agent_scope {
+        return loader_throw(scope, "worker loader: worker stub Agent scope mismatch");
+    }
     let entrypoint = args.get(2).to_rust_string_lossy(scope);
     let method = args.get(3).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(4)).unwrap_or_default();
@@ -5061,6 +5237,30 @@ fn op_loader_capability_grant(
             },
         );
     rv.set(v8::String::new(scope, &token).unwrap().into());
+}
+
+/// Evict every loaded worker owned by one Agent cell before the cell's
+/// residency is returned to the pool. Removing the registry entries first
+/// rejects new calls; `release_loader_entry` then waits for in-flight calls
+/// before dropping host V8 roots on the owning slot.
+pub(crate) fn evict_loader_agent(slot: &Arc<crate::pool::Slot>, agent_scope: &str) {
+    let entries = {
+        let mut registry = loader_registry().lock().unwrap();
+        let ids = registry
+            .iter()
+            .filter_map(|(id, entry)| {
+                let host = entry.host_slot.upgrade()?;
+                (entry.agent_scope == agent_scope && Arc::ptr_eq(&host, slot)).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| registry.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    for entry in entries {
+        entry.lifecycle.dispose();
+        tokio::spawn(release_loader_entry(entry));
+    }
 }
 
 /// `__loader_capability_call(workerId, token, kind, pathJson, argsSc)` ->
@@ -5443,6 +5643,13 @@ fn op_loader_drop(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
+    let state = actor_runtime_state(scope);
+    if state.loader_worker_id.is_some() {
+        return loader_throw(
+            scope,
+            "worker loader: loaded workers cannot drop worker stubs",
+        );
+    }
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let control_token = args.get(1).to_rust_string_lossy(scope);
     if let Err(error) = host_loader_entry(scope, id, &control_token) {
@@ -5454,10 +5661,27 @@ fn op_loader_drop(
         }
         return;
     }
-    if let Some(entry) = loader_registry()
+    let requested_scope =
+        (!args.get(2).is_undefined()).then(|| args.get(2).to_rust_string_lossy(scope));
+    let entry = loader_registry()
+        .lock()
+        .expect("loader registry poisoned")
+        .get(&id)
+        .cloned();
+    let Some(entry) = entry else {
+        return;
+    };
+    if requested_scope
+        .as_deref()
+        .is_some_and(|scope| scope != entry.agent_scope)
+    {
+        return loader_throw(scope, "worker loader: worker stub Agent scope mismatch");
+    }
+    if loader_registry()
         .lock()
         .expect("loader registry poisoned")
         .remove(&id)
+        .is_some()
     {
         entry.lifecycle.dispose();
         asyncrt::op_handle().spawn(release_loader_entry(entry));

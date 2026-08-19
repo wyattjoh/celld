@@ -44,6 +44,48 @@ test("Ticket 06 direct Workspace paths remain compatible with Worker Shell views
   assert.match(harness, /typeof wrapped\.js === "string"/);
 });
 
+test("global fetch routes through the explicit broker instead of ambient egress", async () => {
+  const harness = await source("crates/celld/js/harness.js");
+  const start = harness.indexOf("globalThis.fetch = async");
+  const end = harness.indexOf("\nglobalThis.__fetchWebSocketUpgrade", start);
+  assert.ok(start >= 0 && end > start, "global fetch implementation is present");
+  const vmContext = vm.createContext({
+    Array, Error, JSON, Promise, Symbol, Uint8Array,
+    Request: class Request {
+      constructor(input, init = {}) {
+        this.url = String(input);
+        this.method = String(init.method ?? "GET").toUpperCase();
+        this.redirect = init.redirect ?? "follow";
+        this.headers = new Map(init.headers ?? []);
+        this._bodyBytes = init.body ?? null;
+      }
+      async _consume() { return this._bodyBytes ?? new Uint8Array(); }
+    },
+    Response: class Response {
+      constructor(body) { this.body = body; }
+      async text() { return String(this.body); }
+    },
+    CelldHttpBodyStream: class {},
+    __fetchWebSocketUpgrade: async () => { throw new Error("unexpected websocket"); },
+    __op_fetch: async () => { throw new Error("ambient egress"); },
+  });
+  vm.runInContext(`
+    let __loaderOutbound = null;
+    ${harness.slice(start, end)}
+    globalThis.__setTestOutbound = (value) => { __loaderOutbound = value; };
+    globalThis.__testFetch = globalThis.fetch;
+  `, vmContext);
+  await assert.rejects(
+    vmContext.__testFetch("https://ambient.example"),
+    /ambient egress/,
+  );
+  vmContext.__setTestOutbound(async (request) => new vmContext.Response(
+    `broker:${request.url}`,
+  ));
+  const response = await vmContext.__testFetch("https://approved.example");
+  assert.equal(await response.text(), "broker:https://approved.example");
+});
+
 test("Fetcher broker allowlists are origin-and-path scoped", async () => {
   const harness = await source("crates/celld/js/harness.js");
   const start = harness.indexOf("const __loaderFetcherAllowed =");
@@ -121,6 +163,24 @@ test("runtime checks capability identity and denies ambient loaded-worker egress
   assert.match(runtime, /Fetcher brokers require a non-empty allowlist/);
   assert.match(runtime, /globalOutbound must be an explicit Fetcher broker/);
   assert.match(runtime, /loader_capability_allowlist/);
+  assert.match(runtime, /loaded workers cannot invoke worker stubs/);
+  assert.match(runtime, /worker stub Agent scope mismatch/);
+  assert.match(runtime, /HOST_ONLY/);
+  assert.match(runtime, /evict_loader_agent/);
+});
+
+test("loaded Workers replace raw host authority ops", async () => {
+  const runtime = await source("crates/celld/js.rs");
+  const start = runtime.indexOf("const HOST_ONLY: &[&str] = &[");
+  const end = runtime.indexOf("];", start);
+  assert.ok(start >= 0 && end > start, "host-only op list is present");
+  const names = [...runtime.slice(start, end).matchAll(/\"(__[^\"]+)\"/g)]
+    .map((match) => match[1]);
+  for (const name of [
+    "__svc_call", "__svc_rpc", "__do_call", "__rpc_call",
+    "__storage_get", "__storage_put", "__sql_exec", "__alarm_set",
+    "__loader_fetch", "__loader_rpc", "__loader_drop",
+  ]) assert.ok(names.includes(name), `${name} is host-only`);
 });
 
 test("normal Workers retain inherited outbound behavior while brokers stay explicit", async () => {
@@ -138,6 +198,7 @@ test("host env injection materializes only opaque loaded-worker proxies", async 
   assert.match(bootstrap, /__makeLoaderCapability/);
   assert.match(bootstrap, /__setLoaderOutbound/);
   assert.match(bootstrap, /loader_capabilities/);
+  assert.match(runtime, /worker loader: host internal operation is unavailable/);
   assert.match(runtime, /CapabilityKind::Tools/);
   assert.match(runtime, /release_loader_capabilities/);
   assert.match(runtime, /release_loader_entry/);

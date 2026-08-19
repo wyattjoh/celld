@@ -1938,7 +1938,8 @@ globalThis.__makeLoader = () => {
           ? await req._consume() : req._bodyBytes;
         const r = JSON.parse(
           await __loader_fetch(
-            handle.id, handle.token, req.url, req.method, body_, headers));
+            handle.id, handle.token, req.url, req.method, body_, headers,
+            loaderAgentScope()));
         const body = r.streamId !== undefined
           ? new CelldHttpBodyStream(r.streamId)
           : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
@@ -1968,7 +1969,7 @@ globalThis.__makeLoader = () => {
           return __rpcDes(
             await __loader_rpc(
               handle.id, handle.token, entrypoint, path[0],
-              __rpcOut(encodedArgs, false)));
+              __rpcOut(encodedArgs, false), loaderAgentScope()));
         } finally {
           for (const [token, kind] of grants) {
             try {
@@ -2011,8 +2012,9 @@ globalThis.__makeLoader = () => {
       disposed = true;
       if (evictable && finalizer)
         finalizer.unregister(unregisterToken);
+      const agentScope = loaderAgentScope();
       handlePromise.then(
-        (handle) => __loader_drop(handle.id, handle.token), () => {},
+        (handle) => __loader_drop(handle.id, handle.token, agentScope), () => {},
       );
     };
     const stub = {

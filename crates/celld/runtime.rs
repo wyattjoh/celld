@@ -1109,16 +1109,18 @@ impl RuntimeManager {
             }
         }
         for handle in stopped {
+            let slot = handle.residency.slot().clone();
+            // Remove this Agent's loaded-worker registry entries before
+            // returning the cell to the pool. New capability and stub calls
+            // then fail immediately; the asynchronous release waits for
+            // in-flight calls before dropping host V8 roots.
+            js::evict_loader_agent(&slot, cell);
             // Give the cell back rather than shutting the isolate down: it
             // serves other cells. Taking the isolate for this turn is the
             // barrier — an event of this cell either finished its turn
             // before it, or has not started one — so closing its SQLite
             // cannot land under a handler that is mid-turn.
-            let _ = handle
-                .residency
-                .slot()
-                .turn(|worker| worker.own_cell(cell, None, false))
-                .await;
+            let _ = slot.turn(|worker| worker.own_cell(cell, None, false)).await;
             // Dropping the handle drops its residency, which is what gives
             // the isolate its place back — and what lets `retire` reclaim
             // the isolate once no cell is left in it.
