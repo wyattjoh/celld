@@ -1592,7 +1592,11 @@ globalThis.__makeLoaderCapability = (workerId, token, kind) => {
     disposed = true;
     if (__loaderCapabilityFinalizer && root)
       __loaderCapabilityFinalizer.unregister(unregisterToken);
-    __loaderCapabilityDrop(workerId, token, kind);
+    try {
+      __loaderCapabilityDrop(workerId, token, kind);
+    } catch (error) {
+      if (!String(error).includes("worker_disposed")) throw error;
+    }
   };
   const make = (path) => {
     // A nested method proxy keeps the root alive. The root finalizer therefore

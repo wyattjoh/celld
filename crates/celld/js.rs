@@ -4144,6 +4144,8 @@ fn loader_result_error(
         .any(|class| error.starts_with(&format!("worker loader: {}:", class.as_str())))
     {
         error
+    } else if error.starts_with("handler exceeded ") {
+        loader_interruption(celld_logic::capability::InterruptionClass::TimedOut, error)
     } else {
         loader_interruption(default, error)
     }
