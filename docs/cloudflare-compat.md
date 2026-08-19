@@ -229,8 +229,29 @@ new isolate for each loaded worker. These inputs are honored:
 `env`, and `globalOutbound: null` (no egress). The limits of workerd
 apply: 64 MiB of code and 1 MiB of env, plus the
 `CELLD_MAX_LOADED_WORKERS` limit. A loaded worker serves `fetch()` and
-single RPC method calls. Not yet available: `globalOutbound` as a
-Fetcher, capability stubs in `env`, awaitable or pipelined properties.
+single RPC method calls. An explicit capability sideband is available for
+the pinned Workspace filesystem surface:
+
+```js
+const worker = env.LOADER.load({
+  mainModule: "worker.js",
+  modules: { "worker.js": workerSource },
+  env: {
+    WORKSPACE: env.LOADER.capability("workspace", workspace),
+    plainConfig: { mode: "safe" },
+  },
+  globalOutbound: null,
+});
+```
+
+`WORKSPACE` is an opaque proxy; host objects and credentials never cross the
+isolate. Calls are single structured-clone method calls such as
+`WORKSPACE.fs.readFile(path, "utf8")`. celld checks the host owner, loaded
+worker, capability kind, and liveness before every call. `dispose()` on the
+worker or capability rejects new calls and releases host references after
+in-flight calls settle. Ordinary JSON `env` values and normal Worker
+`fetch()` behavior remain unchanged. A non-null `globalOutbound` Fetcher,
+awaitable properties, and pipelined capability calls remain unsupported.
 
 ## Computer filesystem-only Workspace
 

@@ -340,10 +340,22 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         if let Some(name) = config.loader_binding.as_deref() {
             lines.push_str(&format!("e[{:?}] = __makeLoader();\n", name));
         }
-        // A loaded worker's caller-supplied `env` (plain JSON values only in
-        // the walking skeleton) merges last, over the declared bindings.
+        // A loaded worker's caller-supplied plain JSON env merges last, over
+        // declared bindings. Explicit capabilities are injected separately
+        // so host objects and credentials never enter the JSON envelope.
         if let Some(env) = config.loader_env.as_deref() {
             lines.push_str(&format!("Object.assign(e, {});\n", env));
+        }
+        if let Some(worker_id) = config.loader_worker_id {
+            for capability in &config.loader_capabilities {
+                lines.push_str(&format!(
+                    "e[{:?}] = __makeLoaderCapability({:?}, {:?}, {:?});\n",
+                    capability.name,
+                    worker_id.to_string(),
+                    capability.token,
+                    capability.kind.as_str(),
+                ));
+            }
         }
         lines.push_str("})();");
         lines

@@ -23,8 +23,8 @@ use futures_util::StreamExt as _;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
@@ -71,6 +71,34 @@ pub(crate) const BARE_NODE_BUILTINS: &[&str] = &[
     "worker_threads",
     "zlib",
 ];
+
+thread_local! {
+    /// The pool slot whose isolate is currently entered on this thread.
+    /// Loader capability grants capture a weak reference here so a loaded
+    /// worker can call back into the exact host isolate that created it.
+    static CURRENT_SLOT: RefCell<Option<Weak<crate::pool::Slot>>> =
+        const { RefCell::new(None) };
+}
+
+/// Restore the prior host slot after one V8 turn.
+pub(crate) struct CurrentSlotGuard(Option<Weak<crate::pool::Slot>>);
+
+/// Mark `slot` as the host isolate for the duration of a synchronous turn.
+pub(crate) fn enter_slot(slot: &Arc<crate::pool::Slot>) -> CurrentSlotGuard {
+    CurrentSlotGuard(
+        CURRENT_SLOT.with(|current| current.borrow_mut().replace(Arc::downgrade(slot))),
+    )
+}
+
+fn current_slot() -> Option<Arc<crate::pool::Slot>> {
+    CURRENT_SLOT.with(|current| current.borrow().as_ref().and_then(Weak::upgrade))
+}
+
+impl Drop for CurrentSlotGuard {
+    fn drop(&mut self) {
+        CURRENT_SLOT.with(|current| *current.borrow_mut() = self.0.take());
+    }
+}
 
 /// The pending exception text from a TryCatch scope (a macro so it needs no
 /// bound on the crate-private scope traits).
@@ -1259,6 +1287,13 @@ pub enum ModuleSource {
     Wasm(bytes::Bytes),
 }
 
+#[derive(Clone)]
+struct LoaderCapabilityBinding {
+    name: String,
+    token: String,
+    kind: celld_logic::capability::CapabilityKind,
+}
+
 pub struct WorkerConfig {
     src: String,
     pub script_name: String,
@@ -1289,6 +1324,10 @@ pub struct WorkerConfig {
     /// `triggers.crons` from the deployment. Empty for a loaded worker and for
     /// any script without cron triggers.
     pub crons: Vec<String>,
+    /// The identity of this loaded worker, if it was created by a host Loader.
+    loader_worker_id: Option<u64>,
+    /// Opaque capability bindings materialized after plain JSON env values.
+    loader_capabilities: Vec<LoaderCapabilityBinding>,
 }
 
 pub struct WorkerConfigOptions {
@@ -1338,6 +1377,8 @@ impl WorkerConfig {
             egress: EgressPolicy::Allow,
             loader_env: None,
             crons: Vec::new(),
+            loader_worker_id: None,
+            loader_capabilities: Vec::new(),
         }
     }
 
@@ -1362,6 +1403,17 @@ impl WorkerConfig {
     /// Merge `env` (a JSON object string) onto a loaded worker's `env`.
     fn with_loader_env(mut self, env: Option<String>) -> Self {
         self.loader_env = env;
+        self
+    }
+
+    /// Identify a loaded worker and inject its opaque capability proxies.
+    fn with_loader_capabilities(
+        mut self,
+        worker_id: u64,
+        capabilities: Vec<LoaderCapabilityBinding>,
+    ) -> Self {
+        self.loader_worker_id = Some(worker_id);
+        self.loader_capabilities = capabilities;
         self
     }
 
@@ -1591,11 +1643,27 @@ enum EgressPolicy {
     Deny,
 }
 
+static NEXT_CAPABILITY_OWNER: AtomicU64 = AtomicU64::new(1);
+
+struct HostCapability {
+    owner: celld_logic::capability::OwnerId,
+    kind: celld_logic::capability::CapabilityKind,
+    target: v8::Global<v8::Value>,
+}
+
 #[derive(Default)]
 struct ActorRuntimeState {
     promises: std::sync::Mutex<PromiseMap>,
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
+    /// Host-side targets are rooted only by their owning isolate and are
+    /// removed on loaded-worker capability disposal.
+    capabilities: std::sync::Mutex<HashMap<String, HostCapability>>,
+    /// Identity used to bind capability calls to their creating host.
+    owner_id: celld_logic::capability::OwnerId,
+    /// A non-`None` value means this isolate is a loaded worker and may issue
+    /// calls only for this worker identity.
+    loader_worker_id: Option<u64>,
     egress: EgressPolicy,
 }
 
@@ -1738,6 +1806,8 @@ impl Drop for WorkerIsolate {
 pub enum Answer {
     Fetch(tokio::sync::oneshot::Sender<Result<HttpResponse>>),
     Rpc(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
+    /// A loaded-worker capability call answers structured-clone bytes.
+    Capability(tokio::sync::oneshot::Sender<Result<Vec<u8>>>),
     /// A DO method call, which answers a value rather than a response.
     CellRpc(tokio::sync::oneshot::Sender<Result<RpcOutcome>>),
     /// A `webSocketMessage`, which answers the frames the output gate held
@@ -1756,6 +1826,7 @@ impl Answer {
         match self {
             Answer::Fetch(reply) => drop(reply.send(Err(error))),
             Answer::Rpc(reply) => drop(reply.send(Err(error))),
+            Answer::Capability(reply) => drop(reply.send(Err(error))),
             Answer::CellRpc(reply) => drop(reply.send(Err(error))),
             Answer::WsMessage(reply) => drop(reply.send(Err(error))),
             Answer::Ack(reply) => drop(reply.send(Err(error))),
@@ -1845,6 +1916,11 @@ impl InFlight {
             Answer::Rpc(reply) => {
                 let read =
                     view_bytes(value).ok_or_else(|| anyhow!("entrypoint RPC answered non-bytes"));
+                send_and_end(tc, reply, read)
+            }
+            Answer::Capability(reply) => {
+                let read = view_bytes(value)
+                    .ok_or_else(|| anyhow!("loaded-worker capability answered non-bytes"));
                 send_and_end(tc, reply, read)
             }
             Answer::CellRpc(reply) => {
@@ -2214,6 +2290,33 @@ impl Worker {
         restore_trace(tc, previous);
         ops
     }
+
+    /// Release host-side capability targets while this isolate is entered.
+    /// V8 persistent handles must be dropped under their owning isolate's
+    /// locker; the loader lifecycle waits for in-flight calls before calling
+    /// this method.
+    pub(crate) fn release_loader_capabilities(&mut self, owner: u64, tokens: &[String]) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let cs = &mut v8::ContextScope::new(hs, realm.context);
+        let runtime_state = actor_runtime_state(cs);
+        let mut state = runtime_state
+            .capabilities
+            .lock()
+            .expect("capability registry poisoned");
+        for token in tokens {
+            if state
+                .get(token)
+                .is_some_and(|capability| capability.owner == owner)
+            {
+                state.remove(token);
+            }
+        }
+    }
 }
 
 /// Close a turn, whatever the turn did.
@@ -2288,6 +2391,14 @@ fn begin<'s>(
     job: crate::WorkerJob,
 ) -> Begun {
     let job = match job {
+        crate::WorkerJob::Capability {
+            owner,
+            token,
+            kind,
+            path,
+            args,
+            reply,
+        } => return begin_capability(tc, owner, token, kind, path, args, reply),
         crate::WorkerJob::Rpc {
             entrypoint,
             method,
@@ -2401,6 +2512,72 @@ fn begin_entrypoint_rpc(
                 request_id: None,
                 active_request_id: None,
                 reply: Some(Answer::Rpc(reply)),
+                background: None,
+                ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: Instant::now(),
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+/// Start one host-side loaded-worker capability call. The dispatcher resolves
+/// the opaque target in this isolate, invokes exactly one method, and returns
+/// the result through the structured-clone envelope.
+fn begin_capability(
+    tc: &mut v8::PinScope,
+    owner: String,
+    token: String,
+    kind: String,
+    path: Vec<String>,
+    args: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let context = IoContext::new();
+    let guard = CurrentGuard::enter(context.clone());
+    let started = (|| {
+        let f = dispatcher(tc, "__dispatchLoaderCapability")?;
+        let owner = v8::String::new(tc, &owner).unwrap();
+        let token = v8::String::new(tc, &token).unwrap();
+        let kind = v8::String::new(tc, &kind).unwrap();
+        let path = v8::String::new(tc, &serde_json::to_string(&path)?).unwrap();
+        let args = bytes_value(tc, args);
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = f
+            .call(
+                tc,
+                recv,
+                &[owner.into(), token.into(), kind.into(), path.into(), args],
+            )
+            .ok_or_else(|| anyhow!("loaded-worker capability dispatcher threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Capability(reply)),
                 background: None,
                 ops: std::collections::HashSet::new(),
                 alarm: None,
@@ -2993,6 +3170,8 @@ impl Worker {
         });
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
+            owner_id: NEXT_CAPABILITY_OWNER.fetch_add(1, Ordering::Relaxed),
+            loader_worker_id: config.loader_worker_id,
             egress: config.egress,
             ..Default::default()
         });
@@ -3416,6 +3595,9 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_load" => op_loader_load,
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
+        "__loader_capability_call" => op_loader_capability_call,
+        "__loader_capability_drop" => op_loader_capability_drop,
+        "__loader_capability_target" => op_loader_capability_target,
         "__loader_drop" => op_loader_drop,
         "__do_call" => op_do_call,
         "__writePosition" => op_write_position,
@@ -3634,12 +3816,123 @@ enum LoaderState {
     Failed(Arc<str>),
 }
 
-type LoaderRegistry = HashMap<u64, tokio::sync::watch::Receiver<LoaderState>>;
+/// A call reference keeps a loaded worker's host capabilities rooted until
+/// the call settles, while disposal rejects only new calls.
+struct CapabilityLifecycle {
+    state: AtomicBool,
+    in_flight: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl CapabilityLifecycle {
+    fn live() -> Self {
+        Self {
+            state: AtomicBool::new(true),
+            in_flight: AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn dispose(&self) {
+        self.state.store(false, Ordering::Release);
+        self.idle.notify_waiters();
+    }
+
+    fn acquire(self: &Arc<Self>, what: &str) -> Result<CapabilityCallGuard, String> {
+        if !self.is_live() {
+            return Err(format!("worker loader: {what} capability is disposed"));
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        // Disposal can race the increment. Recheck after reserving the call so
+        // a post-disposal caller cannot sneak through the lifetime edge.
+        if !self.is_live() {
+            self.release_call();
+            return Err(format!("worker loader: {what} capability is disposed"));
+        }
+        Ok(CapabilityCallGuard(self.clone()))
+    }
+
+    fn release_call(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            self.idle.notified().await;
+        }
+    }
+}
+
+struct CapabilityCallGuard(Arc<CapabilityLifecycle>);
+
+impl Drop for CapabilityCallGuard {
+    fn drop(&mut self) {
+        self.0.release_call();
+    }
+}
+
+#[cfg(test)]
+mod loader_capability_tests {
+    use super::*;
+
+    #[test]
+    fn disposal_rejects_new_calls_but_keeps_existing_call_rooted() {
+        let lifecycle = Arc::new(CapabilityLifecycle::live());
+        let call = lifecycle.acquire("workspace").expect("live capability");
+        lifecycle.dispose();
+        assert!(!lifecycle.is_live());
+        assert_eq!(lifecycle.in_flight.load(Ordering::Acquire), 1);
+        assert!(lifecycle.acquire("workspace").is_err());
+        drop(call);
+        assert_eq!(lifecycle.in_flight.load(Ordering::Acquire), 0);
+    }
+}
+
+struct LoadedCapability {
+    grant: celld_logic::capability::CapabilityGrant,
+    lifecycle: Arc<CapabilityLifecycle>,
+}
+
+struct LoadedWorkerEntry {
+    state: tokio::sync::watch::Receiver<LoaderState>,
+    owner: celld_logic::capability::OwnerId,
+    host_slot: Weak<crate::pool::Slot>,
+    capabilities: HashMap<String, Arc<LoadedCapability>>,
+    lifecycle: Arc<CapabilityLifecycle>,
+}
+
+type LoaderRegistry = HashMap<u64, Arc<LoadedWorkerEntry>>;
 static LOADER_REGISTRY: OnceLock<std::sync::Mutex<LoaderRegistry>> = OnceLock::new();
 static LOADER_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static LOADER_CAPABILITY_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
     LOADER_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn next_capability_token(owner: u64, worker: u64) -> String {
+    let sequence = LOADER_CAPABILITY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("cap-{owner:016x}-{worker:016x}-{sequence:016x}")
+}
+
+fn capability_error(error: celld_logic::capability::AuthorizationError) -> String {
+    use celld_logic::capability::AuthorizationError;
+    match error {
+        AuthorizationError::Unknown => "worker loader: unknown capability".into(),
+        AuthorizationError::OwnerMismatch => "worker loader: capability owner mismatch".into(),
+        AuthorizationError::WorkerMismatch => "worker loader: capability worker mismatch".into(),
+        AuthorizationError::KindMismatch => "worker loader: capability kind mismatch".into(),
+        AuthorizationError::NotLive => "worker loader: capability is disposed".into(),
+    }
 }
 
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
@@ -3763,8 +4056,9 @@ fn op_loader_load(
             ),
         );
     }
-    // Plain JSON `env` values merge onto the loaded worker's env; capability
-    // stubs are not yet supported and would fail to serialize upstream in JS.
+    // Plain JSON `env` values merge onto the loaded worker's env. Explicit
+    // capabilities arrive in a separate V8 sideband so JSON.stringify never
+    // copies a host object, credential, or function into the loaded isolate.
     let loader_env = code
         .get("env")
         .filter(|v| !v.is_null())
@@ -3781,6 +4075,21 @@ fn op_loader_load(
             );
         }
     }
+    let host_state = actor_runtime_state(scope);
+    let capability_sideband = args.get(2);
+    let host_slot = if capability_sideband.is_undefined() {
+        Weak::new()
+    } else {
+        let Some(slot) = current_slot() else {
+            return loader_throw(
+                scope,
+                "worker loader: capability grants require an entered host isolate",
+            );
+        };
+        Arc::downgrade(&slot)
+    };
+    let owner = host_state.owner_id;
+
     // globalOutbound: absent inherits the caller's authority, null denies
     // ambient egress, a Fetcher (broker) is not implemented yet.
     let egress = match code.get("globalOutbound") {
@@ -3811,6 +4120,86 @@ fn op_loader_load(
     }));
     compat.js_rpc = true;
     let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut loader_capabilities = Vec::new();
+    let mut loaded_capabilities = HashMap::new();
+    let mut host_capabilities = Vec::new();
+    if !capability_sideband.is_undefined() {
+        let Ok(entries) = v8::Local::<v8::Array>::try_from(capability_sideband) else {
+            return loader_throw(scope, "worker loader: capabilities must be an array");
+        };
+        for index in 0..entries.length() {
+            let Some(pair) = entries
+                .get_index(scope, index)
+                .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+            else {
+                return loader_throw(scope, "worker loader: malformed capability entry");
+            };
+            let Some(name) = pair.get_index(scope, 0).filter(|value| value.is_string()) else {
+                return loader_throw(scope, "worker loader: capability name must be a string");
+            };
+            let Some(kind_value) = pair.get_index(scope, 1).filter(|value| value.is_string())
+            else {
+                return loader_throw(scope, "worker loader: capability kind must be a string");
+            };
+            let Some(target) = pair.get_index(scope, 2) else {
+                return loader_throw(scope, "worker loader: capability target is missing");
+            };
+            let name = name.to_rust_string_lossy(scope);
+            let kind_name = kind_value.to_rust_string_lossy(scope);
+            let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+                return loader_throw(
+                    scope,
+                    &format!("worker loader: unsupported capability kind {kind_name:?}"),
+                );
+            };
+            if kind != celld_logic::capability::CapabilityKind::Workspace {
+                return loader_throw(
+                    scope,
+                    &format!("worker loader: capability kind {kind_name:?} is not enabled yet"),
+                );
+            }
+            if !target.is_object() || loaded_capabilities.contains_key(&name) {
+                return loader_throw(
+                    scope,
+                    &format!("worker loader: invalid or duplicate capability {name:?}"),
+                );
+            }
+            let token = next_capability_token(owner, id);
+            let lifecycle = Arc::new(CapabilityLifecycle::live());
+            let grant = celld_logic::capability::CapabilityGrant {
+                owner,
+                worker: id,
+                kind,
+            };
+            loader_capabilities.push(LoaderCapabilityBinding {
+                name: name.clone(),
+                token: token.clone(),
+                kind,
+            });
+            loaded_capabilities.insert(
+                token.clone(),
+                Arc::new(LoadedCapability {
+                    grant,
+                    lifecycle: lifecycle.clone(),
+                }),
+            );
+            host_capabilities.push((
+                token,
+                HostCapability {
+                    owner,
+                    kind,
+                    target: v8::Global::new(scope, target),
+                },
+            ));
+        }
+    }
+    if !host_capabilities.is_empty() {
+        host_state
+            .capabilities
+            .lock()
+            .expect("capability registry poisoned")
+            .extend(host_capabilities);
+    }
     let config = Arc::new(
         WorkerConfig::new(WorkerConfigOptions {
             src,
@@ -3828,24 +4217,38 @@ fn op_loader_load(
             compat,
         })
         .with_egress(egress)
-        .with_loader_env(loader_env),
+        .with_loader_env(loader_env)
+        .with_loader_capabilities(id, loader_capabilities),
     );
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,
         Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
     };
     let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
-    loader_registry().lock().unwrap().insert(id, state);
+    let lifecycle = Arc::new(CapabilityLifecycle::live());
+    let entry = Arc::new(LoadedWorkerEntry {
+        state,
+        owner,
+        host_slot,
+        capabilities: loaded_capabilities,
+        lifecycle: lifecycle.clone(),
+    });
+    loader_registry().lock().unwrap().insert(id, entry);
     handle.spawn(async move {
         let state =
             match tokio::task::spawn_blocking(move || Worker::load_config(config, &[])).await {
-                Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+                Ok(Ok(worker)) => {
+                    loaded.send_replace(LoaderState::Ready(crate::pool::Slot::standalone(worker)));
+                    return;
+                }
                 Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
                 Err(error) => LoaderState::Failed(Arc::from(format!(
                     "worker loader: load task failed: {error}"
                 ))),
             };
+        lifecycle.dispose();
         loaded.send_replace(state);
+        release_loader_entry_by_id(id).await;
     });
     rv.set(v8::Number::new(scope, id as f64).into());
 }
@@ -3865,8 +4268,9 @@ fn op_loader_fetch(
         serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)).unwrap_or_default();
     let loaded = loader_registry().lock().unwrap().get(&id).cloned();
     let async_id = asyncrt::enqueue(async move {
-        let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
-        let slot = loaded_worker_slot(state).await?;
+        let entry = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
+        let _call = entry.lifecycle.acquire("worker")?;
+        let slot = loaded_worker_slot(entry.state.clone()).await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::Fetch {
             queued_at: Instant::now(),
@@ -3904,8 +4308,9 @@ fn op_loader_rpc(
     let call_args = view_bytes(args.get(3)).unwrap_or_default();
     let loaded = loader_registry().lock().unwrap().get(&id).cloned();
     let async_id = asyncrt::enqueue(async move {
-        let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
-        let slot = loaded_worker_slot(state).await?;
+        let entry = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
+        let _call = entry.lifecycle.acquire("worker")?;
+        let slot = loaded_worker_slot(entry.state.clone()).await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::Rpc {
             entrypoint,
@@ -3926,22 +4331,219 @@ fn op_loader_rpc(
     rv.set(promise_for(scope, async_id));
 }
 
+async fn release_loader_entry(entry: Arc<LoadedWorkerEntry>) {
+    entry.lifecycle.wait_idle().await;
+    let mut tokens = Vec::with_capacity(entry.capabilities.len());
+    for (token, capability) in &entry.capabilities {
+        capability.lifecycle.dispose();
+        capability.lifecycle.wait_idle().await;
+        tokens.push(token.clone());
+    }
+    let Some(slot) = entry.host_slot.upgrade() else {
+        return;
+    };
+    slot.turn(move |worker| worker.release_loader_capabilities(entry.owner, &tokens))
+        .await;
+}
+
+async fn release_loader_entry_by_id(id: u64) {
+    let Some(entry) = loader_registry().lock().unwrap().remove(&id) else {
+        return;
+    };
+    entry.lifecycle.dispose();
+    release_loader_entry(entry).await;
+}
+
+/// `__loader_capability_call(workerId, token, kind, pathJson, argsSc)` ->
+/// Promise<Uint8Array>. The loaded worker's opaque proxy enters here; the
+/// registry checks identity and liveness before a job re-enters its host
+/// isolate.
+fn op_loader_capability_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let requested_worker = args.get(0).to_rust_string_lossy(scope);
+    let Ok(requested_worker) = requested_worker.parse::<u64>() else {
+        return loader_throw(scope, "worker loader: malformed capability worker");
+    };
+    let token = args.get(1).to_rust_string_lossy(scope);
+    let kind_name = args.get(2).to_rust_string_lossy(scope);
+    let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+        return loader_throw(scope, "worker loader: unsupported capability kind");
+    };
+    let path = match serde_json::from_str::<Vec<String>>(&args.get(3).to_rust_string_lossy(scope)) {
+        Ok(path) if !path.is_empty() => path,
+        _ => return loader_throw(scope, "worker loader: capability method path is invalid"),
+    };
+    let call_args = view_bytes(args.get(4)).unwrap_or_default();
+    let state = actor_runtime_state(scope);
+    let Some(actual_worker) = state.loader_worker_id else {
+        return loader_throw(
+            scope,
+            "worker loader: capability calls require a loaded worker",
+        );
+    };
+    if actual_worker != requested_worker {
+        return loader_throw(scope, "worker loader: capability worker mismatch");
+    }
+    let loaded = loader_registry()
+        .lock()
+        .unwrap()
+        .get(&requested_worker)
+        .cloned();
+    let Some(entry) = loaded else {
+        return loader_throw(scope, "worker loader: unknown worker");
+    };
+    let Some(capability) = entry.capabilities.get(&token).cloned() else {
+        return loader_throw(
+            scope,
+            &capability_error(celld_logic::capability::AuthorizationError::Unknown),
+        );
+    };
+    if let Err(error) = celld_logic::capability::authorize(
+        Some(capability.grant),
+        entry.owner,
+        requested_worker,
+        kind,
+        entry.lifecycle.is_live() && capability.lifecycle.is_live(),
+    ) {
+        return loader_throw(scope, &capability_error(error));
+    }
+    let worker_call = match entry.lifecycle.acquire("worker") {
+        Ok(call) => call,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let capability_call = match capability.lifecycle.acquire("capability") {
+        Ok(call) => call,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let Some(host_slot) = entry.host_slot.upgrade() else {
+        return loader_throw(scope, "worker loader: capability host is no longer live");
+    };
+    let owner = entry.owner.to_string();
+    let job_kind = kind.as_str().to_string();
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let job = crate::WorkerJob::Capability {
+        owner,
+        token,
+        kind: job_kind,
+        path,
+        args: call_args,
+        reply,
+    };
+    let async_id = asyncrt::enqueue(async move {
+        let _worker_call = worker_call;
+        let _capability_call = capability_call;
+        let driving = tokio::spawn(crate::runtime::drive(host_slot, job, None));
+        match receive.await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("capability host task died: {error}")),
+                Ok(()) => Err("capability host dropped result".to_string()),
+            },
+        }
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+/// Dispose one capability without disposing its loaded worker. Existing calls
+/// are allowed to settle; the host target is released once they do.
+fn op_loader_capability_drop(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let worker = args.get(0).to_rust_string_lossy(scope).parse::<u64>();
+    let Ok(worker) = worker else {
+        return loader_throw(scope, "worker loader: malformed capability worker");
+    };
+    let token = args.get(1).to_rust_string_lossy(scope);
+    let kind_name = args.get(2).to_rust_string_lossy(scope);
+    let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+        return loader_throw(scope, "worker loader: unsupported capability kind");
+    };
+    let state = actor_runtime_state(scope);
+    if state.loader_worker_id != Some(worker) {
+        return loader_throw(scope, "worker loader: capability worker mismatch");
+    }
+    let entry = loader_registry().lock().unwrap().get(&worker).cloned();
+    let Some(entry) = entry else {
+        return loader_throw(scope, "worker loader: unknown worker");
+    };
+    let Some(capability) = entry.capabilities.get(&token).cloned() else {
+        return loader_throw(scope, "worker loader: unknown capability");
+    };
+    if let Err(error) = celld_logic::capability::authorize(
+        Some(capability.grant),
+        entry.owner,
+        worker,
+        kind,
+        entry.lifecycle.is_live() && capability.lifecycle.is_live(),
+    ) {
+        return loader_throw(scope, &capability_error(error));
+    }
+    capability.lifecycle.dispose();
+    let host_slot = entry.host_slot.clone();
+    let owner = entry.owner;
+    asyncrt::op_handle().spawn(async move {
+        capability.lifecycle.wait_idle().await;
+        let Some(slot) = host_slot.upgrade() else {
+            return;
+        };
+        slot.turn(move |worker| {
+            worker.release_loader_capabilities(owner, std::slice::from_ref(&token))
+        })
+        .await;
+    });
+}
+
+/// Resolve a capability target in its owning host isolate. This op is only
+/// called by the host-side dispatcher, never by the loaded worker.
+fn op_loader_capability_target(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let owner = args.get(0).to_rust_string_lossy(scope).parse::<u64>();
+    let Ok(owner) = owner else {
+        return loader_throw(scope, "worker loader: malformed capability owner");
+    };
+    let token = args.get(1).to_rust_string_lossy(scope);
+    let kind_name = args.get(2).to_rust_string_lossy(scope);
+    let Some(kind) = celld_logic::capability::CapabilityKind::parse(&kind_name) else {
+        return loader_throw(scope, "worker loader: unsupported capability kind");
+    };
+    let state = actor_runtime_state(scope);
+    if state.owner_id != owner {
+        return loader_throw(scope, "worker loader: capability owner mismatch");
+    }
+    let capabilities = state
+        .capabilities
+        .lock()
+        .expect("capability registry poisoned");
+    let Some(capability) = capabilities
+        .get(&token)
+        .filter(|capability| capability.owner == owner && capability.kind == kind)
+    else {
+        return loader_throw(scope, "worker loader: unknown or mismatched capability");
+    };
+    rv.set(v8::Local::new(scope, &capability.target));
+}
+
 /// `__loader_drop(id)` — evict a loaded worker. Called from a
-/// FinalizationRegistry when its stub is GC'd. Removing the registry entry
-/// drops the isolate after any calls that already cloned its load state end.
+/// FinalizationRegistry when its stub is GC'd. New calls fail immediately;
+/// host references are released after in-flight calls settle.
 fn op_loader_drop(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    if let Some(state) = loader_registry().lock().unwrap().remove(&id) {
-        // This op runs while the parent isolate is entered. The load state can
-        // own the loaded isolate, and V8 forbids dropping one isolate while a
-        // different isolate is entered on the same thread. Hand the final
-        // reference to the host scheduler so destruction happens after this
-        // turn has left V8.
-        asyncrt::op_handle().spawn(async move { drop(state) });
+    if let Some(entry) = loader_registry().lock().unwrap().remove(&id) {
+        entry.lifecycle.dispose();
+        asyncrt::op_handle().spawn(release_loader_entry(entry));
     }
 }
 

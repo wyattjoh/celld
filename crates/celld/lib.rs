@@ -194,6 +194,17 @@ pub enum WorkerJob {
         args: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
+    /// Invoke one explicitly granted loaded-worker capability in its host
+    /// isolate. The arguments and result use the same structured-clone bytes
+    /// as entrypoint RPC.
+    Capability {
+        owner: String,
+        token: String,
+        kind: String,
+        path: Vec<String>,
+        args: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
 }
 
 /// Temporary host seam required by the verbatim JS adapter. The runtime

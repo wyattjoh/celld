@@ -72,7 +72,7 @@ impl Slot {
     /// Only the gate is awaited; `f` is synchronous by type, so holding the
     /// isolate across an await is unwritable rather than a rule a comment
     /// asks callers to remember.
-    pub async fn turn<T>(&self, f: impl FnOnce(&mut js::Worker) -> T) -> T {
+    pub async fn turn<T>(self: &Arc<Self>, f: impl FnOnce(&mut js::Worker) -> T) -> T {
         struct Counted<'a>(&'a Slot);
         impl Drop for Counted<'_> {
             fn drop(&mut self) {
@@ -86,6 +86,7 @@ impl Slot {
             Some(worker) => worker,
             None => panic!("entered isolate {} after it was freed", self.id),
         };
+        let _host_slot = js::enter_slot(self);
         f(worker)
     }
 

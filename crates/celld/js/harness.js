@@ -1560,8 +1560,77 @@ const __wrapServiceResponse = (res, url) => {
 // `[[services]]` binding: a Fetcher pointed at another Worker in this
 // process. No identity to resolve, so it goes straight to __svc_call.
 // Worker Loader (Code Mode): spawn a fresh isolate from supplied code and
-// invoke it. Walking skeleton — only `load(code)` and a default-entrypoint
-// `fetch()` are wired, mirroring the cross-isolate service-binding path below.
+// invoke it. Capability values use an explicit sideband form rather than
+// JSON. The target remains rooted in the host isolate; loaded code sees only
+// this opaque method proxy.
+const __loaderCapabilitySafe = (value) =>
+  typeof value === "string" && value.length > 0 && value.length <= 128 &&
+  value !== "__proto__" && value !== "prototype" && value !== "constructor";
+
+globalThis.__makeLoaderCapability = (workerId, token, kind) => {
+  let disposed = false;
+  const drop = () => {
+    if (disposed) return;
+    disposed = true;
+    __loader_capability_drop(workerId, token, kind);
+  };
+  const make = (path) => new Proxy(function () {}, {
+    get: (_base, prop) => {
+      if (prop === "then") return undefined;
+      if (prop === "dispose" || prop === Symbol.dispose) return drop;
+      if (typeof prop !== "string") return undefined;
+      return make([...path, prop]);
+    },
+    apply: (_base, _this, args) => {
+      if (disposed)
+        return Promise.reject(new Error(
+          "worker loader: capability proxy is disposed"));
+      if (path.length === 0)
+        return Promise.reject(new TypeError(
+          "worker loader: capability root is not callable"));
+      let encoded;
+      try {
+        encoded = __rpcOut(args, false);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return __loader_capability_call(
+        workerId, token, kind, JSON.stringify(path), encoded,
+      ).then(__rpcDes);
+    },
+  });
+  return make([]);
+};
+
+globalThis.__dispatchLoaderCapability =
+  (owner, token, kind, pathJson, argsBytes) => __rpcRun(async () => {
+    const path = JSON.parse(pathJson);
+    if (!Array.isArray(path) || path.length < 1 || path.length > 8 ||
+        path.some((part) => !__loaderCapabilitySafe(part))) {
+      throw new TypeError("worker loader: invalid capability method path");
+    }
+    // Ticket 06 deliberately exposes only the pinned Workspace filesystem
+    // surface. Fetcher brokers and other capability kinds are later work.
+    if (kind !== "workspace" || path.length !== 2 || path[0] !== "fs")
+      throw new TypeError(
+        "worker loader: only Workspace fs method calls are supported");
+    const target = __loader_capability_target(owner, token, kind);
+    let receiver = target;
+    for (let i = 0; i < path.length - 1; i++) {
+      receiver = receiver[path[i]];
+      if (receiver === null || receiver === undefined)
+        throw new TypeError("worker loader: capability path is not present");
+    }
+    const method = receiver[path[path.length - 1]];
+    if (typeof method !== "function")
+      throw new TypeError(
+        "worker loader: capability path does not name a method");
+    const callArgs = __sc_decode(argsBytes);
+    if (!Array.isArray(callArgs))
+      throw new TypeError("worker loader: capability arguments must be an array");
+    return Reflect.apply(method, receiver, callArgs);
+  }, false);
+
 globalThis.__makeLoader = () => {
   // `get(name, …)` is memoized by name to one isolate; `load()` is anonymous.
   // A stub holds a Promise<id> so `getCode` may be async and load lazily.
@@ -1655,15 +1724,67 @@ globalThis.__makeLoader = () => {
     }
     return { config: { ...c, modules }, wasm };
   };
+  const capabilityDescriptor = (value) => {
+    if (value === null || typeof value !== "object" ||
+        !Object.hasOwn(value, "__celldCapability")) return null;
+    const marker = value.__celldCapability;
+    if (typeof marker === "string")
+      return { kind: marker, target: value.target ?? value.value };
+    if (marker !== null && typeof marker === "object")
+      return { kind: marker.kind, target: marker.target ?? marker.value };
+    return null;
+  };
+  // Keep capability targets out of JSON. The explicit marker is required so
+  // an ordinary object in the legacy JSON env keeps its old by-value behavior.
+  const encodeEnvironment = (c) => {
+    if (c === null || typeof c !== "object")
+      return { config: c, capabilities: [] };
+    const capabilities = [];
+    const config = { ...c };
+    if (c.env !== null && typeof c.env === "object" && !Array.isArray(c.env)) {
+      const env = {};
+      for (const [name, value] of Object.entries(c.env)) {
+        const descriptor = capabilityDescriptor(value);
+        if (descriptor !== null) {
+          capabilities.push([name, descriptor.kind, descriptor.target]);
+        } else {
+          env[name] = value;
+        }
+      }
+      config.env = env;
+    }
+    if (c.capabilities !== null && typeof c.capabilities === "object" &&
+        !Array.isArray(c.capabilities)) {
+      for (const [name, value] of Object.entries(c.capabilities)) {
+        const descriptor = capabilityDescriptor(value);
+        if (descriptor === null)
+          throw new TypeError(
+            "worker loader: capabilities must use the explicit capability form");
+        capabilities.push([name, descriptor.kind, descriptor.target]);
+      }
+      delete config.capabilities;
+    }
+    return { config, capabilities };
+  };
   // getCode is deferred into a microtask so a throw (or async getCode)
   // surfaces as a rejection when the worker is first used, not at get()/load().
   const loadFrom = (getCode) =>
     Promise.resolve().then(getCode)
       .then((c) => {
-        const { config, wasm } = encodeModules(c);
-        return __loader_load(JSON.stringify(config), wasm);
+        const { config: modulesConfig, wasm } = encodeModules(c);
+        const { config, capabilities } = encodeEnvironment(modulesConfig);
+        return capabilities.length === 0
+          ? __loader_load(JSON.stringify(config), wasm)
+          : __loader_load(JSON.stringify(config), wasm, capabilities);
       });
   return {
+    // Explicit form for a host object in WorkerCode.env. The target never
+    // enters JSON; encodeEnvironment moves it to the capability sideband.
+    capability(kind, target) {
+      return Object.freeze({
+        __celldCapability: Object.freeze({ kind, target }),
+      });
+    },
     load(code) { return makeStub(loadFrom(() => code), true); },
     get(name, getCode) {
       let idPromise = byName.get(name);

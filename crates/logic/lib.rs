@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub mod alarm;
 pub mod cache;
+pub mod capability;
 pub mod cell;
 pub mod cron;
 pub mod dead_node_reconciliation;
