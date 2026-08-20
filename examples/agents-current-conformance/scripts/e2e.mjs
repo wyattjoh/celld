@@ -78,6 +78,17 @@ function messageText(message) {
     .join("") ?? "";
 }
 
+function toolParts(messages, name) {
+  return messages
+    .flatMap((message) => message?.parts ?? [])
+    .filter((part) => part?.type === `tool-${name}` ||
+      (part?.type === "dynamic-tool" && part.toolName === name));
+}
+
+function lastToolPart(messages, name) {
+  return toolParts(messages, name).at(-1);
+}
+
 async function websocketConversation(name, message) {
   if (typeof WebSocket !== "function") {
     throw new Error("current Node runtime does not expose WebSocket; use Node 22+ for the public WS check");
@@ -115,6 +126,21 @@ async function websocketConversation(name, message) {
   await closed;
   socket.removeEventListener("message", onMessage);
   return { connected, received, frames };
+}
+
+async function clearChat(name) {
+  const socket = new WebSocket(websocketUrl(name));
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, { once: true });
+    socket.addEventListener("error", () => reject(new Error(`WebSocket ${name} failed while clearing chat`)), { once: true });
+  });
+  socket.send(JSON.stringify({ type: "cf_agent_chat_clear" }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const closed = new Promise((resolve) => socket.addEventListener("close", resolve, { once: true }));
+  socket.close();
+  await closed;
+  const messages = await json(`/agents/current-conformance-agent/${name}/get-messages`);
+  expect(messages.length === 0, `${name} chat clear did not make the run repeatable`);
 }
 
 async function websocketChat(name, text, body = {}) {
@@ -187,6 +213,9 @@ await step("current target readiness", async () => {
   const result = await json("/current/names");
   expect(result.results?.length === 2, "expected alpha and beta current Agent results");
   expect(result.results.every((entry) => ["alpha", "beta"].includes(entry.agent)), "current Agent names were not isolated");
+  const reset = await post("/current/memories/reset", {});
+  expect(reset.results?.every((entry) => entry.total === 0), "memory reset did not make the run repeatable");
+  await Promise.all([clearChat("alpha"), clearChat("beta")]);
 });
 
 await step("standard current SDK HTTP route", async () => {
@@ -238,6 +267,78 @@ await step("AIChatAgent streams and persists a deterministic conversation", asyn
   expect(messageText(completedTranscript.at(-2)) === "stream a deterministic response", "persisted user message changed");
   expect(completedTranscript.at(-1)?.role === "assistant", "completed transcript did not persist the assistant message");
   expect(messageText(completedTranscript.at(-1)) === "Deterministic streamed response.", "persisted assistant response was not deterministic");
+});
+
+const durableFact = "alpha durable memory";
+let memoryTranscript;
+await step("schema-validated tools persist explicit memory outside chat messages", async () => {
+  await websocketChat("alpha", `[tool-remember] ${durableFact}`);
+  memoryTranscript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const toolPart = lastToolPart(memoryTranscript, "rememberFact");
+  expect(toolPart?.state === "output-available", "rememberFact did not persist a completed tool result");
+  expect(toolPart.output?.memory?.fact === durableFact, "rememberFact returned the wrong durable fact");
+
+  const [alpha, beta] = await Promise.all([
+    json("/agents/current-conformance-agent/alpha/status"),
+    json("/agents/current-conformance-agent/beta/status"),
+  ]);
+  expect(alpha.memories?.length === 1 && alpha.memories[0]?.fact === durableFact, "alpha status did not expose its explicit memory");
+  expect(beta.memories?.length === 0, "alpha memory leaked into beta");
+});
+
+await step("list and summary tools remain bounded to the named Agent", async () => {
+  await websocketChat("alpha", "[tool-list]");
+  const alphaMessages = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const listPart = lastToolPart(alphaMessages, "listMemories");
+  expect(listPart?.output?.total === 1, "listMemories returned the wrong bounded count");
+  expect(listPart.output.memories?.[0]?.fact === durableFact, "listMemories omitted alpha's fact");
+
+  await websocketChat("beta", "[tool-summarize]");
+  const betaMessages = await json("/agents/current-conformance-agent/beta/get-messages");
+  const summaryPart = lastToolPart(betaMessages, "summarizeMemories");
+  expect(summaryPart?.output?.memories === 0, "beta summary observed another Agent's memory");
+  expect(summaryPart.output.summary === "Nothing has been remembered yet.", "empty summary was not deterministic");
+});
+
+for (const [label, marker] of [
+  ["empty", "[tool-empty]"],
+  ["oversized", `[tool-remember] ${"x".repeat(501)}`],
+  ["malformed cross-Agent", "[tool-malformed]"],
+]) {
+  await step(`${label} memory tool input cannot write durable state`, async () => {
+    await websocketChat("alpha", marker);
+    const transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+    const failedPart = lastToolPart(transcript, "rememberFact");
+    expect(failedPart?.state === "output-error", `${label} input did not persist a failed tool part`);
+    expect(failedPart.errorText === "chat_provider_invalid_output", `${label} input exposed an unstable tool error`);
+    const alpha = await json("/agents/current-conformance-agent/alpha/status");
+    expect(alpha.memories?.length === 1 && alpha.memories[0]?.fact === durableFact, `${label} input changed alpha memory`);
+    const beta = await json("/agents/current-conformance-agent/beta/status");
+    expect(beta.memories?.length === 0, `${label} input wrote across Agent names`);
+  });
+}
+
+await step("memory count and summary inputs remain bounded", async () => {
+  const boundaryFacts = [
+    "y".repeat(500),
+    ...Array.from({ length: 18 }, (_, index) => `bounded-memory-${index + 2}`),
+  ];
+  for (const fact of boundaryFacts) {
+    await websocketChat("alpha", `[tool-remember] ${fact}`);
+  }
+  let alpha = await json("/agents/current-conformance-agent/alpha/status");
+  expect(alpha.memories?.length === 20, "the memory cap did not accept exactly 20 facts");
+  expect(alpha.memories.some((memory) => memory.fact.length === 500), "the fact-length boundary was not retained");
+
+  await websocketChat("alpha", "[tool-remember] over-capacity-memory");
+  alpha = await json("/agents/current-conformance-agent/alpha/status");
+  expect(alpha.memories?.length === 20, "the memory cap accepted a 21st fact");
+
+  await websocketChat("alpha", "[tool-summarize]");
+  const transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const summary = lastToolPart(transcript, "summarizeMemories");
+  expect(summary?.output?.memories === 10, "summary did not use the bounded 10-memory window");
+  expect(!summary.output.summary.includes(durableFact), "summary included facts outside its bounded window");
 });
 
 for (const scenario of [
@@ -302,10 +403,19 @@ await step("inactivity and reconnect preserve both current Agent states", async 
 
   const reopenedTranscript = await json("/agents/current-conformance-agent/alpha/get-messages");
   expect(
-    JSON.stringify(reopenedTranscript) === JSON.stringify(completedTranscript),
-    "AIChatAgent transcript changed after inactivity and reopen",
+    reopenedTranscript.length >= completedTranscript.length,
+    "AIChatAgent transcript lost messages after inactivity and reopen",
   );
-  expect(messageText(reopenedTranscript.at(-1)) === "Deterministic streamed response.", "reopened transcript lost the assistant response");
+  expect(
+    JSON.stringify(reopenedTranscript.slice(0, completedTranscript.length)) === JSON.stringify(completedTranscript),
+    "AIChatAgent completed transcript prefix changed after inactivity and reopen",
+  );
+  expect(
+    toolParts(reopenedTranscript, "rememberFact")
+      .some((part) => part?.output?.memory?.fact === durableFact),
+    "reopened transcript lost the memory tool result",
+  );
+  expect(alpha.memories?.[0]?.fact === durableFact, "reopened Agent lost explicit memory state");
 });
 
 console.log("PASS current Agents SDK and AIChatAgent workflow complete");

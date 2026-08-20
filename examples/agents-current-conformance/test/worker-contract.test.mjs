@@ -21,4 +21,10 @@ test("the current target has deterministic named state and durable chat routes",
   assert.match(source, /onChatMessage/);
   assert.match(source, /streamText/);
   assert.match(source, /llama-swap\/Qwen3\.6-35B-A3B/);
+  assert.match(source, /CREATE TABLE IF NOT EXISTS current_conformance_memories/);
+  assert.match(source, /rememberFact:\s*tool\(/);
+  assert.match(source, /listMemories:\s*tool\(/);
+  assert.match(source, /summarizeMemories:\s*tool\(/);
+  assert.match(source, /z\.string\(\)\.trim\(\)\.min\(1\)\.max\(MAX_MEMORY_LENGTH\)/);
+  assert.match(source, /stopWhen: stepCountIs\(5\)/);
 });

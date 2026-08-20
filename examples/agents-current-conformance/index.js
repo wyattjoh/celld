@@ -4,13 +4,24 @@ import {
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
+  stepCountIs,
   streamText,
+  tool,
 } from "ai";
 import { getAgentByName, routeAgentRequest } from "agents";
+import { z } from "zod";
 
 const AGENT_NAMES = new Set(["alpha", "beta"]);
 const CURRENT_ROUTE_PREFIX = "/agents/current-conformance-agent/";
 const CONFORMANCE_MODEL = "llama-swap/Qwen3.6-35B-A3B";
+const MAX_MEMORY_LENGTH = 500;
+const MAX_MEMORIES = 20;
+const MAX_SUMMARY_MEMORIES = 10;
+const memoryInputSchema = z.object({
+  fact: z.string().trim().min(1).max(MAX_MEMORY_LENGTH),
+}).strict();
+const emptyToolInputSchema = z.object({}).strict();
+
 const PUBLIC_PROVIDER_ERRORS = Object.freeze({
   invalid: "chat_provider_invalid_output",
   missing: "chat_provider_capability_missing",
@@ -37,6 +48,7 @@ function initialState(name = null) {
     activationCount: 0,
     lastMessage: null,
     lastConnectionId: null,
+    memories: [],
   };
 }
 
@@ -69,7 +81,7 @@ function modelGatewayBaseUrl(value) {
 
 function publicProviderError(error) {
   const name = error instanceof Error ? error.name : "";
-  if (/InvalidResponse|JSONParse|InvalidStream|NoContent/.test(name)) {
+  if (name.length === 0 || /InvalidResponse|JSONParse|InvalidStream|NoContent|InvalidToolInput/.test(name)) {
     return PUBLIC_PROVIDER_ERRORS.invalid;
   }
   const status = error && typeof error === "object" ? error.statusCode : undefined;
@@ -124,6 +136,13 @@ export class CurrentConformanceAgent extends AIChatAgent {
         revision INTEGER NOT NULL
       )
     `;
+    this.sql`
+      CREATE TABLE IF NOT EXISTS current_conformance_memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+      )
+    `;
   }
 
   durableState() {
@@ -174,6 +193,7 @@ export class CurrentConformanceAgent extends AIChatAgent {
       agent: this.name,
       activeConnections: [...this.getConnections()].length,
       state,
+      memories: this.listMemories().memories,
       events: this.sql`
         SELECT sequence, connection_id, message, message_count
         FROM current_conformance_events
@@ -217,8 +237,87 @@ export class CurrentConformanceAgent extends AIChatAgent {
       model: openai.chat(CONFORMANCE_MODEL),
       maxRetries: 0,
       messages: await convertToModelMessages(this.messages),
+      tools: this.memoryTools(),
+      stopWhen: stepCountIs(5),
     });
     return result.toUIMessageStreamResponse({ onError: publicProviderError });
+  }
+
+  listMemories(limit = MAX_MEMORIES) {
+    this.ensureTables();
+    const memories = this.sql`
+      SELECT id, fact, created_at
+      FROM current_conformance_memories
+      ORDER BY id
+      LIMIT ${limit}
+    `.map((row) => ({
+      id: Number(row.id),
+      fact: row.fact,
+      createdAt: Number(row.created_at),
+    }));
+    return { memories, total: memories.length };
+  }
+
+  rememberFact(input) {
+    const { fact } = memoryInputSchema.parse(input);
+    const current = this.listMemories();
+    if (current.total >= MAX_MEMORIES && !current.memories.some((memory) => memory.fact === fact)) {
+      throw new RangeError(`an Agent can retain at most ${MAX_MEMORIES} explicit memories`);
+    }
+    this.sql`
+      INSERT OR IGNORE INTO current_conformance_memories (fact, created_at)
+      VALUES (${fact}, ${Date.now()})
+    `;
+    const result = this.listMemories();
+    const state = this.state && typeof this.state === "object"
+      ? this.state
+      : initialState(this.name);
+    this.setState({ ...state, agent: this.name, memories: result.memories });
+    return { memory: result.memories.find((memory) => memory.fact === fact), total: result.total };
+  }
+
+  summarizeMemories() {
+    this.ensureTables();
+    const memories = this.sql`
+      SELECT fact
+      FROM current_conformance_memories
+      ORDER BY id DESC
+      LIMIT ${MAX_SUMMARY_MEMORIES}
+    `.map((row) => row.fact).reverse();
+    return {
+      summary: memories.length === 0 ? "Nothing has been remembered yet." : memories.join("; "),
+      memories: memories.length,
+    };
+  }
+
+  memoryTools() {
+    return {
+      rememberFact: tool({
+        description: "Remember one explicit fact in the current named Agent.",
+        inputSchema: memoryInputSchema,
+        execute: async (input) => this.rememberFact(input),
+      }),
+      listMemories: tool({
+        description: "List explicit facts stored by the current named Agent.",
+        inputSchema: emptyToolInputSchema,
+        execute: async () => this.listMemories(),
+      }),
+      summarizeMemories: tool({
+        description: "Summarize only the current named Agent's explicit facts.",
+        inputSchema: emptyToolInputSchema,
+        execute: async () => this.summarizeMemories(),
+      }),
+    };
+  }
+
+  resetMemories() {
+    this.ensureTables();
+    this.sql`DELETE FROM current_conformance_memories`;
+    const state = this.state && typeof this.state === "object"
+      ? this.state
+      : initialState(this.name);
+    this.setState({ ...state, agent: this.name, memories: [] });
+    return this.listMemories();
   }
 
   async probe(input) {
@@ -322,6 +421,19 @@ export default {
         [...AGENT_NAMES].map(async (name) => {
           const agent = await namedAgent(env, name);
           return agent.probe({ name });
+        }),
+      );
+      return json({ results });
+    }
+
+    if (url.pathname === "/current/memories/reset") {
+      if (request.method !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      const results = await Promise.all(
+        [...AGENT_NAMES].map(async (name) => {
+          const agent = await namedAgent(env, name);
+          return { name, ...(await agent.resetMemories()) };
         }),
       );
       return json({ results });

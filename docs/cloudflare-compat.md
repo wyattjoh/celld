@@ -85,8 +85,10 @@ OpenAI adapter, and schema packages. Two named `AIChatAgent` instances are
 resolved with `getAgentByName`, all Agent HTTP and WebSocket traffic is delegated
 through `routeAgentRequest`, and a deterministic OpenAI-compatible provider
 proves multi-event streaming, package-owned durable chat messages, bounded
-provider errors, and reconnect reads after inactivity. `setState` and
-`this.sql` isolation remain covered alongside chat. The legacy
+provider errors, and schema-validated durable memory tools. Completed tool
+parts, rejected malformed writes, named memory isolation, and reconnect reads
+after inactivity are covered through public routes. `setState` and `this.sql`
+isolation remain covered alongside chat. The legacy
 `@cloudflare/agents@0.0.16` target remains in
 [`agents-conformance`](../examples/agents-conformance/README.md) and is tested
 separately.

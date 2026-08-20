@@ -9,6 +9,7 @@ const DEFAULT_PORT = 8788;
 const CONFORMANCE_MODEL = "llama-swap/Qwen3.6-35B-A3B";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const STREAM_CHUNKS = ["Deterministic ", "streamed ", "response."];
+let toolCallSequence = 0;
 
 async function requestJson(request) {
   const chunks = [];
@@ -51,6 +52,34 @@ function streamChunk(response, content, finishReason = null) {
       finish_reason: finishReason,
     }],
   })}\n\n`);
+}
+
+function streamToolCall(response, name, input) {
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    connection: "keep-alive",
+    "content-type": "text/event-stream; charset=utf-8",
+  });
+  response.write(`data: ${JSON.stringify({
+    id: "chatcmpl-celld-conformance-tool",
+    object: "chat.completion.chunk",
+    created: 0,
+    model: CONFORMANCE_MODEL,
+    choices: [{
+      index: 0,
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: `call-${name}-${++toolCallSequence}`,
+          type: "function",
+          function: { name, arguments: JSON.stringify(input) },
+        }],
+      },
+      finish_reason: null,
+    }],
+  })}\n\n`);
+  streamChunk(response, null, "tool_calls");
+  response.end("data: [DONE]\n\n");
 }
 
 async function streamCompletion(response) {
@@ -98,6 +127,25 @@ async function handle(request, response) {
   if (prompt.includes("[provider-unavailable]")) {
     request.socket.destroy();
     return;
+  }
+  if (body.messages.at(-1)?.role === "tool") {
+    return streamCompletion(response);
+  }
+  if (prompt.includes("[tool-empty]")) {
+    return streamToolCall(response, "rememberFact", { fact: "" });
+  }
+  if (prompt.includes("[tool-malformed]")) {
+    return streamToolCall(response, "rememberFact", { fact: "malformed", agent: "beta" });
+  }
+  if (prompt.includes("[tool-remember]")) {
+    const fact = prompt.split("[tool-remember]", 2)[1]?.trim() ?? "";
+    return streamToolCall(response, "rememberFact", { fact });
+  }
+  if (prompt.includes("[tool-list]")) {
+    return streamToolCall(response, "listMemories", {});
+  }
+  if (prompt.includes("[tool-summarize]")) {
+    return streamToolCall(response, "summarizeMemories", {});
   }
   return streamCompletion(response);
 }

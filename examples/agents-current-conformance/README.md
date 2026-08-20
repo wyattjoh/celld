@@ -32,6 +32,7 @@ small tracer endpoints:
 
 - `GET /current/names` resolves `alpha` and `beta` with `getAgentByName`.
 - `GET|POST /current/state/<name>` verifies isolated Agent state and SQL.
+- `POST /current/memories/reset` clears both named fixtures before a repeatable run.
 - `GET /agents/current-conformance-agent/<name>/status` exercises standard
   Agent HTTP routing.
 - `GET /agents/current-conformance-agent/<name>/get-messages` is the
@@ -39,12 +40,7 @@ small tracer endpoints:
 - `ws://.../agents/current-conformance-agent/<name>` carries both ordinary
   Agent frames and the standard `AIChatAgent` chat protocol.
 
-A deterministic OpenAI-compatible provider emits three separate text deltas
-before completing `Deterministic streamed response.` The public runner submits
-a standard chat request, observes multiple response frames, closes every
-connection, leaves both names inactive, reconnects, and reads the same user and
-assistant messages. Persistence is verified only through `get-messages`; tests
-do not inspect the package's private SQLite tables.
+A deterministic OpenAI-compatible provider emits three separate text deltas before completing `Deterministic streamed response.` It also emits controlled `rememberFact`, `listMemories`, and `summarizeMemories` calls. The strict Zod-backed server tools retain a bounded set of explicit facts in application SQL separate from chat transport messages. The public runner verifies completed tool parts, rejects empty, oversized, and cross-Agent-shaped inputs, proves named isolation, closes every connection, reconnects, and reads the same messages and memory through public Agent routes. Tests do not inspect package-private SQLite tables.
 
 The provider double also produces rejection, malformed stream, and connection
 failures. Together with a missing-capability request, these prove stable public

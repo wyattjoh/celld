@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { createOpenAI } from "@ai-sdk/openai";
-import { streamText } from "ai";
+import { stepCountIs, streamText, tool } from "ai";
+import { z } from "zod";
 import { createDeterministicProvider } from "../scripts/model-provider.mjs";
 
 const MODEL = "llama-swap/Qwen3.6-35B-A3B";
@@ -26,6 +27,68 @@ async function providerModel() {
   });
   return openai.chat(MODEL);
 }
+
+test("the OpenAI adapter observes a deterministic memory tool call", async () => {
+  const result = streamText({
+    model: await providerModel(),
+    messages: [{ role: "user", content: "[tool-remember] durable fact" }],
+    tools: {
+      rememberFact: tool({
+        inputSchema: z.object({ fact: z.string() }),
+      }),
+    },
+  });
+  const calls = [];
+  for await (const part of result.fullStream) {
+    if (part.type === "tool-call") calls.push(part);
+  }
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].toolName, "rememberFact");
+  assert.deepEqual(calls[0].input, { fact: "durable fact" });
+});
+
+test("sequential memory calls receive distinct tool call identifiers", async () => {
+  const model = await providerModel();
+  const callId = async (content) => {
+    const result = streamText({
+      model,
+      messages: [{ role: "user", content }],
+      tools: {
+        rememberFact: tool({ inputSchema: z.object({ fact: z.string() }) }),
+      },
+    });
+    for await (const part of result.fullStream) {
+      if (part.type === "tool-call") return part.toolCallId;
+    }
+    throw new Error("provider did not emit a tool call");
+  };
+
+  const first = await callId("[tool-remember] first");
+  const second = await callId("[tool-remember] second");
+  assert.notEqual(first, second);
+});
+
+test("a deterministic memory tool turn executes once and reaches a final response", async () => {
+  let executions = 0;
+  const result = streamText({
+    model: await providerModel(),
+    messages: [{ role: "user", content: "[tool-remember] durable fact" }],
+    tools: {
+      rememberFact: tool({
+        inputSchema: z.object({ fact: z.string() }),
+        execute: async ({ fact }) => {
+          executions += 1;
+          return { fact };
+        },
+      }),
+    },
+    stopWhen: stepCountIs(5),
+  });
+
+  assert.equal(await result.text, "Deterministic streamed response.");
+  assert.equal(executions, 1);
+});
 
 test("the OpenAI adapter observes multiple deterministic text chunks", async () => {
   const result = streamText({

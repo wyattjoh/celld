@@ -138,7 +138,8 @@ credential-free [`agents-current-conformance`](examples/agents-current-conforman
 target. It pins `agents@0.21.0`, `@cloudflare/ai-chat@0.10.2`, and a compatible
 AI SDK/OpenAI adapter lane; exercises standard named HTTP/WebSocket routing;
 and verifies multi-event model streaming, durable messages, bounded errors,
-and reconnect reads after inactivity. Compose keeps the legacy target as its
+schema-validated durable memory tools, named isolation, and reconnect reads
+after inactivity. Compose keeps the legacy target as its
 default and selects the current target with
 `CELLD_CONFORMANCE_FIXTURE=agents-current-conformance`.
 
