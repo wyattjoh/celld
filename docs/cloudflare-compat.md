@@ -86,10 +86,20 @@ resolved with `getAgentByName`, all Agent HTTP and WebSocket traffic is delegate
 through `routeAgentRequest`, and a deterministic OpenAI-compatible provider
 proves multi-event streaming, package-owned durable chat messages, bounded
 provider errors, and schema-validated durable memory and reminder tools. Public
-checks cover idempotent delayed schedules, owner-scoped cancellation, inactive
-Agent alarm wake-up, synchronized completion broadcasts, rejected malformed
-operations, named isolation, and reconnect reads after inactivity. `setState`,
-`this.sql`, and Agent schedule isolation remain covered alongside chat. The legacy
+checks disconnect after a known chunk, race concurrent and stale resumers, and
+observe one exact completed assistant message; terminal provider failure settles
+the same message with a bounded durable outcome. celld keeps the SDK resume
+protocol unchanged and adapts only its WebSocket output path: each hibernatable
+`send()` enters the existing per-cell committed-position FIFO immediately, so a
+proved prefix can flush while the handler is suspended without a later socket
+or write overtaking it. The event's final position still covers a write with no
+following frame, and a failed proof closes the ordered stream.
+
+The remaining checks cover idempotent delayed schedules, owner-scoped
+cancellation, inactive Agent alarm wake-up, synchronized completion broadcasts,
+rejected malformed operations, named isolation, and reconnect reads after
+inactivity. `setState`, `this.sql`, and Agent schedule isolation remain covered
+alongside chat. The legacy
 `@cloudflare/agents@0.0.16` target remains in
 [`agents-conformance`](../examples/agents-conformance/README.md) and is tested
 separately.

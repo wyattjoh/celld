@@ -291,29 +291,37 @@ impl WebSocketRouteTiming {
 /// cell is durable. Reuses the routed machinery: `request` pins the cell (no
 /// eviction mid-wait) and `gate_write` drives the core gate. `Ok` releases the
 /// inline response; `Err` breaks the call, as a routed gate failure would.
-async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
+async fn prove_gate_position(
+    app: &AppHandle,
+    scope: String,
+    position: Option<u64>,
+) -> Result<(), RequestError> {
     if !app.output_gate {
-        let _ = req.reply.send(Ok(()));
-        return;
+        return Ok(());
     }
-    let routed = match app.request(req.scope.clone()).await {
-        Ok(routed) => routed,
-        Err(error) => {
-            let _ = req.reply.send(Err(error));
-            return;
-        }
-    };
-    // The guard pins the cell and releases the request on drop, so the else
+    let routed = app.request(scope.clone()).await?;
+    // The guard pins the cell and releases the request on drop, so the remote
     // branch does not leak the just-acquired request.
-    let _activity = app.activity(routed.request, req.scope.clone());
-    let result = if routed.route == Route::Local {
-        app.gate_output(routed.request, req.position).await
+    let _activity = app.activity(routed.request, scope);
+    if routed.route == Route::Local {
+        app.gate_output(routed.request, position).await
     } else {
         // The owning isolate should route the cell locally; if it moved off the
         // node mid-call, fail closed rather than acknowledge an unproven write.
         Err(RequestError::NodeFenced)
-    };
+    }
+}
+
+async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
+    let result = prove_gate_position(&app, req.scope, req.position).await;
     let _ = req.reply.send(result);
+}
+
+async fn dispatch_ws_frame_gate(app: AppHandle, scope: String, barrier: u64, position: u64) {
+    let ok = prove_gate_position(&app, scope.clone(), Some(position))
+        .await
+        .is_ok();
+    app.ws_frame_settled(scope, barrier, ok);
 }
 
 /// Call the reserved cron cell's arm endpoint, through the ordinary Durable
@@ -2694,6 +2702,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_do_call_tx(do_call_tx);
     let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
     celld::js::set_gate_tx(gate_tx);
+    let (ws_output_tx, mut ws_output_rx) = mpsc::unbounded_channel();
+    celld::js::set_ws_output_tx(ws_output_tx);
     let (rpc_call_tx, mut rpc_call_rx) = mpsc::unbounded_channel();
     celld::js::set_rpc_call_tx(rpc_call_tx);
     let (service_call_tx, mut service_call_rx) = mpsc::unbounded_channel();
@@ -2923,6 +2933,51 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     anyhow::bail!("output-gate channel closed");
                 };
                 gate_calls.push(Box::pin(dispatch_gate(app.clone(), req)));
+            }
+            output = ws_output_rx.recv() => {
+                let Some(output) = output else {
+                    anyhow::bail!("WebSocket output-gate channel closed");
+                };
+                match output {
+                    celld::js::WsOutputReq::Frame {
+                        scope,
+                        websocket,
+                        out,
+                        position,
+                    } if app.output_gate => {
+                        if let Some((barrier, position)) = app
+                            .ws_frame(scope.clone(), (websocket, out), position)
+                            .await
+                        {
+                            gate_calls.push(Box::pin(dispatch_ws_frame_gate(
+                                app.clone(),
+                                scope,
+                                barrier,
+                                position,
+                            )));
+                        }
+                    }
+                    celld::js::WsOutputReq::Frame { websocket, out, .. } => {
+                        celld::js::ws_emit_batch(vec![(websocket, out)]);
+                    }
+                    celld::js::WsOutputReq::Finish {
+                        request,
+                        scope,
+                        write_position,
+                        reply,
+                    } => {
+                        if app.output_gate {
+                            app.ws_output(request, scope, write_position).await;
+                        }
+                        let _ = reply.send(());
+                    }
+                    celld::js::WsOutputReq::Abort { scope, reply } => {
+                        if app.output_gate {
+                            app.ws_output_abort(scope).await;
+                        }
+                        let _ = reply.send(());
+                    }
+                }
             }
             Some(()) = gate_calls.next(), if !gate_calls.is_empty() => {}
             call = service_call_rx.recv() => {

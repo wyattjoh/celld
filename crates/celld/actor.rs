@@ -375,15 +375,34 @@ pub enum Message {
         position: Option<u64>,
         reply: oneshot::Sender<Result<(), RequestError>>,
     },
-    /// A `webSocketMessage` finished; hand its captured outbound frames to the
-    /// cell's output gate. `write_position` present means the handler wrote, so
-    /// the frames are held behind that write until it is durable; absent means
-    /// flush them (behind any earlier still-pending write, else immediately).
+    /// One frame emitted by a hibernatable socket, tagged with the cell's
+    /// committed position at `send()`. The actor either trails an existing
+    /// barrier or opens a new one and asks the shell to prove it.
+    WsFrame {
+        scope: String,
+        frame: (u64, WsOut),
+        write_position: Option<u64>,
+        reply: oneshot::Sender<Option<(u64, u64)>>,
+    },
+    /// The shell finished proving one incremental frame barrier.
+    WsFrameSettled {
+        scope: String,
+        barrier: u64,
+        ok: bool,
+    },
+    /// A `webSocketMessage` finished. Its final position covers a write after
+    /// the last frame; the shared JS-to-host FIFO guarantees all earlier
+    /// `send()` calls were registered before this seal.
     WsOutput {
         request: u64,
         scope: String,
-        frames: Vec<(u64, WsOut)>,
         write_position: Option<u64>,
+        reply: oneshot::Sender<()>,
+    },
+    /// A WebSocket handler failed. Flush the already-emitted durable prefix,
+    /// drop any later output, and then close every socket in the scope.
+    WsOutputAbort {
+        scope: String,
         reply: oneshot::Sender<()>,
     },
     WebSocketOpened {
@@ -895,27 +914,54 @@ impl AppHandle {
         self.gate_output(request, Some(position)).await
     }
 
-    /// Hand a finished `webSocketMessage`'s frames to the cell's output gate.
-    /// Awaited so the request stays pinned until the actor has registered the
-    /// gate (the core reads the still-active request when it opens); frames flush
-    /// or fail asynchronously as durability resolves, not here.
-    pub async fn ws_output(
+    /// Register one incremental WebSocket frame. If this opens a committed
+    /// position barrier, the returned `(barrier, position)` asks the shell to
+    /// prove it with a separately pinned core request.
+    pub async fn ws_frame(
         &self,
-        request: u64,
         scope: String,
-        frames: Vec<(u64, WsOut)>,
+        frame: (u64, WsOut),
         write_position: Option<u64>,
-    ) {
+    ) -> Option<(u64, u64)> {
+        let (reply, receive) = oneshot::channel();
+        self.tx
+            .send(Message::WsFrame {
+                scope,
+                frame,
+                write_position,
+                reply,
+            })
+            .ok()?;
+        receive.await.ok().flatten()
+    }
+
+    pub fn ws_frame_settled(&self, scope: String, barrier: u64, ok: bool) {
+        let _ = self.tx.send(Message::WsFrameSettled { scope, barrier, ok });
+    }
+
+    /// Seal a finished `webSocketMessage`. Awaited so its original request
+    /// stays pinned until a final no-frame write barrier is registered.
+    pub async fn ws_output(&self, request: u64, scope: String, write_position: Option<u64>) {
         let (reply, receive) = oneshot::channel();
         if self
             .tx
             .send(Message::WsOutput {
                 request,
                 scope,
-                frames,
                 write_position,
                 reply,
             })
+            .is_ok()
+        {
+            let _ = receive.await;
+        }
+    }
+
+    pub async fn ws_output_abort(&self, scope: String) {
+        let (reply, receive) = oneshot::channel();
+        if self
+            .tx
+            .send(Message::WsOutputAbort { scope, reply })
             .is_ok()
         {
             let _ = receive.await;
@@ -1016,24 +1062,22 @@ impl AppHandle {
     }
 }
 
-/// One cell's WebSocket output gate: an ordered queue of write barriers.
+/// One cell's WebSocket output gate: an ordered queue of committed-position
+/// barriers. `durable_position` lets later read-only frames skip a redundant
+/// proof once the queue has drained.
 #[derive(Default)]
 struct WsGate {
+    durable_position: u64,
     barriers: VecDeque<WsBarrier>,
+    close_after_flush: bool,
 }
 
-/// One `webSocketMessage` batch and the outbound frames held behind it.
-/// `settled` is `None` while the verdict is outstanding, `Some(true)` once the
-/// core proved every write the frames can reveal (they may flush when this
-/// barrier reaches the front), `Some(false)` on failure (the gate breaks).
-///
-/// Every batch gets its own barrier, including one that wrote nothing: the core
-/// decides what it trails, because only the core knows the writes other
-/// channels have outstanding on this cell. The queue keeps them in arrival
-/// order and drains only from the front, so a barrier settled early cannot
-/// overtake one still waiting.
+/// A committed position and the outbound frames held behind it. `settled` is
+/// `None` while durability is unproven, `Some(true)` once proven, and
+/// `Some(false)` when the whole ordered stream must break.
 struct WsBarrier {
-    request: u64,
+    id: u64,
+    position: u64,
     settled: Option<bool>,
     frames: Vec<(u64, WsOut)>,
 }
@@ -1056,14 +1100,15 @@ pub struct Actor {
     /// Local write responses held open by the output gate, keyed by request,
     /// released when the core emits `ReleaseResponse`.
     gated_responses: BTreeMap<u64, oneshot::Sender<Result<(), RequestError>>>,
-    /// Per-cell WebSocket output gate: a FIFO of write barriers, each holding
-    /// the outbound frames produced up to it. The front drains in write order as
-    /// durability proves, so no client ever sees a frame that trails an
-    /// unproven write (the Cloudflare per-object output gate).
+    /// Per-cell WebSocket output gate: a FIFO of committed-position barriers.
+    /// Each `send()` enters this queue while its handler is still running, so a
+    /// durable prefix can stream without letting another event or socket
+    /// overtake an unproven write.
     ws_gates: BTreeMap<String, WsGate>,
-    /// Gated `webSocketMessage` requests, mapping each to its cell so a
-    /// `ReleaseResponse` routes to the WebSocket gate rather than an HTTP reply.
-    ws_gated: BTreeMap<u64, String>,
+    /// Finished `webSocketMessage` requests that opened a final barrier,
+    /// mapping the core request to its cell and barrier identity.
+    ws_gated: BTreeMap<u64, (String, u64)>,
+    next_ws_barrier: u64,
     published: BTreeSet<String>,
     fail_publish_once: bool,
     publishes: u64,
@@ -1247,6 +1292,7 @@ impl Actor {
             gated_responses: BTreeMap::new(),
             ws_gates: BTreeMap::new(),
             ws_gated: BTreeMap::new(),
+            next_ws_barrier: 1,
             eviction_stops: BTreeMap::new(),
             published: BTreeSet::new(),
             fail_publish_once,
@@ -1472,50 +1518,32 @@ impl Actor {
                     out,
                 );
             }
-            Message::WsOutput {
-                request,
+            Message::WsFrame {
                 scope,
-                frames,
+                frame,
                 write_position,
                 reply,
             } => {
-                // Open a barrier for every batch, then let the core decide
-                // what it trails: its own write when the handler wrote, and
-                // otherwise the newest write still outstanding on this cell,
-                // whichever channel made it. The queue consulted here before
-                // was filled in one place -- the arm below that writes -- so it
-                // held only writes a `webSocketMessage` handler made itself,
-                // and an HTTP, RPC, or peer write on the same cell was
-                // invisible to a batch that only read.
-                //
-                // Both registrations happen before the drive, and must: `drive`
-                // runs the effects it produces synchronously, so a read with no
-                // barrier open on its cell is released inside the call below.
-                // Moved after it, that `Effect::ReleaseResponse` would find no
-                // `ws_gated` entry, fall through to the `gated_responses` map,
-                // match nothing, and strand these frames behind a barrier that
-                // nothing will ever settle.
-                self.ws_gates
-                    .entry(scope.clone())
-                    .or_default()
-                    .barriers
-                    .push_back(WsBarrier {
-                        request,
-                        settled: None,
-                        frames,
-                    });
-                self.ws_gated.insert(request, scope);
-                self.drive(
-                    match write_position {
-                        Some(position) => Event::Wrote { request, position },
-                        // A known gap remains on the other side of this
-                        // question: an alarm handler proves its own write
-                        // durable inline and registers no barrier with the
-                        // core, so a frame revealing one is released early.
-                        None => Event::ReadOutput { request },
-                    },
-                    out,
-                );
+                let proof = self.ws_enqueue(&scope, vec![frame], write_position);
+                let _ = reply.send(proof);
+            }
+            Message::WsFrameSettled { scope, barrier, ok } => self.ws_settle(&scope, barrier, ok),
+            Message::WsOutput {
+                request,
+                scope,
+                write_position,
+                reply,
+            } => {
+                if let Some((barrier, position)) =
+                    self.ws_enqueue(&scope, Vec::new(), write_position)
+                {
+                    self.ws_gated.insert(request, (scope.clone(), barrier));
+                    self.drive(Event::Wrote { request, position }, out);
+                }
+                let _ = reply.send(());
+            }
+            Message::WsOutputAbort { scope, reply } => {
+                self.ws_abort(&scope);
                 let _ = reply.send(());
             }
             Message::ActivityFinished {
@@ -1678,51 +1706,130 @@ impl Actor {
         }
     }
 
-    /// Settle a gated `webSocketMessage`'s durability. On success mark its
-    /// barrier durable and flush the durable prefix in write order; on failure
-    /// break the whole cell gate — drop every held frame and reset its sockets,
-    /// since an unproven write must never leave an acknowledged trace.
-    fn ws_release(&mut self, request: u64, ok: bool) {
-        let Some(scope) = self.ws_gated.remove(&request) else {
-            return;
+    /// Append frames to the scope FIFO, opening a new committed-position
+    /// barrier only when no existing proof covers them. The caller proves a
+    /// returned barrier; `None` means the frames either flushed immediately or
+    /// trail a proof already in flight.
+    fn ws_enqueue(
+        &mut self,
+        scope: &str,
+        frames: Vec<(u64, WsOut)>,
+        write_position: Option<u64>,
+    ) -> Option<(u64, u64)> {
+        if frames.is_empty() && write_position.is_none() {
+            return None;
+        }
+        if self
+            .ws_gates
+            .get(scope)
+            .is_some_and(|gate| gate.close_after_flush)
+        {
+            return None;
+        }
+        let mut frames = Some(frames);
+        let opens_barrier = {
+            let gate = self.ws_gates.entry(scope.to_string()).or_default();
+            if let Some(last) = gate.barriers.back_mut() {
+                if write_position.is_some_and(|position| position > last.position) {
+                    true
+                } else {
+                    last.frames.extend(frames.take().unwrap());
+                    false
+                }
+            } else {
+                write_position.is_some_and(|position| position > gate.durable_position)
+            }
         };
+        if !opens_barrier {
+            if let Some(frames) = frames {
+                crate::js::ws_emit_batch(frames);
+            }
+            return None;
+        }
+
+        let position = write_position.expect("a new WebSocket barrier has a position");
+        let id = self.next_ws_barrier;
+        self.next_ws_barrier = self.next_ws_barrier.wrapping_add(1).max(1);
+        self.ws_gates
+            .get_mut(scope)
+            .expect("WebSocket gate was created above")
+            .barriers
+            .push_back(WsBarrier {
+                id,
+                position,
+                settled: None,
+                frames: frames.unwrap(),
+            });
+        Some((id, position))
+    }
+
+    /// Settle one position and flush every now-durable barrier at the front.
+    fn ws_settle(&mut self, scope: &str, barrier: u64, ok: bool) {
         let mut flush = Vec::new();
+        let mut close_after_flush = false;
         let broke = {
-            let Some(gate) = self.ws_gates.get_mut(&scope) else {
+            let Some(gate) = self.ws_gates.get_mut(scope) else {
                 return;
             };
-            if let Some(barrier) = gate.barriers.iter_mut().find(|b| b.request == request) {
-                barrier.settled = Some(ok);
-            }
-            if gate.barriers.iter().any(|b| b.settled == Some(false)) {
+            let Some(found) = gate.barriers.iter_mut().find(|item| item.id == barrier) else {
+                return;
+            };
+            found.settled = Some(ok);
+            if gate.barriers.iter().any(|item| item.settled == Some(false)) {
                 true
             } else {
                 while gate
                     .barriers
                     .front()
-                    .is_some_and(|b| b.settled == Some(true))
+                    .is_some_and(|item| item.settled == Some(true))
                 {
-                    flush.push(gate.barriers.pop_front().unwrap().frames);
+                    let durable = gate.barriers.pop_front().unwrap();
+                    gate.durable_position = gate.durable_position.max(durable.position);
+                    flush.push(durable.frames);
                 }
+                close_after_flush = gate.close_after_flush && gate.barriers.is_empty();
                 false
             }
         };
         if broke {
-            self.ws_gates.remove(&scope);
-            self.ws_gated.retain(|_, s| *s != scope);
-            crate::js::ws_close_scope(&scope, 1011, "durability unproven");
+            self.ws_break(scope, "durability unproven");
             return;
         }
         for frames in flush {
             crate::js::ws_emit_batch(frames);
         }
-        if self
-            .ws_gates
-            .get(&scope)
-            .is_some_and(|g| g.barriers.is_empty())
-        {
-            self.ws_gates.remove(&scope);
+        if close_after_flush {
+            self.ws_break(scope, "WebSocket handler failed");
         }
+    }
+
+    /// A failed handler truncates the socket only after every already-emitted
+    /// durable prefix frame has had its proof resolved. Later frames are
+    /// dropped; a failed proof still breaks the scope immediately.
+    fn ws_abort(&mut self, scope: &str) {
+        let close_now = {
+            let gate = self.ws_gates.entry(scope.to_string()).or_default();
+            gate.close_after_flush = true;
+            gate.barriers.is_empty()
+        };
+        if close_now {
+            self.ws_break(scope, "WebSocket handler failed");
+        }
+    }
+
+    fn ws_break(&mut self, scope: &str, reason: &str) {
+        self.ws_gates.remove(scope);
+        self.ws_gated.retain(|_, (cell, _)| cell != scope);
+        crate::js::ws_close_scope(scope, 1011, reason);
+    }
+
+    /// Settle the final barrier opened by a completed handler's original core
+    /// request. Incremental barriers settle through `WsFrameSettled` instead.
+    fn ws_release(&mut self, request: u64, ok: bool) {
+        let Some((scope, barrier)) = self.ws_gated.remove(&request) else {
+            return;
+        };
+        self.ws_settle(&scope, barrier, ok);
     }
 
     fn drive(&mut self, first: Event, out: &mut StepOutput) {

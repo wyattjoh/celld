@@ -41,7 +41,11 @@ small tracer endpoints:
 - `ws://.../agents/current-conformance-agent/<name>` carries both ordinary
   Agent frames and the standard `AIChatAgent` chat protocol.
 
-A deterministic OpenAI-compatible provider emits three separate text deltas before completing `Deterministic streamed response.` It also emits controlled memory and reminder tool calls. Strict Zod-backed server tools retain bounded explicit facts and reminder metadata in application SQL separate from chat transport messages. Reminder tools use idempotent Agent schedules, reject invalid delays, messages, identifiers, and cross-Agent cancellation attempts, and retain pending, cancelled, and completed state. The public runner proves same-Agent completion broadcasts, alarm wake-up after inactivity, named isolation, and durable reads through public Agent routes. Tests do not inspect package-private SQLite tables.
+A deterministic OpenAI-compatible provider emits three separate text deltas before completing `Deterministic streamed response.` Its interruption cases emit the known `Interrupted ` prefix, pause, and then either complete `Interrupted stream completed.` or terminate the provider response. The public runner disconnects after that first chunk, races two resumers (one with a stale acknowledgement), and proves exact replay, one durable assistant message, and bounded completed or failed terminal metadata through `get-messages`.
+
+The fixture uses only the published SDK resume frames. celld does not add an Agent-specific protocol: the runtime adaptation hands each hibernatable `ws.send()` to the existing per-cell output gate immediately with the cell's current committed position. The gate preserves one scope-level FIFO, proves each newer position through the normal durability path, flushes the durable prefix while the handler remains suspended, and seals the event's final no-frame write after all earlier sends. A failed proof drops the held suffix and closes the scope rather than exposing a hole in an ordered stream.
+
+The provider also emits controlled memory and reminder tool calls. Strict Zod-backed server tools retain bounded explicit facts and reminder metadata in application SQL separate from chat transport messages. Reminder tools use idempotent Agent schedules, reject invalid delays, messages, identifiers, and cross-Agent cancellation attempts, and retain pending, cancelled, and completed state. The public runner scopes its chat Agents to unique per-run names so durable SDK resume cursors from an earlier run cannot affect repeatability; the pinned `alpha` and `beta` operational reset routes remain covered separately. It proves same-Agent completion broadcasts, alarm wake-up after inactivity, named isolation, and durable reads through public Agent routes. Tests do not inspect package-private SQLite tables.
 
 The provider double also produces rejection, malformed stream, and connection
 failures. Together with a missing-capability request, these prove stable public
@@ -52,6 +56,7 @@ credentials:
 - `chat_provider_unavailable`
 - `chat_provider_rejected`
 - `chat_provider_invalid_output`
+- `chat_stream_interrupted`
 
 ## Compose conformance
 
@@ -68,7 +73,7 @@ CELLD_IDLE_EVICT_S=1 \
 docker compose --profile test run --rm e2e
 ```
 
-The Compose provider is deterministic and secret-free. The E2E runner schedules, lists, deduplicates, cancels, and completes alarm-backed reminders in addition to the chat and memory checks. celld receives only
+The Compose provider is deterministic and secret-free. The E2E runner interrupts and concurrently resumes known paused streams, reconciles terminal failure, and schedules, lists, deduplicates, cancels, and completes alarm-backed reminders in addition to the ordinary chat and memory checks. celld receives only
 `MODEL_GATEWAY_URL=http://model-provider:8788` and the reviewed model name.
 A real Strix deployment supplies the same OpenAI chat-completions shape through
 the separately credentialed internal gateway owned by the demo repository.

@@ -36,23 +36,25 @@ async fn dispatch_ws_message(
         .as_ref()
         .context("no cell runtime")?
         .ws_message(scope.to_string(), ws_id, data)
-        .await?;
-    // The gate captured the handler's outbound frames. With the gate armed, hand
-    // them to the cell's barrier queue; else flush them as the handler produced
-    // them. Either way the frames only reach a socket from here.
-    if !app.output_gate {
-        celld::js::ws_emit_batch(dispatch.frames);
-    } else if !dispatch.frames.is_empty() || dispatch.write_position.is_some() {
-        app.ws_output(
-            request,
-            scope.to_string(),
-            dispatch.frames,
-            dispatch.write_position,
-        )
         .await;
+    match dispatch {
+        Ok(dispatch) => {
+            // Every `send()` entered the shared output queue synchronously.
+            // Seal the event through that same FIFO so its final no-frame write
+            // cannot overtake a chunk that the handler emitted before settling.
+            celld::js::ws_output_finish(request, scope.to_string(), dispatch.write_position)
+                .await?;
+            drop(activity);
+            Ok(())
+        }
+        Err(error) => {
+            // Preserve any already-emitted durable prefix, then truncate the
+            // ordered stream. The gate drops output produced after this abort.
+            celld::js::ws_output_abort(scope.to_string()).await;
+            drop(activity);
+            Err(error)
+        }
     }
-    drop(activity);
-    Ok(())
 }
 
 async fn dispatch_ws_closed(

@@ -8,7 +8,9 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8788;
 const CONFORMANCE_MODEL = "llama-swap/Qwen3.6-35B-A3B";
 const MAX_REQUEST_BYTES = 64 * 1024;
+const DEFAULT_PAUSE_MS = 750;
 const STREAM_CHUNKS = ["Deterministic ", "streamed ", "response."];
+const INTERRUPTED_STREAM_CHUNKS = ["Interrupted ", "stream ", "completed."];
 let toolCallSequence = 0;
 
 async function requestJson(request) {
@@ -82,13 +84,13 @@ function streamToolCall(response, name, input) {
   response.end("data: [DONE]\n\n");
 }
 
-async function streamCompletion(response) {
+async function streamCompletion(response, chunks = STREAM_CHUNKS) {
   response.writeHead(200, {
     "cache-control": "no-store",
     connection: "keep-alive",
     "content-type": "text/event-stream; charset=utf-8",
   });
-  for (const chunk of STREAM_CHUNKS) {
+  for (const chunk of chunks) {
     streamChunk(response, chunk);
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
   }
@@ -96,7 +98,27 @@ async function streamCompletion(response) {
   response.end("data: [DONE]\n\n");
 }
 
-async function handle(request, response) {
+async function streamInterruptedCompletion(response, pauseMs, fail) {
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    connection: "keep-alive",
+    "content-type": "text/event-stream; charset=utf-8",
+  });
+  streamChunk(response, INTERRUPTED_STREAM_CHUNKS[0]);
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, pauseMs));
+  if (fail) {
+    response.destroy();
+    return;
+  }
+  for (const chunk of INTERRUPTED_STREAM_CHUNKS.slice(1)) {
+    streamChunk(response, chunk);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
+  }
+  streamChunk(response, null, "stop");
+  response.end("data: [DONE]\n\n");
+}
+
+async function handle(request, response, pauseMs) {
   const url = new URL(request.url ?? "/", "http://provider.invalid");
   if (request.method === "GET" && url.pathname === "/health") {
     return json(response, 200, { ok: true, model: CONFORMANCE_MODEL });
@@ -127,6 +149,12 @@ async function handle(request, response) {
   if (prompt.includes("[provider-unavailable]")) {
     request.socket.destroy();
     return;
+  }
+  if (prompt.includes("[provider-terminal-failure]")) {
+    return streamInterruptedCompletion(response, pauseMs, true);
+  }
+  if (prompt.includes("[provider-paused]")) {
+    return streamInterruptedCompletion(response, pauseMs, false);
   }
   if (body.messages.at(-1)?.role === "tool") {
     return streamCompletion(response);
@@ -167,11 +195,16 @@ async function handle(request, response) {
 /**
  * Creates the deterministic OpenAI-compatible streaming provider.
  *
+ * @param {{ pauseMs?: number } | undefined} options Provider timing controls for tests.
  * @returns {import("node:http").Server} The unbound HTTP server.
  */
-export function createDeterministicProvider() {
+export function createDeterministicProvider(options = undefined) {
+  const configuredPause = options?.pauseMs;
+  const pauseMs = Number.isSafeInteger(configuredPause) && configuredPause >= 0
+    ? configuredPause
+    : DEFAULT_PAUSE_MS;
   return createServer((request, response) => {
-    void handle(request, response).catch(() => {
+    void handle(request, response, pauseMs).catch(() => {
       if (!response.headersSent) {
         json(response, 500, { error: { code: "provider_internal_error" } });
       } else {

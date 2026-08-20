@@ -18,14 +18,73 @@ pub enum WsOut {
     Close(u16, String),
 }
 
-/// The result of delivering one `webSocketMessage`. `frames` are the outbound
-/// frames the handler produced, captured by the output gate; `write_position`
-/// is the cell's committed-write count after the handler when it advanced past
-/// where it stood before — i.e. the handler wrote, and its frames must be held
-/// until that position is durable. `None` means no write: flush the frames.
+/// The result of delivering one `webSocketMessage`. Outbound frames are handed
+/// to the host as they are sent; `write_position` seals the event with the
+/// cell's final committed-write position so a write with no following frame is
+/// still covered by the output gate.
 pub struct WsDispatch {
-    pub frames: Vec<(u64, WsOut)>,
     pub write_position: Option<u64>,
+}
+
+/// Incremental output from a hibernatable WebSocket event.
+///
+/// Frames and the event's final position share one channel so the host observes
+/// every `send()` before the event is sealed, even when the handler suspends
+/// across turns and resumes on another executor thread.
+pub enum WsOutputReq {
+    Frame {
+        scope: String,
+        websocket: u64,
+        out: WsOut,
+        position: Option<u64>,
+    },
+    Finish {
+        request: u64,
+        scope: String,
+        write_position: Option<u64>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    Abort {
+        scope: String,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+static WS_OUTPUT_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<WsOutputReq>> = OnceLock::new();
+
+pub fn set_ws_output_tx(tx: tokio::sync::mpsc::UnboundedSender<WsOutputReq>) {
+    let _ = WS_OUTPUT_TX.set(tx);
+}
+
+pub async fn ws_output_finish(
+    request: u64,
+    scope: String,
+    write_position: Option<u64>,
+) -> anyhow::Result<()> {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    WS_OUTPUT_TX
+        .get()
+        .context("no WebSocket output channel")?
+        .send(WsOutputReq::Finish {
+            request,
+            scope,
+            write_position,
+            reply,
+        })
+        .map_err(|_| anyhow!("WebSocket output channel closed"))?;
+    receive
+        .await
+        .map_err(|_| anyhow!("WebSocket output gate dropped finish"))
+}
+
+pub async fn ws_output_abort(scope: String) {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    if WS_OUTPUT_TX
+        .get()
+        .is_some_and(|tx| tx.send(WsOutputReq::Abort { scope, reply }).is_ok())
+    {
+        let _ = receive.await;
+    }
 }
 
 /// One inbound event on a socket the ISOLATE polls, rather than one the host
@@ -342,23 +401,6 @@ pub fn ws_unregister(id: u64) {
     }
 }
 
-pub(super) fn ws_capture_begin() {
-    current_context()
-        .ws_capture
-        .lock()
-        .unwrap()
-        .push(Vec::new());
-}
-
-pub(super) fn ws_capture_take() -> Vec<(u64, WsOut)> {
-    current_context()
-        .ws_capture
-        .lock()
-        .unwrap()
-        .pop()
-        .unwrap_or_default()
-}
-
 /// Whether a socket is one the output gate may hold frames for: a hibernatable
 /// transport, whose messages the host pushes into the cell.
 ///
@@ -457,17 +499,32 @@ pub async fn ws_await_flushes(id: u64) {
 }
 
 fn ws_emit(id: u64, out: WsOut) {
-    let context = current_context();
-    let mut capture = context.ws_capture.lock().unwrap();
-    if !capture.is_empty() && ws_gate_may_hold(id) {
-        capture.last_mut().unwrap().push((id, out));
-        return;
+    if ws_gate_may_hold(id) {
+        let context = current_context();
+        let scope = context.cell_scope();
+        let position = scope.as_deref().and_then(storage::write_position);
+        if let (Some(scope), Some(tx)) = (scope, WS_OUTPUT_TX.get()) {
+            if tx
+                .send(WsOutputReq::Frame {
+                    scope,
+                    websocket: id,
+                    out,
+                    position,
+                })
+                .is_ok()
+            {
+                return;
+            }
+            ws_registry().lock().unwrap().emit(
+                id,
+                WsOut::Close(1011, "celld WebSocket output gate unavailable".to_string()),
+            );
+            return;
+        }
     }
-    drop(capture);
-    // A socket the isolate opened itself, which the capture above deliberately
-    // will not hold: releasing captured frames waits for the handler to
-    // return, and this handler may be awaiting a reply to the very frame being
-    // held. Waiting on the DURABILITY ticket instead has no such cycle -- it
+    // A socket the isolate opened itself cannot use the cell-level queue: its
+    // handler may be awaiting a reply to the very frame being held. Waiting on
+    // the DURABILITY ticket instead has no such cycle -- it
     // is resolved by the replicator, which does not need this event loop -- so
     // the frame can be held without deadlocking the script that sent it.
     let gate = egress_gate_request();

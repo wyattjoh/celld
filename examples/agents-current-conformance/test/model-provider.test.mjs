@@ -15,8 +15,8 @@ afterEach(async () => {
   servers.clear();
 });
 
-async function providerModel() {
-  const server = createDeterministicProvider();
+async function providerModel(options = undefined) {
+  const server = createDeterministicProvider(options);
   servers.add(server);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -137,6 +137,44 @@ test("the OpenAI adapter observes multiple deterministic text chunks", async () 
 
   assert.deepEqual(chunks, ["Deterministic ", "streamed ", "response."]);
   assert.equal(chunks.join(""), "Deterministic streamed response.");
+});
+
+test("the provider pauses a resumable response after its first known chunk", async () => {
+  const result = streamText({
+    model: await providerModel({ pauseMs: 75 }),
+    maxRetries: 0,
+    messages: [{ role: "user", content: "[provider-paused]" }],
+  });
+  const chunks = [];
+  const observedAt = [];
+  for await (const part of result.fullStream) {
+    if (part.type !== "text-delta") continue;
+    chunks.push(part.text);
+    observedAt.push(Date.now());
+  }
+
+  assert.deepEqual(chunks, ["Interrupted ", "stream ", "completed."]);
+  assert.ok(observedAt[1] - observedAt[0] >= 50, "provider did not preserve the interruption window");
+});
+
+test("the provider fails deterministically after one resumable chunk", async () => {
+  const result = streamText({
+    model: await providerModel({ pauseMs: 25 }),
+    maxRetries: 0,
+    messages: [{ role: "user", content: "[provider-terminal-failure]" }],
+  });
+  const chunks = [];
+  let failure;
+  try {
+    for await (const part of result.fullStream) {
+      if (part.type === "text-delta") chunks.push(part.text);
+    }
+  } catch (error) {
+    failure = error;
+  }
+
+  assert.deepEqual(chunks, ["Interrupted "]);
+  assert.ok(failure instanceof Error);
 });
 
 for (const [label, marker] of [

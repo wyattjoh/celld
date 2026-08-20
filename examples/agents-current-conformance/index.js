@@ -39,11 +39,13 @@ const reminderPayloadSchema = scheduleReminderInputSchema.extend({
 const emptyToolInputSchema = z.object({}).strict();
 
 const PUBLIC_PROVIDER_ERRORS = Object.freeze({
+  interrupted: "chat_stream_interrupted",
   invalid: "chat_provider_invalid_output",
   missing: "chat_provider_capability_missing",
   rejected: "chat_provider_rejected",
   unavailable: "chat_provider_unavailable",
 });
+const PUBLIC_PROVIDER_ERROR_CODES = new Set(Object.values(PUBLIC_PROVIDER_ERRORS));
 
 function json(value, init) {
   return Response.json(value, init);
@@ -118,6 +120,33 @@ function errorStreamResponse(code) {
       },
     }),
   });
+}
+
+function durableChatOutcome(result) {
+  if (result.status === "completed") return { status: "completed" };
+  if (result.status === "aborted") {
+    return { status: "failed", code: PUBLIC_PROVIDER_ERRORS.interrupted };
+  }
+  return {
+    status: "failed",
+    code: PUBLIC_PROVIDER_ERROR_CODES.has(result.error)
+      ? result.error
+      : PUBLIC_PROVIDER_ERRORS.unavailable,
+  };
+}
+
+function finalizeChatMessage(message, outcome) {
+  return {
+    ...message,
+    metadata: {
+      ...(message.metadata && typeof message.metadata === "object" ? message.metadata : {}),
+      celldStream: outcome,
+    },
+    parts: message.parts.map((part) =>
+      part && typeof part === "object" && part.state === "streaming"
+        ? { ...part, state: "done" }
+        : part),
+  };
 }
 
 /**
@@ -277,6 +306,14 @@ export class CurrentConformanceAgent extends AIChatAgent {
       stopWhen: stepCountIs(5),
     });
     return result.toUIMessageStreamResponse({ onError: publicProviderError });
+  }
+
+  async onChatResponse(result) {
+    const index = this.messages.findIndex((message) => message.id === result.message.id);
+    if (index < 0) return;
+    const messages = [...this.messages];
+    messages[index] = finalizeChatMessage(result.message, durableChatOutcome(result));
+    await this.persistMessages(messages);
   }
 
   listMemories(limit = MAX_MEMORIES) {

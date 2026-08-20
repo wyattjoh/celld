@@ -137,11 +137,16 @@ For the current published Agents SDK chat contract, use the separate
 credential-free [`agents-current-conformance`](examples/agents-current-conformance/README.md)
 target. It pins `agents@0.21.0`, `@cloudflare/ai-chat@0.10.2`, and a compatible
 AI SDK/OpenAI adapter lane; exercises standard named HTTP/WebSocket routing;
-and verifies multi-event model streaming, durable messages, bounded errors,
-schema-validated durable memory and reminder tools, idempotent schedules,
-owner-scoped cancellation, alarm wake-up, synchronized completion broadcasts,
-named isolation, and reconnect reads after inactivity. Compose keeps the legacy target as its
-default and selects the current target with
+and verifies multi-event model streaming, durable messages, deterministic
+mid-stream disconnect and concurrent resume, one reconciled assistant message,
+bounded terminal outcomes and provider errors, schema-validated durable memory
+and reminder tools, idempotent schedules, owner-scoped cancellation, alarm
+wake-up, synchronized completion broadcasts, named isolation, and reconnect
+reads after inactivity. The source-unmodified SDK keeps its public resume
+protocol; celld incrementally feeds hibernatable WebSocket frames through the
+existing committed-position output gate so a durable prefix can leave while a
+handler is suspended. Compose keeps the legacy target as its default and
+selects the current target with
 `CELLD_CONFORMANCE_FIXTURE=agents-current-conformance`.
 
 ## Run it
