@@ -90,6 +90,41 @@ test("a deterministic memory tool turn executes once and reaches a final respons
   assert.equal(executions, 1);
 });
 
+test("the OpenAI adapter observes deterministic reminder tool calls", async () => {
+  const model = await providerModel();
+  const callFor = async (content, tools) => {
+    const result = streamText({
+      model,
+      messages: [{ role: "user", content }],
+      tools,
+    });
+    for await (const part of result.fullStream) {
+      if (part.type === "tool-call") return part;
+    }
+    throw new Error("provider did not emit a reminder tool call");
+  };
+
+  const scheduled = await callFor("[tool-reminder-schedule:15] hydrate", {
+    scheduleReminder: tool({
+      inputSchema: z.object({ message: z.string(), delaySeconds: z.number() }),
+    }),
+  });
+  assert.equal(scheduled.toolName, "scheduleReminder");
+  assert.deepEqual(scheduled.input, { message: "hydrate", delaySeconds: 15 });
+
+  const listed = await callFor("[tool-reminder-list]", {
+    listReminders: tool({ inputSchema: z.object({}) }),
+  });
+  assert.equal(listed.toolName, "listReminders");
+  assert.deepEqual(listed.input, {});
+
+  const cancelled = await callFor("[tool-reminder-cancel] schedule_123", {
+    cancelReminder: tool({ inputSchema: z.object({ id: z.string() }) }),
+  });
+  assert.equal(cancelled.toolName, "cancelReminder");
+  assert.deepEqual(cancelled.input, { id: "schedule_123" });
+});
+
 test("the OpenAI adapter observes multiple deterministic text chunks", async () => {
   const result = streamText({
     model: await providerModel(),

@@ -131,6 +131,20 @@ async function handle(request, response) {
   if (body.messages.at(-1)?.role === "tool") {
     return streamCompletion(response);
   }
+  const reminderSchedule = prompt.match(/\[tool-reminder-schedule:([^\]]+)\]\s*([\s\S]*)/);
+  if (reminderSchedule) {
+    return streamToolCall(response, "scheduleReminder", {
+      message: reminderSchedule[2].trim(),
+      delaySeconds: Number(reminderSchedule[1]),
+    });
+  }
+  if (prompt.includes("[tool-reminder-list]")) {
+    return streamToolCall(response, "listReminders", {});
+  }
+  if (prompt.includes("[tool-reminder-cancel]")) {
+    const id = prompt.split("[tool-reminder-cancel]", 2)[1]?.trim() ?? "";
+    return streamToolCall(response, "cancelReminder", { id });
+  }
   if (prompt.includes("[tool-empty]")) {
     return streamToolCall(response, "rememberFact", { fact: "" });
   }

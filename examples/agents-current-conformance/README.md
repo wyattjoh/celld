@@ -32,7 +32,8 @@ small tracer endpoints:
 
 - `GET /current/names` resolves `alpha` and `beta` with `getAgentByName`.
 - `GET|POST /current/state/<name>` verifies isolated Agent state and SQL.
-- `POST /current/memories/reset` clears both named fixtures before a repeatable run.
+- `POST /current/memories/reset` clears both named memory fixtures before a repeatable run.
+- `POST /current/reminders/reset` cancels and clears both named reminder fixtures before a repeatable run.
 - `GET /agents/current-conformance-agent/<name>/status` exercises standard
   Agent HTTP routing.
 - `GET /agents/current-conformance-agent/<name>/get-messages` is the
@@ -40,7 +41,7 @@ small tracer endpoints:
 - `ws://.../agents/current-conformance-agent/<name>` carries both ordinary
   Agent frames and the standard `AIChatAgent` chat protocol.
 
-A deterministic OpenAI-compatible provider emits three separate text deltas before completing `Deterministic streamed response.` It also emits controlled `rememberFact`, `listMemories`, and `summarizeMemories` calls. The strict Zod-backed server tools retain a bounded set of explicit facts in application SQL separate from chat transport messages. The public runner verifies completed tool parts, rejects empty, oversized, and cross-Agent-shaped inputs, proves named isolation, closes every connection, reconnects, and reads the same messages and memory through public Agent routes. Tests do not inspect package-private SQLite tables.
+A deterministic OpenAI-compatible provider emits three separate text deltas before completing `Deterministic streamed response.` It also emits controlled memory and reminder tool calls. Strict Zod-backed server tools retain bounded explicit facts and reminder metadata in application SQL separate from chat transport messages. Reminder tools use idempotent Agent schedules, reject invalid delays, messages, identifiers, and cross-Agent cancellation attempts, and retain pending, cancelled, and completed state. The public runner proves same-Agent completion broadcasts, alarm wake-up after inactivity, named isolation, and durable reads through public Agent routes. Tests do not inspect package-private SQLite tables.
 
 The provider double also produces rejection, malformed stream, and connection
 failures. Together with a missing-capability request, these prove stable public
@@ -67,7 +68,7 @@ CELLD_IDLE_EVICT_S=1 \
 docker compose --profile test run --rm e2e
 ```
 
-The Compose provider is deterministic and secret-free. celld receives only
+The Compose provider is deterministic and secret-free. The E2E runner schedules, lists, deduplicates, cancels, and completes alarm-backed reminders in addition to the chat and memory checks. celld receives only
 `MODEL_GATEWAY_URL=http://model-provider:8788` and the reviewed model name.
 A real Strix deployment supplies the same OpenAI chat-completions shape through
 the separately credentialed internal gateway owned by the demo repository.

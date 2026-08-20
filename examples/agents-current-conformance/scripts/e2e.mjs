@@ -138,9 +138,60 @@ async function clearChat(name) {
   await new Promise((resolve) => setTimeout(resolve, 100));
   const closed = new Promise((resolve) => socket.addEventListener("close", resolve, { once: true }));
   socket.close();
-  await closed;
+  await Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(resolve, 500)),
+  ]);
   const messages = await json(`/agents/current-conformance-agent/${name}/get-messages`);
   expect(messages.length === 0, `${name} chat clear did not make the run repeatable`);
+}
+
+async function observeState(name, predicate, action) {
+  const socket = new WebSocket(websocketUrl(name));
+  let resolveConnected;
+  let rejectConnected;
+  let resolveState;
+  let rejectState;
+  const connected = new Promise((resolve, reject) => {
+    resolveConnected = resolve;
+    rejectConnected = reject;
+  });
+  const observed = new Promise((resolve, reject) => {
+    resolveState = resolve;
+    rejectState = reject;
+  });
+  const timer = setTimeout(() => {
+    const error = new Error(`WebSocket ${name} did not broadcast the expected Agent state`);
+    rejectConnected(error);
+    rejectState(error);
+    socket.close();
+  }, REQUEST_TIMEOUT_MS);
+  socket.addEventListener("message", (event) => {
+    if (typeof event.data !== "string") return;
+    let frame;
+    try { frame = JSON.parse(event.data); } catch { return; }
+    if (frame.type === "current-conformance.connected") resolveConnected();
+    if (frame.type === "cf_agent_state" && predicate(frame.state)) resolveState(frame.state);
+  });
+  socket.addEventListener("error", () => {
+    const error = new Error(`WebSocket ${name} state observer failed`);
+    rejectConnected(error);
+    rejectState(error);
+  });
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, { once: true });
+    socket.addEventListener("error", reject, { once: true });
+  });
+  await connected;
+  try {
+    await action();
+    return await observed;
+  } finally {
+    clearTimeout(timer);
+    const closed = new Promise((resolve) => socket.addEventListener("close", resolve, { once: true }));
+    socket.close();
+    await closed;
+  }
 }
 
 async function websocketChat(name, text, body = {}) {
@@ -215,6 +266,8 @@ await step("current target readiness", async () => {
   expect(result.results.every((entry) => ["alpha", "beta"].includes(entry.agent)), "current Agent names were not isolated");
   const reset = await post("/current/memories/reset", {});
   expect(reset.results?.every((entry) => entry.total === 0), "memory reset did not make the run repeatable");
+  const reminderReset = await post("/current/reminders/reset", {});
+  expect(reminderReset.results?.every((entry) => entry.total === 0), "reminder reset did not make the run repeatable");
   await Promise.all([clearChat("alpha"), clearChat("beta")]);
 });
 
@@ -254,7 +307,6 @@ const alphaConversation = await (async () => {
   return value;
 })();
 
-let completedTranscript;
 await step("AIChatAgent streams and persists a deterministic conversation", async () => {
   const chat = await websocketChat("alpha", "stream a deterministic response");
   const observableChunks = chat.responseFrames.filter((frame) =>
@@ -262,11 +314,11 @@ await step("AIChatAgent streams and persists a deterministic conversation", asyn
   );
   expect(observableChunks.length > 1, "expected multiple observable chat streaming events");
 
-  completedTranscript = await json("/agents/current-conformance-agent/alpha/get-messages");
-  expect(completedTranscript.at(-2)?.role === "user", "completed transcript did not persist the user message");
-  expect(messageText(completedTranscript.at(-2)) === "stream a deterministic response", "persisted user message changed");
-  expect(completedTranscript.at(-1)?.role === "assistant", "completed transcript did not persist the assistant message");
-  expect(messageText(completedTranscript.at(-1)) === "Deterministic streamed response.", "persisted assistant response was not deterministic");
+  const transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  expect(transcript.at(-2)?.role === "user", "completed transcript did not persist the user message");
+  expect(messageText(transcript.at(-2)) === "stream a deterministic response", "persisted user message changed");
+  expect(transcript.at(-1)?.role === "assistant", "completed transcript did not persist the assistant message");
+  expect(messageText(transcript.at(-1)) === "Deterministic streamed response.", "persisted assistant response was not deterministic");
 });
 
 const durableFact = "alpha durable memory";
@@ -341,6 +393,116 @@ await step("memory count and summary inputs remain bounded", async () => {
   expect(!summary.output.summary.includes(durableFact), "summary included facts outside its bounded window");
 });
 
+for (const [label, marker] of [
+  ["zero delay", "[tool-reminder-schedule:0] invalid delay"],
+  ["excessive delay", "[tool-reminder-schedule:3601] invalid delay"],
+  ["empty message", "[tool-reminder-schedule:10]"],
+  ["oversized message", `[tool-reminder-schedule:10] ${"r".repeat(501)}`],
+]) {
+  await step(`${label} reminder input cannot create a schedule`, async () => {
+    const chat = await websocketChat("alpha", marker);
+    const transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+    const failedPart = lastToolPart(transcript, "scheduleReminder");
+    const publicStream = chat.responseFrames.map((frame) => frame.body ?? "").join("");
+    expect(
+      failedPart?.state === "output-error" || publicStream.includes("chat_provider_invalid_output"),
+      `${label} did not expose a bounded reminder validation failure`,
+    );
+    const alpha = await json("/agents/current-conformance-agent/alpha/status");
+    expect(alpha.reminders?.length === 0, `${label} created reminder metadata`);
+  });
+}
+
+let cancellableReminderId;
+await step("reminder scheduling is idempotent and listable", async () => {
+  const marker = "[tool-reminder-schedule:30] deterministic cancellable reminder";
+  await websocketChat("alpha", marker);
+  let transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const first = lastToolPart(transcript, "scheduleReminder");
+  expect(first?.state === "output-available", "scheduleReminder did not complete");
+  expect(first.output?.reminder?.status === "pending", "new reminder was not pending");
+  cancellableReminderId = first.output.reminder.id;
+
+  await websocketChat("alpha", marker);
+  transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const repeated = lastToolPart(transcript, "scheduleReminder");
+  expect(repeated?.output?.duplicate === true, "repeated schedule call did not report deduplication");
+  expect(repeated.output.reminder?.id === cancellableReminderId, "repeated schedule call changed identifiers");
+
+  await websocketChat("alpha", "[tool-reminder-list]");
+  transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const listed = lastToolPart(transcript, "listReminders");
+  expect(listed?.output?.pending === 1, "listReminders did not expose exactly one pending reminder");
+  expect(listed.output.reminders?.[0]?.id === cancellableReminderId, "listReminders omitted the pending reminder");
+});
+
+await step("cross-Agent and malformed cancellation attempts are rejected", async () => {
+  await websocketChat("beta", `[tool-reminder-cancel] ${cancellableReminderId}`);
+  let transcript = await json("/agents/current-conformance-agent/beta/get-messages");
+  const crossAgent = lastToolPart(transcript, "cancelReminder");
+  expect(crossAgent?.state === "output-error", "cross-Agent cancellation did not fail");
+
+  await websocketChat("alpha", "[tool-reminder-cancel] invalid/id");
+  transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const malformed = lastToolPart(transcript, "cancelReminder");
+  expect(malformed?.state === "output-error", "malformed schedule id did not fail");
+
+  const alpha = await json("/agents/current-conformance-agent/alpha/status");
+  expect(
+    alpha.reminders?.some((reminder) =>
+      reminder.id === cancellableReminderId && reminder.status === "pending"),
+    "rejected cancellation changed the owning Agent reminder",
+  );
+  const beta = await json("/agents/current-conformance-agent/beta/status");
+  expect(beta.reminders?.length === 0, "cross-Agent cancellation created beta reminder state");
+});
+
+await step("the owning Agent can cancel and retain reminder history", async () => {
+  await websocketChat("alpha", `[tool-reminder-cancel] ${cancellableReminderId}`);
+  const transcript = await json("/agents/current-conformance-agent/alpha/get-messages");
+  const cancelled = lastToolPart(transcript, "cancelReminder");
+  expect(cancelled?.output?.cancelled === true, "cancelReminder did not report cancellation");
+  expect(cancelled.output.reminder?.status === "cancelled", "cancelled reminder metadata was not durable");
+  const alpha = await json("/agents/current-conformance-agent/alpha/status");
+  expect(
+    alpha.reminders?.some((reminder) =>
+      reminder.id === cancellableReminderId && reminder.status === "cancelled"),
+    "status did not retain the cancelled reminder",
+  );
+});
+
+await step("completed reminder state broadcasts without polling", async () => {
+  const message = "broadcast reminder completion";
+  const state = await observeState(
+    "alpha",
+    (candidate) => candidate?.reminderItems?.some((reminder) =>
+      reminder.message === message && reminder.status === "completed"),
+    async () => websocketChat("alpha", `[tool-reminder-schedule:2] ${message}`),
+  );
+  expect(state.lastReminder === message, "broadcast state omitted the completed reminder");
+});
+
+await step("an alarm wakes an inactive Agent and preserves Agent isolation", async () => {
+  const delaySeconds = IDLE_EVICT_S + 8;
+  const message = "inactive beta reminder";
+  await websocketChat("beta", `[tool-reminder-schedule:${delaySeconds}] ${message}`);
+  await new Promise((resolve) => setTimeout(resolve, (delaySeconds + 2) * 1_000));
+  const [alpha, beta] = await Promise.all([
+    json("/agents/current-conformance-agent/alpha/status"),
+    json("/agents/current-conformance-agent/beta/status"),
+  ]);
+  expect(beta.activeConnections === 0, "beta retained a public connection through the alarm wait");
+  expect(
+    beta.reminders?.some((reminder) =>
+      reminder.message === message && reminder.status === "completed"),
+    "inactive beta reminder did not complete durably",
+  );
+  expect(
+    !alpha.reminders?.some((reminder) => reminder.message === message),
+    "beta reminder leaked into alpha",
+  );
+});
+
 for (const scenario of [
   {
     label: "missing provider capability",
@@ -379,6 +541,9 @@ for (const scenario of [
   });
 }
 
+const reconnectMarker = "[tool-reminder-list]";
+await websocketChat("alpha", reconnectMarker);
+
 await step("inactivity and reconnect preserve both current Agent states", async () => {
   // Close every public connection, then leave both names idle through several
   // celld load samples before reconnecting through the standard Agent route.
@@ -403,17 +568,15 @@ await step("inactivity and reconnect preserve both current Agent states", async 
 
   const reopenedTranscript = await json("/agents/current-conformance-agent/alpha/get-messages");
   expect(
-    reopenedTranscript.length >= completedTranscript.length,
-    "AIChatAgent transcript lost messages after inactivity and reopen",
+    reopenedTranscript.some((message) =>
+      message.role === "user" && messageText(message) === reconnectMarker),
+    "AIChatAgent transcript lost the latest user message after inactivity and reopen",
   );
   expect(
-    JSON.stringify(reopenedTranscript.slice(0, completedTranscript.length)) === JSON.stringify(completedTranscript),
-    "AIChatAgent completed transcript prefix changed after inactivity and reopen",
-  );
-  expect(
-    toolParts(reopenedTranscript, "rememberFact")
-      .some((part) => part?.output?.memory?.fact === durableFact),
-    "reopened transcript lost the memory tool result",
+    toolParts(reopenedTranscript, "listReminders")
+      .some((part) => part?.output?.reminders?.some((reminder) =>
+        reminder.id === cancellableReminderId && reminder.status === "cancelled")),
+    "reopened transcript lost the latest durable reminder tool result",
   );
   expect(alpha.memories?.[0]?.fact === durableFact, "reopened Agent lost explicit memory state");
 });

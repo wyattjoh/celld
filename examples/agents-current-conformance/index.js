@@ -17,8 +17,24 @@ const CONFORMANCE_MODEL = "llama-swap/Qwen3.6-35B-A3B";
 const MAX_MEMORY_LENGTH = 500;
 const MAX_MEMORIES = 20;
 const MAX_SUMMARY_MEMORIES = 10;
+const MAX_REMINDER_MESSAGE_LENGTH = 500;
+const MAX_REMINDER_DELAY_SECONDS = 3_600;
+const MAX_PENDING_REMINDERS = 20;
+const MAX_REMINDER_HISTORY = 50;
+const MAX_SCHEDULE_ID_LENGTH = 64;
 const memoryInputSchema = z.object({
   fact: z.string().trim().min(1).max(MAX_MEMORY_LENGTH),
+}).strict();
+const scheduleReminderInputSchema = z.object({
+  message: z.string().trim().min(1).max(MAX_REMINDER_MESSAGE_LENGTH),
+  delaySeconds: z.number().int().min(1).max(MAX_REMINDER_DELAY_SECONDS),
+}).strict();
+const cancelReminderInputSchema = z.object({
+  id: z.string().trim().min(1).max(MAX_SCHEDULE_ID_LENGTH)
+    .regex(/^[a-zA-Z0-9_-]+$/),
+}).strict();
+const reminderPayloadSchema = scheduleReminderInputSchema.extend({
+  reminderId: z.string().uuid(),
 }).strict();
 const emptyToolInputSchema = z.object({}).strict();
 
@@ -49,6 +65,9 @@ function initialState(name = null) {
     lastMessage: null,
     lastConnectionId: null,
     memories: [],
+    reminders: 0,
+    lastReminder: null,
+    reminderItems: [],
   };
 }
 
@@ -143,6 +162,19 @@ export class CurrentConformanceAgent extends AIChatAgent {
         created_at INTEGER NOT NULL
       )
     `;
+    this.sql`
+      CREATE TABLE IF NOT EXISTS current_conformance_reminders (
+        reminder_id TEXT PRIMARY KEY NOT NULL,
+        schedule_id TEXT UNIQUE,
+        message TEXT NOT NULL,
+        delay_seconds INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        scheduled_at INTEGER NOT NULL,
+        due_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        cancelled_at INTEGER
+      )
+    `;
   }
 
   durableState() {
@@ -156,6 +188,9 @@ export class CurrentConformanceAgent extends AIChatAgent {
           ...(typeof persisted.value === "string" ? { value: persisted.value } : {}),
           ...(Number.isSafeInteger(persisted.revision) ? { revision: persisted.revision } : {}),
           ...(Number.isSafeInteger(activationCount) ? { activationCount } : {}),
+          ...(Number.isSafeInteger(persisted.reminders) ? { reminders: persisted.reminders } : {}),
+          ...(typeof persisted.lastReminder === "string" ? { lastReminder: persisted.lastReminder } : {}),
+          ...(Array.isArray(persisted.reminderItems) ? { reminderItems: persisted.reminderItems } : {}),
         }
       : {};
     const rows = this.sql`
@@ -194,6 +229,7 @@ export class CurrentConformanceAgent extends AIChatAgent {
       activeConnections: [...this.getConnections()].length,
       state,
       memories: this.listMemories().memories,
+      reminders: this.listReminders().reminders,
       events: this.sql`
         SELECT sequence, connection_id, message, message_count
         FROM current_conformance_events
@@ -237,7 +273,7 @@ export class CurrentConformanceAgent extends AIChatAgent {
       model: openai.chat(CONFORMANCE_MODEL),
       maxRetries: 0,
       messages: await convertToModelMessages(this.messages),
-      tools: this.memoryTools(),
+      tools: this.agentTools(),
       stopWhen: stepCountIs(5),
     });
     return result.toUIMessageStreamResponse({ onError: publicProviderError });
@@ -290,7 +326,7 @@ export class CurrentConformanceAgent extends AIChatAgent {
     };
   }
 
-  memoryTools() {
+  agentTools() {
     return {
       rememberFact: tool({
         description: "Remember one explicit fact in the current named Agent.",
@@ -307,7 +343,179 @@ export class CurrentConformanceAgent extends AIChatAgent {
         inputSchema: emptyToolInputSchema,
         execute: async () => this.summarizeMemories(),
       }),
+      scheduleReminder: tool({
+        description: "Schedule one durable reminder in the current named Agent.",
+        inputSchema: scheduleReminderInputSchema,
+        execute: async (input) => this.scheduleReminder(input),
+      }),
+      listReminders: tool({
+        description: "List pending, cancelled, and completed reminders in the current named Agent.",
+        inputSchema: emptyToolInputSchema,
+        execute: async () => this.listReminders(),
+      }),
+      cancelReminder: tool({
+        description: "Cancel a pending reminder owned by the current named Agent.",
+        inputSchema: cancelReminderInputSchema,
+        execute: async (input) => this.cancelReminder(input),
+      }),
     };
+  }
+
+  listReminders() {
+    this.ensureTables();
+    const reminders = this.sql`
+      SELECT schedule_id, message, delay_seconds, status, scheduled_at,
+             due_at, completed_at, cancelled_at
+      FROM current_conformance_reminders
+      WHERE status != 'scheduling'
+      ORDER BY
+        CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+        CASE status
+          WHEN 'pending' THEN due_at
+          ELSE COALESCE(completed_at, cancelled_at, scheduled_at)
+        END DESC
+      LIMIT ${MAX_REMINDER_HISTORY}
+    `.map((row) => ({
+      id: row.schedule_id,
+      message: row.message,
+      delaySeconds: Number(row.delay_seconds),
+      status: row.status,
+      scheduledAt: Number(row.scheduled_at),
+      dueAt: Number(row.due_at),
+      completedAt: row.completed_at === null ? null : Number(row.completed_at),
+      cancelledAt: row.cancelled_at === null ? null : Number(row.cancelled_at),
+    }));
+    return {
+      reminders,
+      total: reminders.length,
+      pending: reminders.filter((reminder) => reminder.status === "pending").length,
+    };
+  }
+
+  syncReminderState(lastReminder = undefined) {
+    const result = this.listReminders();
+    const state = this.state && typeof this.state === "object"
+      ? this.state
+      : initialState(this.name);
+    this.setState({
+      ...state,
+      agent: this.name,
+      reminders: result.reminders.filter((reminder) => reminder.status === "completed").length,
+      lastReminder: lastReminder ?? state.lastReminder ?? null,
+      reminderItems: result.reminders,
+    });
+    return result;
+  }
+
+  pruneReminderHistory() {
+    this.sql`
+      DELETE FROM current_conformance_reminders
+      WHERE status NOT IN ('scheduling', 'pending')
+        AND reminder_id NOT IN (
+          SELECT reminder_id
+          FROM current_conformance_reminders
+          WHERE status NOT IN ('scheduling', 'pending')
+          ORDER BY COALESCE(completed_at, cancelled_at, scheduled_at) DESC
+          LIMIT ${MAX_REMINDER_HISTORY}
+        )
+    `;
+  }
+
+  async scheduleReminder(input) {
+    const { message, delaySeconds } = scheduleReminderInputSchema.parse(input);
+    const duplicate = this.sql`
+      SELECT reminder_id, schedule_id
+      FROM current_conformance_reminders
+      WHERE message = ${message}
+        AND delay_seconds = ${delaySeconds}
+        AND status IN ('scheduling', 'pending')
+      ORDER BY scheduled_at
+      LIMIT 1
+    `[0];
+    if (duplicate?.schedule_id) {
+      const result = this.syncReminderState();
+      return {
+        reminder: result.reminders.find((reminder) => reminder.id === duplicate.schedule_id),
+        duplicate: true,
+      };
+    }
+    const pendingRows = this.sql`
+      SELECT COUNT(*) AS count
+      FROM current_conformance_reminders
+      WHERE status IN ('scheduling', 'pending')
+    `;
+    const current = { pending: Number(pendingRows[0]?.count ?? 0) };
+    if (!duplicate && current.pending >= MAX_PENDING_REMINDERS) {
+      throw new RangeError("reminder_pending_limit_reached");
+    }
+    const reminderId = duplicate?.reminder_id ?? crypto.randomUUID();
+    if (!duplicate) {
+      const scheduledAt = Date.now();
+      this.sql`
+        INSERT INTO current_conformance_reminders
+          (reminder_id, message, delay_seconds, status, scheduled_at, due_at)
+        VALUES (
+          ${reminderId}, ${message}, ${delaySeconds}, 'scheduling',
+          ${scheduledAt}, ${scheduledAt + delaySeconds * 1_000}
+        )
+      `;
+    }
+    const schedule = await this.schedule(delaySeconds, "deliverReminder", {
+      reminderId,
+      message,
+      delaySeconds,
+    }, { idempotent: true });
+    this.sql`
+      UPDATE current_conformance_reminders
+      SET schedule_id = ${schedule.id}, status = 'pending', due_at = ${schedule.time * 1_000}
+      WHERE reminder_id = ${reminderId} AND status = 'scheduling'
+    `;
+    const result = this.syncReminderState();
+    return {
+      reminder: result.reminders.find((reminder) => reminder.id === schedule.id),
+      duplicate: Boolean(duplicate),
+    };
+  }
+
+  async cancelReminder(input) {
+    const { id } = cancelReminderInputSchema.parse(input);
+    const reminder = this.sql`
+      SELECT schedule_id
+      FROM current_conformance_reminders
+      WHERE schedule_id = ${id} AND status = 'pending'
+    `[0];
+    if (!reminder) throw new RangeError("reminder_not_found_for_agent");
+    if (!await this.cancelSchedule(id)) {
+      throw new RangeError("reminder_no_longer_pending");
+    }
+    this.sql`
+      UPDATE current_conformance_reminders
+      SET status = 'cancelled', cancelled_at = ${Date.now()}
+      WHERE schedule_id = ${id} AND status = 'pending'
+    `;
+    this.pruneReminderHistory();
+    const result = this.syncReminderState();
+    return {
+      reminder: result.reminders.find((item) => item.id === id),
+      cancelled: true,
+    };
+  }
+
+  deliverReminder(payload) {
+    const { reminderId, message } = reminderPayloadSchema.parse(payload);
+    const reminder = this.sql`
+      SELECT schedule_id
+      FROM current_conformance_reminders
+      WHERE reminder_id = ${reminderId} AND status = 'pending'
+    `[0];
+    if (!reminder) return;
+    this.sql`
+      UPDATE current_conformance_reminders
+      SET status = 'completed', completed_at = ${Date.now()}
+      WHERE reminder_id = ${reminderId} AND status = 'pending'
+    `;
+    this.pruneReminderHistory();
+    this.syncReminderState(message);
   }
 
   resetMemories() {
@@ -318,6 +526,25 @@ export class CurrentConformanceAgent extends AIChatAgent {
       : initialState(this.name);
     this.setState({ ...state, agent: this.name, memories: [] });
     return this.listMemories();
+  }
+
+  async resetReminders() {
+    this.ensureTables();
+    const pending = this.listReminders().reminders
+      .filter((reminder) => reminder.status === "pending");
+    await Promise.all(pending.map((reminder) => this.cancelSchedule(reminder.id)));
+    this.sql`DELETE FROM current_conformance_reminders`;
+    const state = this.state && typeof this.state === "object"
+      ? this.state
+      : initialState(this.name);
+    this.setState({
+      ...state,
+      agent: this.name,
+      reminders: 0,
+      lastReminder: null,
+      reminderItems: [],
+    });
+    return this.listReminders();
   }
 
   async probe(input) {
@@ -434,6 +661,19 @@ export default {
         [...AGENT_NAMES].map(async (name) => {
           const agent = await namedAgent(env, name);
           return { name, ...(await agent.resetMemories()) };
+        }),
+      );
+      return json({ results });
+    }
+
+    if (url.pathname === "/current/reminders/reset") {
+      if (request.method !== "POST") {
+        return json({ error: "method_not_allowed" }, { status: 405 });
+      }
+      const results = await Promise.all(
+        [...AGENT_NAMES].map(async (name) => {
+          const agent = await namedAgent(env, name);
+          return { name, ...(await agent.resetReminders()) };
         }),
       );
       return json({ results });

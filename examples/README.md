@@ -24,8 +24,8 @@ Durable Object surface supported by `celld`:
 - `agents-current-conformance/` — deterministic, credential-free current
   `agents@0.21.0` and `@cloudflare/ai-chat@0.10.2` target for standard named
   routing, multi-event model streaming, durable chat messages, schema-validated
-  memory tools, bounded provider errors, and state/SQL persistence after inactivity
-  and reconnect
+  memory and alarm-backed reminder tools, bounded provider errors, synchronized
+  completion broadcasts, and state/SQL persistence after inactivity and reconnect
 - `wasm/` — a Durable Object counter in Rust, compiled to Wasm with
   [workers-rs](https://github.com/cloudflare/workers-rs); needs a build
   step first (see its [README](wasm/README.md))

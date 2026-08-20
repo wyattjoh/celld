@@ -27,4 +27,15 @@ test("the current target has deterministic named state and durable chat routes",
   assert.match(source, /summarizeMemories:\s*tool\(/);
   assert.match(source, /z\.string\(\)\.trim\(\)\.min\(1\)\.max\(MAX_MEMORY_LENGTH\)/);
   assert.match(source, /stopWhen: stepCountIs\(5\)/);
+  assert.match(source, /CREATE TABLE IF NOT EXISTS current_conformance_reminders/);
+  assert.match(source, /scheduleReminder:\s*tool\(/);
+  assert.match(source, /listReminders:\s*tool\(/);
+  assert.match(source, /cancelReminder:\s*tool\(/);
+  assert.match(source, /idempotent:\s*true/);
+  assert.match(source, /current\.pending >= MAX_PENDING_REMINDERS/);
+  assert.match(source, /LIMIT \$\{MAX_REMINDER_HISTORY\}/);
+  assert.match(source, /this\.schedule\(delaySeconds, "deliverReminder"/);
+  assert.match(source, /this\.cancelSchedule\(id\)/);
+  assert.match(source, /reminderId:\s*z\.string\(\)\.uuid\(\)/);
+  assert.match(source, /WHERE reminder_id = \$\{reminderId\}/);
 });
