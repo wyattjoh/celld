@@ -55,7 +55,7 @@ services:
       <<: *storage-environment
       CELLD_ESBUILD: /usr/local/bin/esbuild
     volumes:
-      - ./examples/agents-conformance:/workspace:ro
+      - ./examples/${CELLD_CONFORMANCE_FIXTURE:-agents-conformance}:/workspace:ro
       - agents-node-modules:/workspace/node_modules
     restart: "no"
 
@@ -82,7 +82,7 @@ services:
       timeout: 2s
       retries: 30
     volumes:
-      - ./examples/agents-conformance:/workspace:ro
+      - ./examples/${CELLD_CONFORMANCE_FIXTURE:-agents-conformance}:/workspace:ro
     init: true
 
   celld:
@@ -105,7 +105,10 @@ services:
       CELLD_LOADED_WORKER_TIMEOUT_S: "1"
       CELLD_VAR_MODEL_PROVIDER_URL: http://model-provider:8788/v1/chat
       CELLD_AI_URL: http://model-provider:8788/v1/ai
+      CELLD_VAR_MODEL_GATEWAY_URL: http://model-provider:8788
+      CELLD_VAR_LLM_MODEL: llama-swap/Qwen3.6-35B-A3B
       CELLD_ALARM_RESIDENT_MS: "0"
+      CELLD_IDLE_EVICT_S: ${CELLD_IDLE_EVICT_S:-1}
       # MinIO is convenient for this single-node lab but is not a supported
       # production fencing backend; skip only the startup provider probe here.
       CELLD_STORAGE_PROBE: "0"
@@ -133,8 +136,9 @@ services:
       CELLD_INTERNAL_URL: http://celld:8081
       CELLD_REQUEST_TIMEOUT_MS: "15000"
       CELLD_READINESS_TIMEOUT_MS: "120000"
+      CELLD_IDLE_EVICT_S: ${CELLD_IDLE_EVICT_S:-1}
     volumes:
-      - ./examples/agents-conformance:/workspace:ro
+      - ./examples/${CELLD_CONFORMANCE_FIXTURE:-agents-conformance}:/workspace:ro
     init: true
     restart: "no"
 

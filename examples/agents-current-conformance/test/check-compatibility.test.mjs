@@ -25,17 +25,21 @@ async function copyFixture() {
 test("the checked-in current Agents SDK target is exact", () => {
   assert.deepEqual(checkCompatibility(ROOT), {
     agentsVersion: "0.21.0",
+    aiChatVersion: "0.10.2",
+    aiVersion: "6.0.259",
+    openaiVersion: "3.0.98",
     zodVersion: "4.4.3",
     esbuildVersion: "0.28.2",
     lockfileSha256:
-      "209c17bf8bf53fd37cd6c89eb7e1fb6ecafc4c563593370e217c47512f68a51e",
+      "7be9d2518eed1483b43340d44e7fe24a28be32db0ed0595730e0887686718544",
   });
 });
 
 test("the target uses the current public routing surface", async () => {
   const source = await readFile(join(ROOT, "index.js"), "utf8");
   assert.match(source, /from "agents"/);
-  assert.match(source, /extends Agent/);
+  assert.match(source, /from "@cloudflare\/ai-chat"/);
+  assert.match(source, /extends AIChatAgent/);
   assert.match(source, /getAgentByName/);
   assert.match(source, /routeAgentRequest/);
   assert.match(source, /onRequest\(request\)/);
@@ -55,6 +59,9 @@ test("the matrix records supported, adapted, and unsupported decisions", async (
     assert.match(matrix, new RegExp(`\\|\\s*${status}\\s*\\|`, "i"));
   }
   assert.match(matrix, /agents@0\.21\.0/);
+  assert.match(matrix, /@cloudflare\/ai-chat@0\.10\.2/);
+  assert.match(matrix, /ai@6\.0\.259/);
+  assert.match(matrix, /@ai-sdk\/openai@3\.0\.98/);
 });
 
 test("a direct package version change fails with a stable error", async () => {

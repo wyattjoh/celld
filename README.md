@@ -133,12 +133,14 @@ single-node lab explicitly disables the startup storage-provider probe. Never
 reuse this Compose topology, its credentials, or that probe override for a
 production fleet.
 
-For the current published Agents SDK routing contract, use the separate
+For the current published Agents SDK chat contract, use the separate
 credential-free [`agents-current-conformance`](examples/agents-current-conformance/README.md)
-target. It pins `agents@0.21.0`, exercises the standard named HTTP/WebSocket
-routes, and verifies state/SQL after idle eviction and reopen. The existing
-Compose workflow intentionally remains on the legacy target so its contract is
-not changed.
+target. It pins `agents@0.21.0`, `@cloudflare/ai-chat@0.10.2`, and a compatible
+AI SDK/OpenAI adapter lane; exercises standard named HTTP/WebSocket routing;
+and verifies multi-event model streaming, durable messages, bounded errors,
+and reconnect reads after inactivity. Compose keeps the legacy target as its
+default and selects the current target with
+`CELLD_CONFORMANCE_FIXTURE=agents-current-conformance`.
 
 ## Run it
 

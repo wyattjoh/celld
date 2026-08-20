@@ -80,11 +80,14 @@ by category:
 ## Current Agents SDK conformance
 
 The separate [`agents-current-conformance`](../examples/agents-current-conformance/README.md)
-target pins the published `agents@0.21.0` package and a reviewed lockfile peer
-lane. It is a credential-free tracer: two named `Agent` instances are resolved
-with `getAgentByName`, standard HTTP and WebSocket paths are delegated through
-`routeAgentRequest`, and `setState`/`this.sql` records are read after an idle
-eviction and reopen. The legacy `@cloudflare/agents@0.0.16` target remains in
+target pins the published `agents@0.21.0`, `@cloudflare/ai-chat@0.10.2`, AI SDK,
+OpenAI adapter, and schema packages. Two named `AIChatAgent` instances are
+resolved with `getAgentByName`, all Agent HTTP and WebSocket traffic is delegated
+through `routeAgentRequest`, and a deterministic OpenAI-compatible provider
+proves multi-event streaming, package-owned durable chat messages, bounded
+provider errors, and reconnect reads after inactivity. `setState` and
+`this.sql` isolation remain covered alongside chat. The legacy
+`@cloudflare/agents@0.0.16` target remains in
 [`agents-conformance`](../examples/agents-conformance/README.md) and is tested
 separately.
 

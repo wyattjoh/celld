@@ -9,6 +9,18 @@
       "version": "0.21.0",
       "integrity": "sha512-8A048JJFMog7t68NrIQOT9CGcQ9O+h8NpP/Udw2kd4fAHvDn2T/+3Do85XT+xGj2VpciGbW+58RwLpVM9AA9eA=="
     },
+    "@cloudflare/ai-chat": {
+      "version": "0.10.2",
+      "integrity": "sha512-z3IikXqnfgtRqSI3YGX+MlbMtbmi7wUfVJT6tb8xQvhly/Znvi50Azkjhz3jj51f4KFccJSdEiUnzFK63o7mEg=="
+    },
+    "ai": {
+      "version": "6.0.259",
+      "integrity": "sha512-/KvzoDkzqRjb/wlNFguETnMW4QBqNlAqB9rAi0dl36giF2pXJzTlWZCIONlppCplPbAckhcN3Sd9PvsKfi+7ag=="
+    },
+    "@ai-sdk/openai": {
+      "version": "3.0.98",
+      "integrity": "sha512-nAvp8pVOUJ3znJHRzZs54Y7CJQSikOW1Ty7LTdtQT+/pgtAwqhuKd8oaXbiW2xQaYBdH2i8o9AcEpcUdXIyF+g=="
+    },
     "zod": {
       "version": "4.4.3",
       "integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="
@@ -18,6 +30,6 @@
       "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
     }
   },
-  "lockfileSha256": "209c17bf8bf53fd37cd6c89eb7e1fb6ecafc4c563593370e217c47512f68a51e",
+  "lockfileSha256": "7be9d2518eed1483b43340d44e7fe24a28be32db0ed0595730e0887686718544",
   "matrix": "compatibility-matrix.md"
 }

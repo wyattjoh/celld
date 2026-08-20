@@ -48,7 +48,7 @@ function packageSpec(packageJson, name) {
  * Validate the complete, pinned current Agents SDK target.
  *
  * @param {string} root fixture directory.
- * @returns {{agentsVersion: string, zodVersion: string, esbuildVersion: string, lockfileSha256: string}}
+ * @returns {{agentsVersion: string, aiChatVersion: string, aiVersion: string, openaiVersion: string, zodVersion: string, esbuildVersion: string, lockfileSha256: string}}
  */
 export function checkCompatibility(root = DEFAULT_ROOT) {
   const packageJson = readJson(root, "package.json");
@@ -100,6 +100,12 @@ export function checkCompatibility(root = DEFAULT_ROOT) {
   if (!source.includes('from "agents"')) {
     fail("source", "index.js must import the current Agents SDK from agents");
   }
+  if (!source.includes('from "@cloudflare/ai-chat"') || !source.includes("extends AIChatAgent")) {
+    fail("source", "index.js must extend the published AIChatAgent");
+  }
+  if (!source.includes('from "ai"') || !source.includes('from "@ai-sdk/openai"')) {
+    fail("source", "index.js must use the pinned AI SDK and OpenAI provider adapter");
+  }
   if (!source.includes("routeAgentRequest") || !source.includes("getAgentByName")) {
     fail("source", "index.js must exercise the current SDK routing helpers");
   }
@@ -109,6 +115,9 @@ export function checkCompatibility(root = DEFAULT_ROOT) {
 
   return {
     agentsVersion: target.packages.agents.version,
+    aiChatVersion: target.packages["@cloudflare/ai-chat"].version,
+    aiVersion: target.packages.ai.version,
+    openaiVersion: target.packages["@ai-sdk/openai"].version,
     zodVersion: target.packages.zod.version,
     esbuildVersion: target.packages.esbuild.version,
     lockfileSha256: lockfileDigest,
@@ -120,7 +129,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const result = checkCompatibility(process.argv[2] ?? DEFAULT_ROOT);
     console.log(
       `compatibility target verified: agents@${result.agentsVersion}, ` +
-        `zod@${result.zodVersion}, esbuild@${result.esbuildVersion}, ` +
+        `@cloudflare/ai-chat@${result.aiChatVersion}, ai@${result.aiVersion}, ` +
+        `@ai-sdk/openai@${result.openaiVersion}, zod@${result.zodVersion}, ` +
+        `esbuild@${result.esbuildVersion}, ` +
         `lockfile sha256 ${result.lockfileSha256}`,
     );
   } catch (error) {

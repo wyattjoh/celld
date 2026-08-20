@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-test("the current target has deterministic named state and lifecycle routes", async () => {
+test("the current target has deterministic named state and durable chat routes", async () => {
   const source = await readFile(join(ROOT, "index.js"), "utf8");
   for (const name of ["alpha", "beta"]) assert.match(source, new RegExp(`\\"${name}\\"`));
   assert.match(source, /initialState/);
@@ -17,5 +17,8 @@ test("the current target has deterministic named state and lifecycle routes", as
   assert.match(source, /current\/names/);
   assert.match(source, /current\/state/);
   assert.match(source, /current-conformance-agent/);
-  assert.match(source, /idle eviction/i);
+  assert.match(source, /extends AIChatAgent/);
+  assert.match(source, /onChatMessage/);
+  assert.match(source, /streamText/);
+  assert.match(source, /llama-swap\/Qwen3\.6-35B-A3B/);
 });

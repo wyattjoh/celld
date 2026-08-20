@@ -1,7 +1,22 @@
-import { Agent, getAgentByName, routeAgentRequest } from "agents";
+import { createOpenAI } from "@ai-sdk/openai";
+import { AIChatAgent } from "@cloudflare/ai-chat";
+import {
+  convertToModelMessages,
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+  streamText,
+} from "ai";
+import { getAgentByName, routeAgentRequest } from "agents";
 
 const AGENT_NAMES = new Set(["alpha", "beta"]);
 const CURRENT_ROUTE_PREFIX = "/agents/current-conformance-agent/";
+const CONFORMANCE_MODEL = "llama-swap/Qwen3.6-35B-A3B";
+const PUBLIC_PROVIDER_ERRORS = Object.freeze({
+  invalid: "chat_provider_invalid_output",
+  missing: "chat_provider_capability_missing",
+  rejected: "chat_provider_rejected",
+  unavailable: "chat_provider_unavailable",
+});
 
 function json(value, init) {
   return Response.json(value, init);
@@ -37,16 +52,51 @@ function messageValue(message) {
   }
 }
 
+function modelGatewayBaseUrl(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+      return null;
+    }
+    url.search = "";
+    url.hash = "";
+    return url.href.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function publicProviderError(error) {
+  const name = error instanceof Error ? error.name : "";
+  if (/InvalidResponse|JSONParse|InvalidStream|NoContent/.test(name)) {
+    return PUBLIC_PROVIDER_ERRORS.invalid;
+  }
+  const status = error && typeof error === "object" ? error.statusCode : undefined;
+  if (Number.isSafeInteger(status) && status >= 400) {
+    return PUBLIC_PROVIDER_ERRORS.rejected;
+  }
+  return PUBLIC_PROVIDER_ERRORS.unavailable;
+}
+
+function errorStreamResponse(code) {
+  return createUIMessageStreamResponse({
+    stream: createUIMessageStream({
+      execute({ writer }) {
+        writer.write({ type: "error", errorText: code });
+      },
+    }),
+  });
+}
+
 /**
- * Minimal source-unmodified current Agents SDK target.
+ * Source-unmodified current Agents SDK and durable chat target.
  *
- * The Agent is intentionally boring: it uses the public Agent, getAgentByName,
- * and routeAgentRequest APIs, then stores only a small state/event record. This
- * is the tracer used to distinguish current SDK/runtime compatibility from the
- * legacy fixture and from later AI/chat features. It is intentionally safe to
- * run through idle eviction and reopen without credentials.
+ * The Agent uses the public AIChatAgent, getAgentByName, and routeAgentRequest
+ * APIs. It streams through a credential-free OpenAI-compatible gateway and
+ * leaves chat persistence to the package-owned durable message model.
  */
-export class CurrentConformanceAgent extends Agent {
+export class CurrentConformanceAgent extends AIChatAgent {
   initialState = initialState();
 
   ensureTables() {
@@ -122,6 +172,7 @@ export class CurrentConformanceAgent extends Agent {
     const state = this.durableState();
     return {
       agent: this.name,
+      activeConnections: [...this.getConnections()].length,
       state,
       events: this.sql`
         SELECT sequence, connection_id, message, message_count
@@ -146,6 +197,28 @@ export class CurrentConformanceAgent extends Agent {
       agent: this.name,
       activationCount: this.activationCount,
     });
+  }
+
+  async onChatMessage(_onFinish, options) {
+    if (options?.body?.conformanceProviderMode === "missing") {
+      return errorStreamResponse(PUBLIC_PROVIDER_ERRORS.missing);
+    }
+    const gatewayUrl = modelGatewayBaseUrl(this.env.MODEL_GATEWAY_URL);
+    if (gatewayUrl === null || this.env.LLM_MODEL !== CONFORMANCE_MODEL) {
+      return errorStreamResponse(PUBLIC_PROVIDER_ERRORS.missing);
+    }
+
+    const openai = createOpenAI({
+      apiKey: "celld-conformance-placeholder",
+      baseURL: `${gatewayUrl}/v1`,
+    });
+    const result = streamText({
+      abortSignal: options?.abortSignal,
+      model: openai.chat(CONFORMANCE_MODEL),
+      maxRetries: 0,
+      messages: await convertToModelMessages(this.messages),
+    });
+    return result.toUIMessageStreamResponse({ onError: publicProviderError });
   }
 
   async probe(input) {
