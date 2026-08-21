@@ -51,10 +51,10 @@ and filesystem behavior.
 
 | Former lines | Assertion inventory | Disposition |
 | --- | --- | --- |
-| 151 | `packageData.dependencies["just-bash"] === "3.4.0"` | **Retained as a package-pin check** (not runtime source inspection), also enforced by `check:compatibility`. |
+| 151 | `packageData.dependencies["just-bash"] === "3.4.1"` | **Retained as a package-pin check** (not runtime source inspection), also enforced by `check:compatibility`. |
 | 152–158 | Source regexes `/WorkerShellBackend/`, `/egress: \\{ mode: "none" \\}/`, `/backend: "worker-shell"/`, `/workspace\\.runtime\\.exec\\(command,/`, `/unsupported_command/`, `/timed_out/`, `/WorkspaceServiceProxy/` | **Ticket 05**, replaced by the deployed Worker Shell route and retained package/bundling tests. These source-text assertions are deleted. |
 | 159–165 | Harness regexes `/__celld\\$loaderCapability/`, `/service\\?\\.name === "WorkspaceServiceProxy"/`, `/path\\.length === 0 \\? drop/`, `/workspaceView\\?\\.\\[Symbol\\.dispose\\]/`, `/capabilityDescriptor\\(value, name\\)/`, `/Workspace capability only exposes getWorkspace and fs methods/`, `/globalThis\\.\\__loaderWorkerId/` | **Tickets 05 and 07**, replaced by the deployed shell/Workspace operation and loaded-isolate denial tests. The private helper names and cleanup syntax have no replacement. |
-| 166–167 | Matrix regexes `/just-bash@3\\.4\\.0/`, `/Worker Shell backend.*adapted/` | **Retained as compatibility documentation checks**; these do not inspect runtime source. |
+| 166–167 | Matrix regexes `/just-bash@3\\.4\\.1/`, `/Worker Shell backend.*adapted/` | **Retained as compatibility documentation checks**; these do not inspect runtime source. |
 | 168 | Source negative regex `/shell\\/(?:curl|python|sqlite|js-exec)/` | **Ticket 05**, replaced by the deployed unsupported-command and no-egress shell cases; deleted as source inspection. |
 | 189–351 | Remaining loader/package/Workspace behavioral assertions (entrypoint/config props, shared Workspace writes, unsupported command, denied network, interruption/timeout) | **Retained.** They already execute the pinned package and are not source-text assertions. The deployed e2e runner adds the same public Worker Shell path. |
 

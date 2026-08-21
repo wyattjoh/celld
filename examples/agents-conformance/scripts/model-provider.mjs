@@ -6,14 +6,20 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8788;
 const MAX_BODY_BYTES = 1024 * 1024;
 
+function messageText(message) {
+  if (typeof message?.content === "string") return message.content;
+  if (!Array.isArray(message?.parts)) return "";
+  return message.parts
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
 function responseText(messages) {
   const lastUser = [...(Array.isArray(messages) ? messages : [])]
     .reverse()
     .find((message) => message?.role === "user");
-  const content = typeof lastUser?.content === "string" && lastUser.content.length > 0
-    ? lastUser.content
-    : "(empty)";
-  return `deterministic response for ${content}`;
+  return `deterministic response for ${messageText(lastUser) || "(empty)"}`;
 }
 
 async function readJson(request) {

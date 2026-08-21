@@ -9,9 +9,10 @@ reviewed target update fails before deployment.
 
 | input | value |
 | --- | --- |
-| Agents SDK | `@cloudflare/agents@0.0.16` |
-| AI SDK helper | `ai@4.3.19` |
-| schema helper | `zod@3.25.76` |
+| Agents SDK | `agents@0.21.0` |
+| AI Chat SDK | `@cloudflare/ai-chat@0.10.2` |
+| AI SDK helper | `ai@7.0.71` |
+| schema helper | `zod@4.4.3` |
 | Computer SDK | `@cloudflare/computer@0.2.1` |
 | bundler | `esbuild@0.28.2` |
 | compatibility date | `2026-01-01` |
@@ -31,15 +32,15 @@ The status describes the celld contract at this fixture seam:
 
 | package and surface | fixture exercise | status | evidence / boundary |
 | --- | --- | --- | --- |
-| `@cloudflare/agents@0.0.16` `Agent` class and DO registration | `ConformanceAgent` extends `AIChatAgent` (which extends `Agent`) and deploys with a SQLite migration | adapted | celld maps the Cloudflare Durable Object base and SQLite storage to a named cell |
-| `@cloudflare/agents@0.0.16` `AIChatAgent` message persistence | inherited message table is read through `/conformance/messages/<name>`; HTTP chat writes the same table | adapted | the SDK class is imported unmodified; the fixture's HTTP seam duplicates only the private persistence call needed outside the WebSocket protocol |
+| `agents@0.21.0` `Agent` class and DO registration | `ConformanceAgent` extends `AIChatAgent` (which extends `Agent`) and deploys with a SQLite migration | adapted | celld maps the Cloudflare Durable Object base and SQLite storage to a named cell |
+| `@cloudflare/ai-chat@0.10.2` `AIChatAgent` message persistence | inherited message table is read through `/conformance/messages/<name>`; HTTP chat writes the same table | adapted | the SDK class is imported unmodified; the fixture's HTTP seam duplicates only the private persistence call needed outside the WebSocket protocol and stores current UI-message parts |
 | celld durable response cursor | each framed `ndjson-v1` provider chunk is stored in `conformance_ai_response_chunks`; `/conformance/resume/<name>` reports the cursor, replays, and continues after an eviction/reopen | adapted | the cursor is explicit provider frame sequence, response IDs hash canonical messages, and a 30-second lease renews every 10 seconds while active; the provider double honors `x-celld-resume-after`; live-fleet takeover/output-gate timing remains an operational test |
-| `@cloudflare/agents@0.0.16` `getAgentByName` | calls both `alpha` and `beta` | supported | each name is resolved through the declared `agents` Durable Object namespace |
-| `@cloudflare/agents@0.0.16` structured-cloneable callable method | `conformance({ name })` returns nested arrays and objects | supported | no function, stream, class, or live RPC capability crosses the cell boundary |
-| `@cloudflare/agents@0.0.16` `routeAgentRequest` | `/agents/agents/alpha`, `/agents/agents/beta`, and HTTP chat paths | adapted | PartyServer routing is source-unmodified; celld supplies namespace, dispatch, and streaming response bodies |
-| `@cloudflare/agents@0.0.16` state and embedded SQL | `/conformance/state/alpha` and `/conformance/state/beta` write/read independently | adapted | the fixture uses celld's private per-cell SQLite path; deterministic reopen coverage is present, while bucket restore, ownership-transfer, and output-gate evidence remain runtime-test work |
-| `@cloudflare/agents@0.0.16` hibernating WebSockets and durable session state | `/agents/agents/<name>` `onConnect`/`onMessage`, `/conformance/session/<name>`, deployed eviction procedure | adapted | celld keeps the host socket and attachment metadata while the named cell is inactive; session state and event rows remain in that Agent cell's SQLite database |
-| `@cloudflare/agents@0.0.16` delayed `schedule()` and alarm callback | `/conformance/schedule/<name>` plus deployed eviction procedure | adapted | numeric-delay schedules call `storage.setAlarm()` and wake the inactive named cell; Worker cron is not implied |
+| `agents@0.21.0` `getAgentByName` | calls both `alpha` and `beta` | supported | each name is resolved through the declared `agents` Durable Object namespace |
+| `agents@0.21.0` structured-cloneable callable method | `conformance({ name })` returns nested arrays and objects | supported | no function, stream, class, or live RPC capability crosses the cell boundary |
+| `agents@0.21.0` `routeAgentRequest` | `/agents/agents/alpha`, `/agents/agents/beta`, and HTTP chat paths | adapted | PartyServer routing is source-unmodified; celld supplies namespace, dispatch, and streaming response bodies |
+| `agents@0.21.0` state and embedded SQL | `/conformance/state/alpha` and `/conformance/state/beta` write/read independently | adapted | the fixture uses celld's private per-cell SQLite path; deterministic reopen coverage is present, while bucket restore, ownership-transfer, and output-gate evidence remain runtime-test work |
+| `agents@0.21.0` hibernating WebSockets and durable session state | `/agents/agents/<name>` `onConnect`/`onMessage`, `/conformance/session/<name>`, deployed eviction procedure | adapted | celld keeps the host socket and attachment metadata while the named cell is inactive; session state and event rows remain in that Agent cell's SQLite database |
+| `agents@0.21.0` delayed `schedule()` and alarm callback | `/conformance/schedule/<name>` plus deployed eviction procedure | adapted | numeric-delay schedules call `storage.setAlarm()` and wake the inactive named cell; Worker cron is not implied |
 | celld Worker Loader lifecycle and capability sideband | `/conformance/code-mode/<name>` covers disposal, in-flight mutation durability, named-worker eviction revocation, stable interruption classes, and host capability calls | adapted | the route uses only the public Loader surface; the e2e runner keeps the stale handle minted before operator eviction and asserts the structured error result |
 | celld Code Mode Fetcher, tools, and output transport | `/conformance/code-mode/<name>` covers origin/path allowlisting, explicit tool catalog/invocation, and deterministic 8 MiB output truncation | adapted | approved egress succeeds, a sibling path is denied, secret catalog fields do not cross the sideband, and the loaded worker remains usable after truncation |
 | celld Code Mode admission and timeout contract | `/conformance/code-mode/<name>` asserts code/env size rejection and loaded-worker timeout | adapted | HTTP JSON carries `code_mode.code_size`, `code_mode.env_size`, and `code_mode.timeout` plus their retryable booleans |
@@ -52,6 +53,6 @@ The status describes the celld contract at this fixture seam:
 | public deployment/lifecycle route | README curl flow covers chat, status, resume, and messages after a node transition | adapted | this worktree has no live bucket/node credentials; Node tests and Rust storage tests are bounded local evidence, so a live deployment run is still required for end-to-end acceptance |
 | `@cloudflare/computer@0.2.1` Worker JavaScript backend | `/conformance/javascript/<name>` runs a structured module in a fresh loaded worker, imports a Workspace sibling, and reads a Workspace file through `node:fs/promises`; `operation: loader-modules` separately exercises nested sibling and Wasm loader modules | adapted | celld grants one explicit `library` capability for the pinned bridge; generated code has no ambient egress; bounded framed stdio is forwarded as bytes rather than as a live stream; the pinned Computer `modules` option is text-only, so Wasm evidence is the direct Worker Loader seam; transient grants are revoked after each call; cancellation, isolate failure, and non-JSON results are bounded outcomes |
 | `@cloudflare/computer@0.2.1` Worker Shell backend | `/conformance/shell/<name>` runs pinned core commands in a loaded worker | adapted | `WorkerShellBackend` is source-unmodified; celld grants only the Workspace fs sideband and forces `globalOutbound: null`; shell state stays in the Agent cell |
-| `just-bash@3.4.0` core Worker Shell runtime | `mkdir`, redirection, `cat`, `grep`, and unsupported-command/timeout outcomes | supported | the exact package is a direct fixture dependency and lockfile target; no optional Python, SQLite, or JS-exec groups are bundled, and core `curl` is denied by `globalOutbound: null` |
+| `just-bash@3.4.1` core Worker Shell runtime | `mkdir`, redirection, `cat`, `grep`, and unsupported-command/timeout outcomes | supported | the exact package is a direct fixture dependency and lockfile target; no optional Python, SQLite, or JS-exec groups are bundled, and core `curl` is denied by `globalOutbound: null` |
 | `@cloudflare/computer@0.2.1` container backend, R2, and Artifacts | not exercised by this ticket | unsupported | no Linux/container or object-store emulation is implied |
 | `esbuild@0.28.2` Worker bundling | `celld deploy` bundles `index.js` and accepts the `ai` binding | adapted | celld's deploy allowlist records the AI binding while the endpoint remains node deployment configuration |

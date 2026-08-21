@@ -27,12 +27,13 @@ async function copyFixture() {
 
 test("the checked-in Agents, AI, Computer, and Worker Shell target is exact", () => {
   assert.deepEqual(checkCompatibility(ROOT), {
-    agentsVersion: "0.0.16",
-    aiVersion: "4.3.19",
+    agentsVersion: "0.21.0",
+    aiChatVersion: "0.10.2",
+    aiVersion: "7.0.71",
     computerVersion: "0.2.1",
-    zodVersion: "3.25.76",
+    zodVersion: "4.4.3",
     lockfileSha256:
-      "58a8d0772f3b32269294c3762c82aa614943ae298bf9b5160dd477562e5c851e",
+      "08b5db437c5a698977ba81d820987924491c3d3f006701772e2a6ddd746aa5a3",
   });
 });
 
@@ -100,7 +101,7 @@ test("the fixture wires a filesystem-only Workspace to each Agent cell", async (
 
 test("the source-unmodified AIChatAgent seam persists complete HTTP streams", async () => {
   const source = await readFile(join(ROOT, "index.js"), "utf8");
-  assert.ok(source.includes('from "@cloudflare/agents/ai-chat-agent"'));
+  assert.ok(source.includes('from "@cloudflare/ai-chat"'));
   assert.match(source, /extends (?:AIChatAgent|withWorkspace\(\s*AIChatAgent)/);
   assert.match(source, /cf_ai_chat_agent_messages/);
   assert.match(source, /conformance_ai_responses/);
@@ -118,7 +119,8 @@ test("the source-unmodified AIChatAgent seam persists complete HTTP streams", as
   assert.match(source, /before exposing it/);
   assert.match(source, /response resume lease was lost/);
   assert.match(source, /conformance\/resume/);
-  assert.match(source, /appendResponseMessages/);
+  assert.match(source, /autoTransformMessages/);
+  assert.match(source, /parts: \[\{/);
   assert.match(source, /MODEL_PROVIDER_URL HTTP deployment capability/);
   assert.match(source, /AI adapter deployment capability is missing/);
   assert.match(source, /HTTP model provider returned status/);
@@ -209,12 +211,12 @@ test("a direct upstream version change fails with a stable error", async () => {
   const root = await copyFixture();
   const path = join(root, "package.json");
   const packageJson = JSON.parse(await readFile(path, "utf8"));
-  packageJson.dependencies["@cloudflare/agents"] = "0.0.15";
+  packageJson.dependencies.agents = "0.20.0";
   await writeFile(path, `${JSON.stringify(packageJson, null, 2)}\n`);
 
   assert.throws(
     () => checkCompatibility(root),
-    /\[compatibility\.package-version\].+@cloudflare\/agents/,
+    /\[compatibility\.package-version\].+agents/,
   );
 });
 

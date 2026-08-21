@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           npm --prefix examples/agents-conformance ci \
-            --legacy-peer-deps --no-audit --no-fund
+            --no-audit --no-fund
           npm --prefix examples/agents-conformance run check:compatibility
 
       - name: Run Compose public e2e

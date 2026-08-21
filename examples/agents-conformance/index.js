@@ -1,7 +1,7 @@
 import {
   getAgentByName,
   routeAgentRequest,
-} from "@cloudflare/agents";
+} from "agents";
 import {
   getWorkspace,
   withWorkspace,
@@ -9,8 +9,8 @@ import {
 } from "@cloudflare/computer";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
-import { AIChatAgent } from "@cloudflare/agents/ai-chat-agent";
-import { appendResponseMessages } from "ai";
+import { AIChatAgent } from "@cloudflare/ai-chat";
+import { autoTransformMessages } from "@cloudflare/ai-chat/ai-chat-v5-migration";
 
 // The Worker Shell backend asks the host cell for this entrypoint over the
 // granted Workspace capability. Re-exporting the pinned package class makes
@@ -1377,7 +1377,10 @@ export class ConformanceAgent extends withWorkspace(
           const responseMessages = [{
             id: responseId,
             role: "assistant",
-            content: agent.responseContent(responseId),
+            parts: [{
+              type: "text",
+              text: agent.responseContent(responseId),
+            }],
           }];
           // Persist the final assistant message before closing the public
           // stream. The live-fleet output gate still owns acknowledgement and
@@ -1472,7 +1475,7 @@ export class ConformanceAgent extends withWorkspace(
     if (request.method !== "POST") {
       return json({ error: "method_not_allowed" }, { status: 405 });
     }
-    const messages = await requestMessagesFrom(request);
+    const messages = autoTransformMessages(await requestMessagesFrom(request));
     const responseId = await this.responseIdFor(messages);
     const existing = this.responseState(responseId);
     if (existing) {
@@ -1481,12 +1484,7 @@ export class ConformanceAgent extends withWorkspace(
       await this.persistHttpMessages(messages);
     }
     return this.onChatMessage(async ({ response }) => {
-      const finalMessages = appendResponseMessages({
-        messages,
-        responseMessages: response.messages,
-        _internal: { currentDate: () => new Date(0) },
-      });
-      await this.persistHttpMessages(finalMessages);
+      await this.persistHttpMessages([...messages, ...response.messages]);
     });
   }
 
@@ -1513,12 +1511,7 @@ export class ConformanceAgent extends withWorkspace(
       throw new InvalidChatRequestError("resume requires an integer response cursor");
     }
     return this.resumeResponse(responseId, after, async ({ response }) => {
-      const finalMessages = appendResponseMessages({
-        messages: state.messages,
-        responseMessages: response.messages,
-        _internal: { currentDate: () => new Date(0) },
-      });
-      await this.persistHttpMessages(finalMessages);
+      await this.persistHttpMessages([...state.messages, ...response.messages]);
     });
   }
 

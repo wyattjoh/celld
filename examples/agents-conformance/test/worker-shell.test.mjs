@@ -143,8 +143,8 @@ test("Worker Shell package target stays pinned and bundleable", async () => {
     join(FIXTURE_ROOT, "compatibility-matrix.md"),
     "utf8",
   );
-  assert.equal(packageData.dependencies["just-bash"], "3.4.0");
-  assert.match(matrix, /just-bash@3\.4\.0/);
+  assert.equal(packageData.dependencies["just-bash"], "3.4.1");
+  assert.match(matrix, /just-bash@3\.4\.1/);
   assert.match(matrix, /Worker Shell backend.*adapted/);
 
   const { ShellWorker, WorkerShellBackend, close } =

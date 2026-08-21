@@ -1,13 +1,13 @@
 # Agents compatibility conformance
 
 This is the smallest source-unmodified multi-Agent application for celld. It
-pins `@cloudflare/agents@0.0.16`, `ai@4.3.19`,
-`@cloudflare/computer@0.2.1`, and `just-bash@3.4.0`; the exact resolved package
+pins `agents@0.21.0`, `@cloudflare/ai-chat@0.10.2`, `ai@7.0.71`,
+`@cloudflare/computer@0.2.1`, and `just-bash@3.4.1`; the exact resolved package
 integrity values and complete lockfile digest are recorded in
 [`compatibility.json`](compatibility.json). The retired white-box assertion
 mapping is documented in [`coverage-map.md`](coverage-map.md).
-The `ai` version is pinned because the published `AIChatAgent` implementation
-uses its `appendResponseMessages` helper.
+The deprecated `@cloudflare/agents` package has been replaced by `agents`, and
+`AIChatAgent` now comes from its current `@cloudflare/ai-chat` package.
 
 The fixture declares one `ConformanceAgent` Durable Object class and addresses
 stable names `alpha` and `beta` in the same deployment. Its callable
@@ -44,7 +44,7 @@ the cell's configured durability path proves the SQLite write position;
 `CELLD_OUTPUT_GATE=0` explicitly opts out of that acknowledgment guarantee.
 
 Worker Shell is the source-unmodified `@cloudflare/computer@0.2.1`
-`WorkerShellBackend` running pinned `just-bash@3.4.0` in a loaded worker. The
+`WorkerShellBackend` running pinned `just-bash@3.4.1` in a loaded worker. The
 fixture bundles only the core command group: there is no native process
 execution, host filesystem, arbitrary TCP socket, Python, SQLite,
 JavaScript-exec, or ambient network capability. The host passes the Workspace
@@ -125,14 +125,15 @@ lifecycle transition. The WebSocket chat protocol remains reserved for ticket
 ## Verify the target
 
 ```sh
-npm ci --legacy-peer-deps
+npm ci
 npm test
 npm run check:compatibility
 ```
 
-The pinned `ai@4` target and `@cloudflare/computer`'s optional `ai@6/7`
-peer range require npm's `--legacy-peer-deps` installation mode; the lockfile
-and compatibility checks still pin and verify the reviewed dependency graph.
+The pinned `ai@7` and `zod@4` targets satisfy the current `agents`, AI Chat,
+and Computer peer ranges, so the lockfile installs with npm's standard peer
+resolver. The compatibility checks still pin and verify the reviewed dependency
+graph.
 
 `check:compatibility` fails with stable `[compatibility.*]` error codes if a
 pinned package, lockfile integrity, lockfile digest, compatibility setting, or

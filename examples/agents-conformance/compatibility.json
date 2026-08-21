@@ -5,31 +5,35 @@
     "compatibilityFlags": ["js_rpc"]
   },
   "packages": {
-    "@cloudflare/agents": {
-      "version": "0.0.16",
-      "integrity": "sha512-7xx7b60Z0PA7V2NRcxl+iHgT82B8At0RIigW5/yW1sKNDDhY23SgD/E+cFWMGzGcvoYHwlhmx34JIB2o1VRc3Q=="
+    "agents": {
+      "version": "0.21.0",
+      "integrity": "sha512-8A048JJFMog7t68NrIQOT9CGcQ9O+h8NpP/Udw2kd4fAHvDn2T/+3Do85XT+xGj2VpciGbW+58RwLpVM9AA9eA=="
+    },
+    "@cloudflare/ai-chat": {
+      "version": "0.10.2",
+      "integrity": "sha512-z3IikXqnfgtRqSI3YGX+MlbMtbmi7wUfVJT6tb8xQvhly/Znvi50Azkjhz3jj51f4KFccJSdEiUnzFK63o7mEg=="
     },
     "@cloudflare/computer": {
       "version": "0.2.1",
       "integrity": "sha512-jh0pa1csAExPItUYzrzBrZO1vCBjsQ6jX+aunrnKe2VSC9i8mEziQYZUL3IZId4GpceRL+v8HIzVr4kjbmQXPw=="
     },
     "just-bash": {
-      "version": "3.4.0",
-      "integrity": "sha512-dSJDEyjcy/xhGspY7PvO+5UYCcwMDT8sabuHNt/OPDZMDSonyJi3liVBBgLpUKcf2bFAvTLnN4Y1lBkNPm04Ow=="
+      "version": "3.4.1",
+      "integrity": "sha512-OfrDvaJ+pDEaJQYeIri6Y36WncX+8nbfizGUHwj60MxuInYtQhfzDHRIhv3nw55ZoulXFOk9rdDb90HuydiX8w=="
     },
     "ai": {
-      "version": "4.3.19",
-      "integrity": "sha512-dIE2bfNpqHN3r6IINp9znguYdhIOheKW2LDigAMrgt/upT3B8eBGPSCblENvaZGoq+hxaN9fSMzjWpbqloP+7Q=="
+      "version": "7.0.71",
+      "integrity": "sha512-e3PhIepVn9zErrsOjvM2ed3rvB2bTLzJYKPIqDSJles9sKx45ZCUSDSWavhh+WGQ9BQo2RMsjtf+venEmGFHlg=="
     },
     "zod": {
-      "version": "3.25.76",
-      "integrity": "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="
+      "version": "4.4.3",
+      "integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="
     },
     "esbuild": {
       "version": "0.28.2",
       "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
     }
   },
-  "lockfileSha256": "58a8d0772f3b32269294c3762c82aa614943ae298bf9b5160dd477562e5c851e",
+  "lockfileSha256": "08b5db437c5a698977ba81d820987924491c3d3f006701772e2a6ddd746aa5a3",
   "matrix": "compatibility-matrix.md"
 }
