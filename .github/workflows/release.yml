@@ -29,7 +29,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.97.1
-  IMAGE: ghcr.io/denoland/celld
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   build-celld:
@@ -129,6 +129,7 @@ jobs:
           docker buildx build \
             --platform linux/amd64 \
             --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
+            --build-arg "CELLD_SOURCE=https://github.com/$GITHUB_REPOSITORY" \
             --build-arg "CELLD_VERSION=$version" \
             --cache-from "type=registry,ref=$IMAGE:buildcache-amd64" \
             .
@@ -263,6 +264,7 @@ jobs:
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --build-arg "CELLD_COMMIT=$TAG_SHA" \
+            --build-arg "CELLD_SOURCE=https://github.com/$GITHUB_REPOSITORY" \
             --build-arg "CELLD_VERSION=$CELLD_VERSION" \
             --cache-from "type=registry,ref=$cache" \
             --cache-to "type=registry,ref=$cache,mode=max" \
@@ -328,7 +330,7 @@ jobs:
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ghcr.io/denoland/celld
+          subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.digest.outputs.digest }}
           push-to-registry: true
 

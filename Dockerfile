@@ -45,9 +45,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 ARG CELLD_COMMIT
+ARG CELLD_SOURCE=https://github.com/denoland/celld
 ARG CELLD_VERSION=unknown
 LABEL org.opencontainers.image.title="celld" \
       org.opencontainers.image.revision="${CELLD_COMMIT}" \
+      org.opencontainers.image.source="${CELLD_SOURCE}" \
       org.opencontainers.image.version="${CELLD_VERSION}"
 COPY --from=test /out/celld /usr/local/bin/celld
 ENTRYPOINT ["/usr/local/bin/celld"]
