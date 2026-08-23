@@ -308,6 +308,21 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
          (scope TEXT PRIMARY KEY, actor_name TEXT)",
         [],
     )?;
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _cf_QUEUE (
+             scope TEXT NOT NULL,
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             id TEXT NOT NULL,
+             enqueued_ms INTEGER NOT NULL,
+             visible_at_ms INTEGER NOT NULL,
+             body BLOB NOT NULL,
+             content_type TEXT NOT NULL,
+             attempts INTEGER NOT NULL DEFAULT 0,
+             UNIQUE(scope, id)
+         );
+         CREATE INDEX IF NOT EXISTS _cf_QUEUE_visible
+             ON _cf_QUEUE(scope, visible_at_ms, seq);",
+    )?;
     let alarm_columns = {
         let mut statement = c.prepare("PRAGMA table_info(_cf_ALARM)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -3762,7 +3777,7 @@ mod internal_table_names {
                 .expect("query");
             rows.collect::<rusqlite::Result<Vec<_>>>().expect("collect")
         };
-        assert_eq!(names, ["_cf_ALARM", "_cf_KV", "_cf_METADATA"]);
+        assert_eq!(names, ["_cf_ALARM", "_cf_KV", "_cf_METADATA", "_cf_QUEUE"]);
 
         let kept: String = connection
             .query_row("SELECT v FROM _cf_KV WHERE k='k'", [], |row| row.get(0))
@@ -3776,6 +3791,83 @@ mod internal_table_names {
             .expect("still there");
         assert_eq!(kept_again, "v");
         let _ = std::fs::remove_file(&file);
+    }
+}
+
+#[cfg(test)]
+mod queue_backlog_storage {
+    use super::*;
+
+    #[test]
+    fn enqueued_message_survives_reopen() {
+        install_for_test();
+        let root = std::env::temp_dir().join(format!(
+            "celld-queue-backlog-{}-{}",
+            std::process::id(),
+            NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let scope = ".queue:orders";
+        let path = root.join("orders.sqlite");
+        let path_text = path.to_str().expect("sqlite path");
+        let body = br#"{"orderId":"ord-123"}"#;
+
+        open(scope, path_text).expect("open queue cell");
+        with(scope, |connection| {
+            connection.execute(
+                "INSERT INTO _cf_QUEUE
+                 (scope, id, enqueued_ms, visible_at_ms, body, content_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    scope,
+                    "0123456789abcdef",
+                    1_800_000_000_000_i64,
+                    1_800_000_005_000_i64,
+                    body,
+                    "json",
+                ],
+            )
+        })
+        .expect("queue cell is open")
+        .expect("enqueue message");
+
+        close(scope);
+        open(scope, path_text).expect("reopen queue cell");
+        let row = with(scope, |connection| {
+            connection.query_row(
+                "SELECT seq, id, enqueued_ms, visible_at_ms, body, content_type, attempts
+                 FROM _cf_QUEUE WHERE scope=?1",
+                [scope],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+        })
+        .expect("queue cell is open")
+        .expect("read queued message");
+        assert_eq!(
+            row,
+            (
+                1,
+                "0123456789abcdef".to_string(),
+                1_800_000_000_000,
+                1_800_000_005_000,
+                body.to_vec(),
+                "json".to_string(),
+                0,
+            )
+        );
+
+        close(scope);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
