@@ -481,6 +481,7 @@ pub fn batch_decision(
     now_ms: Ms,
     visible_count: usize,
     earliest_visible_at_ms: Option<Ms>,
+    next_visible_at_ms: Option<Ms>,
     config: &ConsumerConfig,
 ) -> BatchDecision {
     let Some(earliest_visible_at_ms) = earliest_visible_at_ms else {
@@ -503,10 +504,11 @@ pub fn batch_decision(
 
     let timeout_ms = i64::from(config.max_batch_timeout).saturating_mul(1_000);
     let deadline = earliest_visible_at_ms.saturating_add(timeout_ms);
-    if now_ms >= deadline {
+    let wake_at = next_visible_at_ms.map_or(deadline, |visible_at| deadline.min(visible_at));
+    if now_ms >= wake_at {
         BatchDecision::DeliverNow
     } else {
-        BatchDecision::ArmAt(deadline)
+        BatchDecision::ArmAt(wake_at)
     }
 }
 
@@ -522,11 +524,13 @@ pub enum ClaimDecision {
 }
 
 /// Increment a stored attempt count and apply the settled `max_retries`
-/// ceiling. Infrastructure failures before claim do not call this function and
-/// therefore do not consume a message attempt.
+/// ceiling. `max_retries` counts redeliveries after the first delivery, so a
+/// value of three permits four handler attempts. Infrastructure failures before
+/// claim do not call this function and therefore do not consume an attempt.
 pub fn claim_attempt(stored_attempts: u16, max_retries: u16) -> ClaimDecision {
     let attempts = stored_attempts.saturating_add(1);
-    if attempts > max_retries {
+    let max_attempts = max_retries.saturating_add(1);
+    if attempts > max_attempts {
         ClaimDecision::Drop { attempts }
     } else {
         ClaimDecision::Deliver { attempts }
@@ -614,6 +618,7 @@ mod tests {
             now_ms: Ms,
             visible_count: usize,
             earliest_visible_at_ms: Option<Ms>,
+            next_visible_at_ms: Option<Ms>,
             config: ConsumerConfig,
             expected: BatchDecision,
         }
@@ -626,6 +631,7 @@ mod tests {
                 now_ms: 1_000,
                 visible_count: 0,
                 earliest_visible_at_ms: None,
+                next_visible_at_ms: None,
                 config: consumer_config(),
                 expected: BatchDecision::Idle,
             },
@@ -634,6 +640,7 @@ mod tests {
                 now_ms: 1_000,
                 visible_count: 0,
                 earliest_visible_at_ms: Some(4_000),
+                next_visible_at_ms: Some(4_000),
                 config: consumer_config(),
                 expected: BatchDecision::ArmAt(4_000),
             },
@@ -642,6 +649,7 @@ mod tests {
                 now_ms: 4_000,
                 visible_count: 0,
                 earliest_visible_at_ms: Some(4_000),
+                next_visible_at_ms: None,
                 config: consumer_config(),
                 expected: BatchDecision::Idle,
             },
@@ -650,6 +658,7 @@ mod tests {
                 now_ms: 1_000,
                 visible_count: 10,
                 earliest_visible_at_ms: Some(1_000),
+                next_visible_at_ms: None,
                 config: consumer_config(),
                 expected: BatchDecision::DeliverNow,
             },
@@ -658,6 +667,7 @@ mod tests {
                 now_ms: 1_000,
                 visible_count: 1,
                 earliest_visible_at_ms: Some(1_000),
+                next_visible_at_ms: None,
                 config: consumer_config(),
                 expected: BatchDecision::ArmAt(6_000),
             },
@@ -666,6 +676,7 @@ mod tests {
                 now_ms: 1_000,
                 visible_count: 1,
                 earliest_visible_at_ms: Some(4_000),
+                next_visible_at_ms: Some(4_000),
                 config: consumer_config(),
                 expected: BatchDecision::ArmAt(4_000),
             },
@@ -674,14 +685,25 @@ mod tests {
                 now_ms: 6_000,
                 visible_count: 1,
                 earliest_visible_at_ms: Some(1_000),
+                next_visible_at_ms: None,
                 config: consumer_config(),
                 expected: BatchDecision::DeliverNow,
+            },
+            Case {
+                name: "a newly visible message wakes before the timeout",
+                now_ms: 1_000,
+                visible_count: 1,
+                earliest_visible_at_ms: Some(1_000),
+                next_visible_at_ms: Some(2_000),
+                config: consumer_config(),
+                expected: BatchDecision::ArmAt(2_000),
             },
             Case {
                 name: "zero timeout delivers the first visible message",
                 now_ms: 1_000,
                 visible_count: 1,
                 earliest_visible_at_ms: Some(1_000),
+                next_visible_at_ms: None,
                 config: zero_timeout,
                 expected: BatchDecision::DeliverNow,
             },
@@ -693,6 +715,7 @@ mod tests {
                     case.now_ms,
                     case.visible_count,
                     case.earliest_visible_at_ms,
+                    case.next_visible_at_ms,
                     &case.config,
                 ),
                 case.expected,
@@ -719,22 +742,22 @@ mod tests {
                 expected: ClaimDecision::Deliver { attempts: 1 },
             },
             Case {
-                name: "last allowed claim",
-                stored_attempts: 2,
+                name: "last allowed retry",
+                stored_attempts: 3,
                 max_retries: 3,
-                expected: ClaimDecision::Deliver { attempts: 3 },
+                expected: ClaimDecision::Deliver { attempts: 4 },
             },
             Case {
                 name: "ceiling crossed",
-                stored_attempts: 3,
+                stored_attempts: 4,
                 max_retries: 3,
-                expected: ClaimDecision::Drop { attempts: 4 },
+                expected: ClaimDecision::Drop { attempts: 5 },
             },
             Case {
-                name: "zero ceiling drops first claim",
+                name: "zero retries still permits the first claim",
                 stored_attempts: 0,
                 max_retries: 0,
-                expected: ClaimDecision::Drop { attempts: 1 },
+                expected: ClaimDecision::Deliver { attempts: 1 },
             },
             Case {
                 name: "saturated counter remains droppable",

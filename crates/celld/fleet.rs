@@ -581,6 +581,7 @@ async fn load_worker_from_pointer(
             r2_bindings,
             d1_bindings,
             queue_bindings,
+            queue_consumers: manifest.queue_consumers,
             ai_binding,
             vars,
             node,

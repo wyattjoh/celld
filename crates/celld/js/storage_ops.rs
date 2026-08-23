@@ -349,8 +349,11 @@ pub(super) fn op_queue_run(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let request = args.get(1).to_rust_string_lossy(scope);
-    let out = storage::queue_run_json(&cell, &request);
-    rv.set(v8::String::new(scope, &out).unwrap().into());
+    let out = storage::queue_run_op(&cell, &request);
+    if let Some(at_ms) = out.alarm_at.filter(|at_ms| *at_ms >= 0) {
+        spawn_arm_gate(&cell, at_ms);
+    }
+    rv.set(v8::String::new(scope, &out.json).unwrap().into());
 }
 #[cfg(all(test, celld_internal_tests))]
 pub(super) fn op_sql_set_max_page_count_for_test(

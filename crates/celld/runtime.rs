@@ -566,6 +566,8 @@ impl RuntimeManager {
         let region: Arc<str> = Arc::from(region);
         let primary_script = worker.script_name.clone();
         let primary_classes = worker.do_classes.clone();
+        let primary_uses_queues =
+            !worker.queue_bindings.is_empty() || !worker.queue_consumers.is_empty();
         // Only classes the user declared can be a bare-id default. The
         // runtime-supplied `__D1Database` rides in `do_classes` so that its
         // namespace key is minted, and counting it here made adding any D1
@@ -602,6 +604,14 @@ impl RuntimeManager {
         if !config.crons.is_empty() {
             cell_configs.insert(
                 celld_logic::cron::RESERVED_CLASS.to_string(),
+                config.clone(),
+            );
+        }
+        // Queue producers and consumers share the fleet-global `.queue`
+        // reserved class. The queue name in the cell scope selects policy.
+        if primary_uses_queues {
+            cell_configs.insert(
+                celld_logic::queue::RESERVED_CLASS.to_string(),
                 config.clone(),
             );
         }

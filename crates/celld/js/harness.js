@@ -3113,7 +3113,7 @@ const __foreignStub = () => new Proxy(function () {}, {
 // methods and accessors are visible — never own instance state
 // (env/ctx live there) and never Object.prototype.
 const __entrypointReserved = new Set([
-  "constructor", "fetch", "connect", "alarm", "scheduled",
+  "constructor", "fetch", "connect", "alarm", "scheduled", "queue",
   "webSocketMessage", "webSocketClose", "webSocketError", "dup",
 ]);
 const __entrypointResolve = (inst, prop) => {
@@ -4234,6 +4234,8 @@ globalThis.__dispatchEntrypointFetch = (name, request) =>
   __dispatchEntrypointMethod(name, "fetch", request);
 globalThis.__dispatchEntrypointScheduled = (name, ctrl) =>
   __dispatchEntrypointMethod(name, "scheduled", ctrl);
+globalThis.__dispatchEntrypointQueue = (name, batch) =>
+  __dispatchEntrypointMethod(name, "queue", batch);
 // Workerd's simple-handler RPC rules (worker-rpc.c++): a non-class
 // handler method is called as fn(arg, env, ctx), the client must send
 // exactly one argument, and the handler must not declare more than
@@ -4550,6 +4552,7 @@ globalThis.__cell = {
   doExports: {},
   classes: { ".cron": CelldCronSchedule },
   crons: [],
+  queueConsumers: {},
   instances: {},
   env: {},
   owned: {},
@@ -4636,15 +4639,152 @@ const __queueRun = (scope, request) => {
   return response.ok;
 };
 
+const __queueDeserialize = (message) => {
+  const bytes = Uint8Array.from(message.body);
+  if (message.contentType === "json")
+    return JSON.parse(new TextDecoder().decode(bytes));
+  if (message.contentType === "text")
+    return new TextDecoder().decode(bytes);
+  if (message.contentType === "bytes") return bytes;
+  if (message.contentType === "v8") return __sc_decode(bytes);
+  throw new TypeError(
+    `Unsupported queue message content type: ${message.contentType}`,
+  );
+};
+
+class QueueMessage {
+  constructor(message) {
+    Object.defineProperties(this, {
+      id: { value: message.id, enumerable: true },
+      timestamp: { value: new Date(message.enqueuedMs), enumerable: true },
+      body: { value: __queueDeserialize(message), enumerable: true },
+      attempts: { value: message.attempts, enumerable: true },
+      _resolution: { value: { action: null } },
+    });
+  }
+  ack() {
+    if (this._resolution.action === null)
+      this._resolution.action = { kind: "ack" };
+  }
+  retry(options) {
+    if (this._resolution.action !== null) return;
+    this._resolution.action = {
+      kind: "retry",
+      delaySeconds: __queueDelay(options?.delaySeconds, undefined),
+    };
+  }
+}
+
+class MessageBatch {
+  constructor(claim) {
+    const messages = claim.messages.map((message) => new QueueMessage(message));
+    Object.defineProperties(this, {
+      queue: { value: claim.queue, enumerable: true },
+      messages: { value: Object.freeze(messages), enumerable: true },
+      metadata: { value: claim.metadata, enumerable: true },
+      _resolution: { value: { action: null } },
+    });
+  }
+  ackAll() {
+    if (this._resolution.action === null)
+      this._resolution.action = { kind: "ack" };
+  }
+  retryAll(options) {
+    if (this._resolution.action !== null) return;
+    this._resolution.action = {
+      kind: "retry",
+      delaySeconds: __queueDelay(options?.delaySeconds, undefined),
+    };
+  }
+  _response(outcome) {
+    const explicitAcks = [];
+    const retryMessages = [];
+    for (const message of this.messages) {
+      const resolution = message._resolution.action;
+      if (resolution?.kind === "ack") explicitAcks.push(message.id);
+      else if (resolution?.kind === "retry") {
+        retryMessages.push({
+          msgId: message.id,
+          delaySeconds: resolution.delaySeconds,
+        });
+      }
+    }
+    const batch = this._resolution.action;
+    return {
+      outcome,
+      ackAll: batch?.kind === "ack",
+      retryBatch: {
+        retry: batch?.kind === "retry",
+        delaySeconds: batch?.delaySeconds,
+      },
+      explicitAcks,
+      retryMessages,
+    };
+  }
+}
+
 class __QueueCell {
   constructor(ctx) {
     this.ctx = ctx;
+    this._scope = ctx.storage.sql._scope;
+    this._queueName = this._scope.slice(`${__QUEUE_CLASS}:`.length);
+  }
+  _consumer() {
+    if (typeof __cell.selfQueue !== "function") return null;
+    return __cell.queueConsumers[this._queueName] || null;
   }
   __queueSend(messages) {
-    return __queueRun(this.ctx.storage.sql._scope, { mode: "send", messages });
+    return __queueRun(this._scope, {
+      mode: "send", messages, consumer: this._consumer(),
+    });
   }
   __queueMetrics() {
-    return __queueRun(this.ctx.storage.sql._scope, { mode: "metrics" });
+    return __queueRun(this._scope, { mode: "metrics" });
+  }
+  async alarm() {
+    const consumer = this._consumer();
+    if (consumer === null) return;
+    for (;;) {
+      const claim = __queueRun(this._scope, {
+        mode: "claim", nowMs: Date.now(), consumer,
+      });
+      for (const dropped of claim.dropped) {
+        console.error(JSON.stringify({
+          event: "celld.queue.message_dropped",
+          queue: claim.queue,
+          messageId: dropped.id,
+          attempts: dropped.attempts,
+          counter: {
+            name: "celld_queue_messages_dropped_total",
+            value: claim.droppedCount,
+          },
+        }));
+      }
+      if (claim.kind === "again") continue;
+      if (claim.kind !== "batch") return;
+
+      const batch = new MessageBatch(claim);
+      const ctx = __beginEvent();
+      let outcome = "ok";
+      try {
+        await __cell.selfQueue(batch, __cell.env, ctx);
+      } catch (error) {
+        outcome = "exception";
+        console.error(
+          `queue handler for ${JSON.stringify(claim.queue)} failed:`, error,
+        );
+      } finally {
+        __endEvent();
+      }
+      __queueRun(this._scope, {
+        mode: "settle",
+        nowMs: Date.now(),
+        consumer,
+        messageIds: batch.messages.map((message) => message.id),
+        response: batch._response(outcome),
+      });
+      return;
+    }
   }
 }
 

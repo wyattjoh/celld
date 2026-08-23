@@ -264,6 +264,39 @@ pub(super) fn inject_crons(scope: &mut v8::PinScope, crons: &[String]) -> Result
     Ok(())
 }
 
+/// `__cell.queueConsumers`: deploy-resolved push-consumer policy by queue name.
+pub(super) fn inject_queue_consumers(
+    scope: &mut v8::PinScope,
+    consumers: &[crate::protocol::QueueConsumer],
+) -> Result<()> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let cell = global
+        .get(scope, v8::String::new(scope, "__cell").unwrap().into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing __cell runtime state"))?;
+    let registry = v8::Object::new(scope);
+    for consumer in consumers {
+        let config = v8::Object::new(scope);
+        for (name, value) in [
+            ("maxBatchSize", f64::from(consumer.max_batch_size)),
+            ("maxBatchTimeout", f64::from(consumer.max_batch_timeout)),
+            ("maxRetries", f64::from(consumer.max_retries)),
+            ("retryDelay", f64::from(consumer.retry_delay)),
+        ] {
+            let key = v8::String::new(scope, name).unwrap();
+            let value = v8::Number::new(scope, value);
+            config.set(scope, key.into(), value.into());
+        }
+        let key = v8::String::new(scope, &consumer.queue_name)
+            .ok_or_else(|| anyhow!("queue consumer name"))?;
+        registry.set(scope, key.into(), config.into());
+    }
+    let key = v8::String::new(scope, "queueConsumers").unwrap();
+    cell.set(scope, key.into(), registry.into());
+    Ok(())
+}
+
 /// `globalThis.Cloudflare.compatibilityFlags`. Only flags Cells actually
 /// honours are listed; a flag Cells does not model is absent (falsy) rather
 /// than reported as enabled.

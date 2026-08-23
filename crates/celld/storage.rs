@@ -2514,6 +2514,28 @@ pub fn d1_run_json(scope: &str, request: &str) -> String {
 const QUEUE_MAX_MESSAGE_BYTES: usize = 128_000;
 const QUEUE_MAX_BATCH_BYTES: usize = 256_000;
 const QUEUE_MAX_BATCH_MESSAGES: usize = 100;
+static QUEUE_DROPPED_MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueConsumerConfig {
+    max_batch_size: u16,
+    max_batch_timeout: u32,
+    max_retries: u16,
+    retry_delay: u32,
+}
+
+impl QueueConsumerConfig {
+    fn policy(&self) -> anyhow::Result<celld_logic::queue::ConsumerConfig> {
+        celld_logic::queue::resolve_consumer(celld_logic::queue::ConsumerOptions {
+            max_batch_size: Some(i64::from(self.max_batch_size)),
+            max_batch_timeout: Some(i64::from(self.max_batch_timeout)),
+            max_retries: Some(i64::from(self.max_retries)),
+            retry_delay: Some(i64::from(self.retry_delay)),
+        })
+        .map_err(Into::into)
+    }
+}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2524,13 +2546,61 @@ struct QueueEnqueueMessage {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
+struct QueueRetryBatch {
+    retry: bool,
+    delay_seconds: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueRetryMessage {
+    msg_id: String,
+    delay_seconds: Option<i64>,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueueOutcome {
+    Ok,
+    Exception,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueSettleResponse {
+    outcome: QueueOutcome,
+    ack_all: bool,
+    retry_batch: QueueRetryBatch,
+    explicit_acks: Vec<String>,
+    retry_messages: Vec<QueueRetryMessage>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 enum QueueRequest {
-    Send { messages: Vec<QueueEnqueueMessage> },
+    Send {
+        messages: Vec<QueueEnqueueMessage>,
+        consumer: Option<QueueConsumerConfig>,
+    },
+    Claim {
+        now_ms: i64,
+        consumer: QueueConsumerConfig,
+    },
+    Settle {
+        now_ms: i64,
+        consumer: QueueConsumerConfig,
+        message_ids: Vec<String>,
+        response: QueueSettleResponse,
+    },
     Metrics,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueMetrics {
     backlog_count: u64,
@@ -2550,10 +2620,56 @@ struct QueueSendResult {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueClaimedMessage {
+    id: String,
+    enqueued_ms: i64,
+    body: Vec<u8>,
+    content_type: String,
+    attempts: u16,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueDrop {
+    id: String,
+    attempts: u16,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueClaimResult {
+    kind: &'static str,
+    queue: String,
+    messages: Vec<QueueClaimedMessage>,
+    metadata: QueueMetadata,
+    dropped: Vec<QueueDrop>,
+    dropped_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct QueueSettleResult {
+    metadata: QueueMetadata,
+}
+
+#[derive(serde::Serialize)]
 #[serde(untagged)]
 enum QueueResponse {
     Send(QueueSendResult),
+    Claim(QueueClaimResult),
+    Settle(QueueSettleResult),
     Metrics(QueueMetrics),
+}
+
+struct QueueRunResult {
+    response: QueueResponse,
+    alarm_changed: bool,
+}
+
+/// The queue op's JSON answer plus any newly committed wake deadline.
+pub struct QueueOpResult {
+    pub json: String,
+    pub alarm_at: Option<i64>,
 }
 
 fn queue_scope_name(scope: &str) -> anyhow::Result<&str> {
@@ -2594,8 +2710,78 @@ fn queue_message_id() -> String {
     id
 }
 
-fn queue_send(scope: &str, messages: &[QueueEnqueueMessage]) -> anyhow::Result<QueueSendResult> {
-    queue_scope_name(scope)?;
+fn queue_now_ms() -> anyhow::Result<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system clock is before Unix epoch: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("queue timestamp exceeds i64"))
+}
+
+fn queue_batch_decision(
+    connection: &Connection,
+    scope: &str,
+    now_ms: i64,
+    config: &celld_logic::queue::ConsumerConfig,
+) -> anyhow::Result<celld_logic::queue::BatchDecision> {
+    let (visible_count, earliest_visible_at_ms, next_visible_at_ms) = connection.query_row(
+        "SELECT COUNT(CASE WHEN visible_at_ms<=?2 THEN 1 END), \
+                MIN(visible_at_ms), \
+                MIN(CASE WHEN visible_at_ms>?2 THEN visible_at_ms END) \
+         FROM _cf_QUEUE WHERE scope=?1",
+        rusqlite::params![scope, now_ms],
+        |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        },
+    )?;
+    let visible_count = usize::try_from(visible_count).unwrap_or(usize::MAX);
+    Ok(celld_logic::queue::batch_decision(
+        now_ms,
+        visible_count,
+        earliest_visible_at_ms,
+        next_visible_at_ms,
+        config,
+    ))
+}
+
+fn queue_rearm(
+    connection: &Connection,
+    scope: &str,
+    now_ms: i64,
+    decision: celld_logic::queue::BatchDecision,
+    replace: bool,
+) -> anyhow::Result<bool> {
+    let desired = match decision {
+        celld_logic::queue::BatchDecision::Idle => return Ok(false),
+        celld_logic::queue::BatchDecision::DeliverNow => now_ms,
+        celld_logic::queue::BatchDecision::ArmAt(at_ms) => at_ms,
+    };
+    let current = connection
+        .query_row(
+            "SELECT at_ms FROM _cf_ALARM WHERE scope=?1",
+            [scope],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if !replace && current.is_some_and(|current| current <= desired) {
+        return Ok(false);
+    }
+    connection.execute(
+        "INSERT INTO _cf_ALARM(scope,at_ms,retry,counted_retry,generation) \
+         VALUES(?1,?2,0,0,random()) \
+         ON CONFLICT(scope) DO UPDATE SET \
+           at_ms=excluded.at_ms, retry=0, counted_retry=0, generation=random()",
+        rusqlite::params![scope, desired],
+    )?;
+    Ok(true)
+}
+
+fn queue_validate_messages(messages: &[QueueEnqueueMessage]) -> anyhow::Result<()> {
     anyhow::ensure!(
         !messages.is_empty(),
         "a queue send needs at least one message"
@@ -2631,14 +2817,18 @@ fn queue_send(scope: &str, messages: &[QueueEnqueueMessage]) -> anyhow::Result<Q
         batch_bytes <= QUEUE_MAX_BATCH_BYTES,
         "queue batch exceeds {QUEUE_MAX_BATCH_BYTES} bytes"
     );
+    Ok(())
+}
 
-    let enqueued_ms: i64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| anyhow::anyhow!("system clock is before Unix epoch: {error}"))?
-        .as_millis()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("queue enqueue timestamp exceeds i64"))?;
-
+fn queue_send(
+    scope: &str,
+    messages: &[QueueEnqueueMessage],
+    consumer: Option<&QueueConsumerConfig>,
+) -> anyhow::Result<QueueRunResult> {
+    queue_validate_messages(messages)?;
+    let config = consumer.map(QueueConsumerConfig::policy).transpose()?;
+    let enqueued_ms = queue_now_ms()?;
+    let alarm_active = active_alarm_scheduled_time(scope).is_some();
     with_mut(scope, |connection| {
         without_sql_authorizer_mut(connection, |connection| {
             let transaction =
@@ -2661,38 +2851,311 @@ fn queue_send(scope: &str, messages: &[QueueEnqueueMessage]) -> anyhow::Result<Q
                     ],
                 )?;
             }
+            let alarm_changed = match config.as_ref() {
+                Some(config) if !alarm_active => {
+                    let decision = queue_batch_decision(&transaction, scope, enqueued_ms, config)?;
+                    queue_rearm(&transaction, scope, enqueued_ms, decision, false)?
+                }
+                _ => false,
+            };
             let metrics = queue_metrics(&transaction, scope)?;
             transaction.commit()?;
-            Ok(QueueSendResult {
-                metadata: QueueMetadata { metrics },
+            Ok(QueueRunResult {
+                response: QueueResponse::Send(QueueSendResult {
+                    metadata: QueueMetadata { metrics },
+                }),
+                alarm_changed,
             })
         })
     })
     .ok_or_else(|| anyhow::anyhow!("no db for {scope}"))?
 }
 
-fn queue_run(scope: &str, request: QueueRequest) -> anyhow::Result<QueueResponse> {
+fn queue_claim(
+    scope: &str,
+    now_ms: i64,
+    consumer: &QueueConsumerConfig,
+) -> anyhow::Result<QueueRunResult> {
+    anyhow::ensure!(now_ms >= 0, "queue claim timestamp is negative");
+    let config = consumer.policy()?;
+    let queue = queue_scope_name(scope)?.to_string();
+    with_mut(scope, |connection| {
+        without_sql_authorizer_mut(connection, |connection| {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let decision = queue_batch_decision(&transaction, scope, now_ms, &config)?;
+            if decision != celld_logic::queue::BatchDecision::DeliverNow {
+                let alarm_changed = queue_rearm(&transaction, scope, now_ms, decision, true)?;
+                let metrics = queue_metrics(&transaction, scope)?;
+                transaction.commit()?;
+                return Ok(QueueRunResult {
+                    response: QueueResponse::Claim(QueueClaimResult {
+                        kind: "wait",
+                        queue,
+                        messages: Vec::new(),
+                        metadata: QueueMetadata { metrics },
+                        dropped: Vec::new(),
+                        dropped_count: QUEUE_DROPPED_MESSAGES.load(Ordering::Relaxed),
+                    }),
+                    alarm_changed,
+                });
+            }
+
+            let rows = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, enqueued_ms, body, content_type, attempts \
+                     FROM _cf_QUEUE WHERE scope=?1 AND visible_at_ms<=?2 \
+                     ORDER BY seq LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![scope, now_ms, i64::from(config.max_batch_size)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, u64>(4)?,
+                        ))
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut messages = Vec::with_capacity(rows.len());
+            let mut dropped = Vec::new();
+            for (id, enqueued_ms, body, content_type, stored_attempts) in rows {
+                let stored_attempts = stored_attempts.min(u64::from(u16::MAX)) as u16;
+                match celld_logic::queue::claim_attempt(stored_attempts, config.max_retries) {
+                    celld_logic::queue::ClaimDecision::Deliver { attempts } => {
+                        transaction.execute(
+                            "UPDATE _cf_QUEUE SET attempts=?3 WHERE scope=?1 AND id=?2",
+                            rusqlite::params![scope, id, i64::from(attempts)],
+                        )?;
+                        messages.push(QueueClaimedMessage {
+                            id,
+                            enqueued_ms,
+                            body,
+                            content_type,
+                            attempts,
+                        });
+                    }
+                    celld_logic::queue::ClaimDecision::Drop { attempts } => {
+                        transaction.execute(
+                            "DELETE FROM _cf_QUEUE WHERE scope=?1 AND id=?2",
+                            rusqlite::params![scope, id],
+                        )?;
+                        dropped.push(QueueDrop { id, attempts });
+                    }
+                }
+            }
+            let dropped_count = if dropped.is_empty() {
+                QUEUE_DROPPED_MESSAGES.load(Ordering::Relaxed)
+            } else {
+                QUEUE_DROPPED_MESSAGES.fetch_add(dropped.len() as u64, Ordering::Relaxed)
+                    + dropped.len() as u64
+            };
+            let (kind, alarm_changed) = if messages.is_empty() {
+                let decision = queue_batch_decision(&transaction, scope, now_ms, &config)?;
+                if decision == celld_logic::queue::BatchDecision::DeliverNow {
+                    ("again", false)
+                } else {
+                    (
+                        "wait",
+                        queue_rearm(&transaction, scope, now_ms, decision, true)?,
+                    )
+                }
+            } else {
+                ("batch", false)
+            };
+            let metrics = queue_metrics(&transaction, scope)?;
+            transaction.commit()?;
+            Ok(QueueRunResult {
+                response: QueueResponse::Claim(QueueClaimResult {
+                    kind,
+                    queue,
+                    messages,
+                    metadata: QueueMetadata { metrics },
+                    dropped,
+                    dropped_count,
+                }),
+                alarm_changed,
+            })
+        })
+    })
+    .ok_or_else(|| anyhow::anyhow!("no db for {scope}"))?
+}
+
+fn queue_validate_delay(delay_seconds: Option<i64>) -> anyhow::Result<()> {
+    if let Some(delay_seconds) = delay_seconds {
+        anyhow::ensure!(
+            (0..=i64::from(celld_logic::queue::MAX_DELAY_SECONDS)).contains(&delay_seconds),
+            "queue retry delay {delay_seconds} is outside 0..={}",
+            celld_logic::queue::MAX_DELAY_SECONDS
+        );
+    }
+    Ok(())
+}
+
+fn queue_settle(
+    scope: &str,
+    now_ms: i64,
+    consumer: &QueueConsumerConfig,
+    message_ids: &[String],
+    response: &QueueSettleResponse,
+) -> anyhow::Result<QueueRunResult> {
+    anyhow::ensure!(now_ms >= 0, "queue settle timestamp is negative");
+    anyhow::ensure!(
+        message_ids.len() <= QUEUE_MAX_BATCH_MESSAGES,
+        "queue settlement exceeds {QUEUE_MAX_BATCH_MESSAGES} messages"
+    );
+    anyhow::ensure!(
+        !(response.ack_all && response.retry_batch.retry),
+        "queue settlement cannot ackAll and retryAll"
+    );
+    queue_validate_delay(response.retry_batch.delay_seconds)?;
+    let delivered: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
+    anyhow::ensure!(
+        delivered.len() == message_ids.len(),
+        "queue settlement contains duplicate message ids"
+    );
+    let explicit_acks: HashSet<&str> = response.explicit_acks.iter().map(String::as_str).collect();
+    anyhow::ensure!(
+        explicit_acks.len() == response.explicit_acks.len(),
+        "queue settlement contains duplicate explicit acks"
+    );
+    let mut retry_messages = HashMap::new();
+    for retry in &response.retry_messages {
+        queue_validate_delay(retry.delay_seconds)?;
+        anyhow::ensure!(
+            retry_messages
+                .insert(retry.msg_id.as_str(), retry.delay_seconds)
+                .is_none(),
+            "queue settlement contains duplicate retries"
+        );
+    }
+    anyhow::ensure!(
+        !explicit_acks
+            .iter()
+            .any(|id| retry_messages.contains_key(id)),
+        "queue settlement both acknowledges and retries a message"
+    );
+    anyhow::ensure!(
+        explicit_acks.iter().all(|id| delivered.contains(id))
+            && retry_messages.keys().all(|id| delivered.contains(id)),
+        "queue settlement references a message outside the claimed batch"
+    );
+    let config = consumer.policy()?;
+    with_mut(scope, |connection| {
+        without_sql_authorizer_mut(connection, |connection| {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for id in message_ids {
+                let retry_delay = if explicit_acks.contains(id.as_str()) {
+                    None
+                } else if let Some(delay) = retry_messages.get(id.as_str()) {
+                    Some(celld_logic::queue::retry_delay_seconds(
+                        *delay,
+                        response
+                            .retry_batch
+                            .retry
+                            .then_some(response.retry_batch.delay_seconds)
+                            .flatten(),
+                        &config,
+                    ))
+                } else if response.ack_all {
+                    None
+                } else if response.retry_batch.retry {
+                    Some(celld_logic::queue::retry_delay_seconds(
+                        None,
+                        response.retry_batch.delay_seconds,
+                        &config,
+                    ))
+                } else if matches!(response.outcome, QueueOutcome::Ok) {
+                    None
+                } else {
+                    Some(celld_logic::queue::retry_delay_seconds(None, None, &config))
+                };
+                let changed = if let Some(delay_seconds) = retry_delay {
+                    let visible_at_ms =
+                        celld_logic::queue::visible_at_ms(now_ms, i64::from(delay_seconds));
+                    transaction.execute(
+                        "UPDATE _cf_QUEUE SET visible_at_ms=?3 \
+                         WHERE scope=?1 AND id=?2",
+                        rusqlite::params![scope, id, visible_at_ms],
+                    )?
+                } else {
+                    transaction.execute(
+                        "DELETE FROM _cf_QUEUE WHERE scope=?1 AND id=?2",
+                        rusqlite::params![scope, id],
+                    )?
+                };
+                anyhow::ensure!(changed == 1, "queue settlement lost message {id:?}");
+            }
+            let decision = queue_batch_decision(&transaction, scope, now_ms, &config)?;
+            let alarm_changed = queue_rearm(&transaction, scope, now_ms, decision, true)?;
+            let metrics = queue_metrics(&transaction, scope)?;
+            transaction.commit()?;
+            Ok(QueueRunResult {
+                response: QueueResponse::Settle(QueueSettleResult {
+                    metadata: QueueMetadata { metrics },
+                }),
+                alarm_changed,
+            })
+        })
+    })
+    .ok_or_else(|| anyhow::anyhow!("no db for {scope}"))?
+}
+
+fn queue_run(scope: &str, request: QueueRequest) -> anyhow::Result<QueueRunResult> {
     queue_scope_name(scope)?;
     match request {
-        QueueRequest::Send { messages } => queue_send(scope, &messages).map(QueueResponse::Send),
+        QueueRequest::Send { messages, consumer } => {
+            queue_send(scope, &messages, consumer.as_ref())
+        }
+        QueueRequest::Claim { now_ms, consumer } => queue_claim(scope, now_ms, &consumer),
+        QueueRequest::Settle {
+            now_ms,
+            consumer,
+            message_ids,
+            response,
+        } => queue_settle(scope, now_ms, &consumer, &message_ids, &response),
         QueueRequest::Metrics => with(scope, |connection| queue_metrics(connection, scope))
             .ok_or_else(|| anyhow::anyhow!("no db for {scope}"))?
-            .map(QueueResponse::Metrics),
+            .map(|metrics| QueueRunResult {
+                response: QueueResponse::Metrics(metrics),
+                alarm_changed: false,
+            }),
     }
 }
 
-/// The string-in, string-out wrapper used by the reserved queue cell.
-pub fn queue_run_json(scope: &str, request: &str) -> String {
+/// Run the reserved queue op and expose a newly committed alarm to its wake gate.
+pub fn queue_run_op(scope: &str, request: &str) -> QueueOpResult {
     let response = serde_json::from_str::<QueueRequest>(request)
         .map_err(|error| anyhow::anyhow!("invalid queue request: {error}"))
         .and_then(|request| queue_run(scope, request));
     match response {
-        Ok(response) => serde_json::json!({ "ok": response }).to_string(),
-        Err(error) => serde_json::json!({
-            "error": { "message": error.to_string() },
-        })
-        .to_string(),
+        Ok(result) => QueueOpResult {
+            json: serde_json::json!({ "ok": result.response }).to_string(),
+            alarm_at: result.alarm_changed.then(|| publish_alarm(scope)).flatten(),
+        },
+        Err(error) => QueueOpResult {
+            json: serde_json::json!({
+                "error": { "message": error.to_string() },
+            })
+            .to_string(),
+            alarm_at: None,
+        },
     }
+}
+
+/// The string-in, string-out wrapper used by storage tests.
+pub fn queue_run_json(scope: &str, request: &str) -> String {
+    queue_run_op(scope, request).json
+}
+
+#[cfg(test)]
+pub fn queue_dropped_messages_for_test() -> u64 {
+    QUEUE_DROPPED_MESSAGES.load(Ordering::Relaxed)
 }
 
 /// `Ok(Some(at_ms))` when an outermost commit published a dirty committed

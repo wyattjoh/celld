@@ -1352,6 +1352,8 @@ pub struct WorkerConfig {
     d1_bindings: Vec<(String, String)>,
     /// Queue producers: (environment name, fleet-global queue name, default delay).
     queue_bindings: Vec<(String, String, u32)>,
+    /// Push-consumer policy resolved and pinned in the deployment manifest.
+    queue_consumers: Vec<crate::protocol::QueueConsumer>,
     ai_binding: Option<String>,
     vars: Vec<(String, String)>,
     node: String,
@@ -1393,6 +1395,7 @@ pub struct WorkerConfigOptions {
     pub r2_bindings: Vec<String>,
     pub d1_bindings: Vec<(String, String)>,
     pub queue_bindings: Vec<(String, String, u32)>,
+    pub queue_consumers: Vec<crate::protocol::QueueConsumer>,
     pub ai_binding: Option<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
@@ -1410,6 +1413,7 @@ impl WorkerConfig {
             r2_bindings,
             d1_bindings,
             queue_bindings,
+            queue_consumers,
             ai_binding,
             vars,
             node,
@@ -1425,6 +1429,7 @@ impl WorkerConfig {
             r2_bindings,
             d1_bindings,
             queue_bindings,
+            queue_consumers,
             ai_binding,
             vars,
             node,
@@ -3431,6 +3436,7 @@ impl Worker {
             }
             inject_namespace_keys(scope, script_name, do_classes)?;
             inject_crons(scope, &config.crons)?;
+            inject_queue_consumers(scope, &config.queue_consumers)?;
             populate_cf_exports(scope, ns, do_classes)?;
             register_entrypoints(scope, ns)?;
             // build env from bindings and stash it in the harness
@@ -3526,6 +3532,30 @@ impl Worker {
                                 "(ctrl) => globalThis.__dispatchEntrypointScheduled('default', ctrl)",
                             )?;
                             cell.set(scope, key_.into(), shim.into());
+                        }
+                    }
+
+                    // Queue cells invoke the module's push-consumer handler in
+                    // the same realm, with the same object/class distinction.
+                    let qk = v8::String::new(scope, "queue").unwrap();
+                    let self_queue = v8::String::new(scope, "selfQueue").unwrap();
+                    let own = default
+                        .get(scope, qk.into())
+                        .filter(|handler| handler.is_function());
+                    if let Some(handler) = own {
+                        cell.set(scope, self_queue.into(), handler);
+                    } else if default_is_entrypoint {
+                        let pk = v8::String::new(scope, "prototype").unwrap();
+                        let proto_queue = default
+                            .get(scope, pk.into())
+                            .and_then(|proto| proto.to_object(scope))
+                            .and_then(|proto| proto.get(scope, qk.into()));
+                        if proto_queue.is_some_and(|handler| handler.is_function()) {
+                            let shim = compile_fn(
+                                scope,
+                                "(batch) => globalThis.__dispatchEntrypointQueue('default', batch)",
+                            )?;
+                            cell.set(scope, self_queue.into(), shim.into());
                         }
                     }
                 }
@@ -4452,6 +4482,7 @@ mod loader_capability_tests {
             r2_bindings: Vec::new(),
             d1_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -4465,6 +4496,14 @@ mod loader_capability_tests {
     }
 
     fn load_queue_test_worker(source: &str) -> Worker {
+        load_queue_worker(source, Vec::new(), 7)
+    }
+
+    fn load_queue_worker(
+        source: &str,
+        queue_consumers: Vec<crate::protocol::QueueConsumer>,
+        delivery_delay: u32,
+    ) -> Worker {
         init_v8();
         Worker::load(
             WorkerConfigOptions {
@@ -4475,9 +4514,10 @@ mod loader_capability_tests {
                 r2_bindings: Vec::new(),
                 d1_bindings: Vec::new(),
                 queue_bindings: vec![
-                    ("Q".into(), "events".into(), 7),
+                    ("Q".into(), "events".into(), delivery_delay),
                     ("UNREACHABLE".into(), "unreachable".into(), 0),
                 ],
+                queue_consumers,
                 ai_binding: None,
                 vars: Vec::new(),
                 node: String::new(),
@@ -4509,12 +4549,16 @@ mod loader_capability_tests {
 
     async fn fetch_with_worker(worker: Worker) -> HttpResponse {
         let slot = crate::pool::Slot::standalone(worker);
+        fetch_with_slot(&slot, "/").await
+    }
+
+    async fn fetch_with_slot(slot: &Arc<crate::pool::Slot>, path: &str) -> HttpResponse {
         let (reply, receive) = tokio::sync::oneshot::channel();
         crate::runtime::drive(
-            slot,
+            slot.clone(),
             crate::WorkerJob::Fetch {
                 queued_at: Instant::now(),
-                url: "https://behavior.example/".into(),
+                url: format!("https://behavior.example{path}"),
                 method: "GET".into(),
                 body: RequestBody::Bytes(Vec::new()),
                 headers: Vec::new(),
@@ -4528,6 +4572,27 @@ mod loader_capability_tests {
             .await
             .expect("behavior worker reply")
             .expect("behavior worker result")
+    }
+
+    async fn fire_queue_alarm(slot: &Arc<crate::pool::Slot>) -> Option<i64> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        crate::runtime::drive_cell(
+            slot.affiliate(),
+            CellJob::Alarm {
+                scope: ".queue:events".into(),
+                scheduled_ms: 0,
+                claim: AlarmDispatch::Armed,
+                reply,
+            },
+            None,
+            None,
+        )
+        .await;
+        receive
+            .await
+            .expect("queue alarm reply")
+            .expect("queue alarm result")
+            .0
     }
 
     #[tokio::test]
@@ -4780,6 +4845,259 @@ mod loader_capability_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn queue_consumer_delivers_selective_retries_drops_poison_and_self_sends() {
+        init_queue_gate();
+        let root = std::env::temp_dir().join(format!(
+            "celld-queue-consumer-{}-{}",
+            std::process::id(),
+            NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create queue consumer test directory");
+        let queue_path = root.join("events.sqlite");
+        let source = r#"
+            const deliveries = [];
+            const describe = (message) => {
+              const { body } = message;
+              if (body instanceof Uint8Array) {
+                return { kind: "bytes", value: Array.from(body) };
+              }
+              if (body instanceof Date) {
+                return { kind: "date", value: body.toISOString() };
+              }
+              if (typeof body === "string") {
+                return { kind: "text", value: body };
+              }
+              return { kind: body.mode ?? "json", value: body };
+            };
+            export default {
+              async fetch(request, env) {
+                if (new URL(request.url).pathname === "/seed") {
+                  return Response.json(await env.Q.sendBatch([
+                    { body: { mode: "ack", value: 42 } },
+                    { body: "hello", contentType: "text" },
+                    { body: new Uint8Array([1, 2, 3]), contentType: "bytes" },
+                    {
+                      body: new Date("2026-01-02T03:04:05Z"),
+                      contentType: "v8",
+                    },
+                    { body: { mode: "retry" } },
+                    { body: { mode: "poison" } },
+                    { body: { mode: "self" } },
+                  ]));
+                }
+                return Response.json({
+                  deliveries,
+                  metrics: await env.Q.metrics(),
+                });
+              },
+              async queue(batch, env) {
+                for (const message of batch.messages) {
+                  deliveries.push({
+                    queue: batch.queue,
+                    id: message.id,
+                    attempts: message.attempts,
+                    timestampIsDate: message.timestamp instanceof Date &&
+                      Number.isFinite(message.timestamp.valueOf()),
+                    ...describe(message),
+                  });
+                  if (message.body?.mode === "retry" && message.attempts === 1) {
+                    message.retry({ delaySeconds: 0 });
+                  } else if (message.body?.mode === "poison") {
+                    message.retry({ delaySeconds: 0 });
+                  } else if (message.body?.mode === "self" && message.attempts === 1) {
+                    message.ack();
+                    await env.Q.send({ mode: "child" });
+                  } else {
+                    message.ack();
+                  }
+                }
+              },
+            };
+        "#;
+        let consumer = crate::protocol::QueueConsumer {
+            queue_name: "events".into(),
+            max_batch_size: 10,
+            max_batch_timeout: 0,
+            max_retries: 2,
+            retry_delay: 0,
+        };
+        let mut worker = load_queue_worker(source, vec![consumer], 0);
+        worker
+            .own_cell(
+                ".queue:events",
+                Some(queue_path.to_str().expect("queue sqlite path")),
+                true,
+            )
+            .expect("own queue cell");
+        worker
+            .mark_owned_for_test(&[".queue:events".to_string()])
+            .expect("mark queue cell local for consumer test");
+        let slot = crate::pool::Slot::standalone(worker);
+
+        let dropped_before = crate::storage::queue_dropped_messages_for_test();
+        let seeded = fetch_with_slot(&slot, "/seed").await;
+        assert_eq!(seeded.status, 200);
+        for alarm_number in 1..=4 {
+            tokio::time::timeout(Duration::from_secs(2), fire_queue_alarm(&slot))
+                .await
+                .unwrap_or_else(|_| panic!("queue alarm {alarm_number} deadlocked"));
+        }
+
+        let response = fetch_with_slot(&slot, "/state").await;
+        assert_eq!(response.status, 200);
+        let state: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("queue consumer state JSON");
+        let deliveries = state["deliveries"]
+            .as_array()
+            .expect("queue consumer delivery list");
+        let attempts_for = |kind: &str| {
+            deliveries
+                .iter()
+                .filter(|delivery| delivery["kind"] == kind)
+                .map(|delivery| {
+                    delivery["attempts"]
+                        .as_u64()
+                        .expect("queue delivery attempts")
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(attempts_for("ack"), [1]);
+        assert_eq!(attempts_for("text"), [1]);
+        assert_eq!(attempts_for("bytes"), [1]);
+        assert_eq!(attempts_for("date"), [1]);
+        assert_eq!(attempts_for("retry"), [1, 2]);
+        assert_eq!(attempts_for("poison"), [1, 2, 3]);
+        assert_eq!(attempts_for("self"), [1]);
+        assert_eq!(attempts_for("child"), [1]);
+        assert!(deliveries.iter().all(|delivery| {
+            delivery["queue"] == "events"
+                && delivery["timestampIsDate"] == true
+                && delivery["id"].as_str().is_some_and(|id| !id.is_empty())
+        }));
+        assert_eq!(
+            deliveries
+                .iter()
+                .find(|delivery| delivery["kind"] == "ack")
+                .expect("JSON delivery")["value"]["value"],
+            42
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .find(|delivery| delivery["kind"] == "text")
+                .expect("text delivery")["value"],
+            "hello"
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .find(|delivery| delivery["kind"] == "bytes")
+                .expect("bytes delivery")["value"],
+            serde_json::json!([1, 2, 3])
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .find(|delivery| delivery["kind"] == "date")
+                .expect("v8 delivery")["value"],
+            "2026-01-02T03:04:05.000Z"
+        );
+        assert_eq!(state["metrics"]["backlogCount"], 0);
+        assert_eq!(state["metrics"]["backlogBytes"], 0);
+        assert!(
+            crate::storage::queue_dropped_messages_for_test() > dropped_before,
+            "poison claim increments the dropped-message counter"
+        );
+
+        let connection = rusqlite::Connection::open(&queue_path).expect("open queue database");
+        let queued: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM _cf_QUEUE WHERE scope='.queue:events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count queue rows");
+        let alarms: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM _cf_ALARM WHERE scope='.queue:events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count queue alarms");
+        assert_eq!(queued, 0);
+        assert_eq!(alarms, 0);
+
+        drop(connection);
+        drop(slot);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn queue_without_handler_accumulates_without_alarm() {
+        init_queue_gate();
+        let root = std::env::temp_dir().join(format!(
+            "celld-queue-no-handler-{}-{}",
+            std::process::id(),
+            NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create no-handler test directory");
+        let queue_path = root.join("events.sqlite");
+        let source = r#"
+            export default {
+              async fetch(_request, env) {
+                return Response.json(await env.Q.send({ mode: "stored" }));
+              },
+            };
+        "#;
+        let consumer = crate::protocol::QueueConsumer {
+            queue_name: "events".into(),
+            max_batch_size: 10,
+            max_batch_timeout: 0,
+            max_retries: 2,
+            retry_delay: 0,
+        };
+        let mut worker = load_queue_worker(source, vec![consumer], 0);
+        worker
+            .own_cell(
+                ".queue:events",
+                Some(queue_path.to_str().expect("queue sqlite path")),
+                true,
+            )
+            .expect("own queue cell");
+        worker
+            .mark_owned_for_test(&[".queue:events".to_string()])
+            .expect("mark queue cell local for no-handler test");
+
+        let response = fetch_with_worker(worker).await;
+        assert_eq!(response.status, 200);
+        let send: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("no-handler send response JSON");
+        assert_eq!(send["metadata"]["metrics"]["backlogCount"], 1);
+
+        let connection = rusqlite::Connection::open(&queue_path).expect("open queue database");
+        let queued: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM _cf_QUEUE WHERE scope='.queue:events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count queued messages");
+        let alarms: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM _cf_ALARM WHERE scope='.queue:events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count queue alarms");
+        assert_eq!(queued, 1);
+        assert_eq!(alarms, 0);
+
+        drop(connection);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn disposal_rejects_new_calls_but_keeps_existing_call_rooted() {
         let lifecycle = Arc::new(CapabilityLifecycle::live());
@@ -4891,6 +5209,7 @@ mod loader_capability_tests {
             r2_bindings: Vec::new(),
             d1_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -6090,6 +6409,7 @@ fn op_loader_load(
             // ambient bindings are exactly what Code Mode withholds.
             d1_bindings: Vec::new(),
             queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -9268,8 +9588,8 @@ mod modules;
 use bootstrap::{
     adopt_cell, begin_event_context, build_env, end_event_context, harness_env,
     inject_compatibility_flags, inject_crons, inject_loader_outbound, inject_namespace_keys,
-    inject_routing, inject_storage_compatibility, install_harness, install_prelude,
-    populate_cf_exports, register_class, register_entrypoints,
+    inject_queue_consumers, inject_routing, inject_storage_compatibility, install_harness,
+    install_prelude, populate_cf_exports, register_class, register_entrypoints,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
