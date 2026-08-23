@@ -13,8 +13,7 @@ use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumer, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1,
-    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_QUEUES_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_QUEUES_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -1010,7 +1009,10 @@ fn read_queues(project: &Map<String, Value>) -> anyhow::Result<QueueDeclarations
         .cloned()
         .collect::<Vec<_>>();
     if !unsupported.is_empty() {
-        bail!("unknown config keys under `queues`: {}", unsupported.join(", "));
+        bail!(
+            "unknown config keys under `queues`: {}",
+            unsupported.join(", ")
+        );
     }
 
     let producers = queue_entries(queues, "producers")?;
@@ -1024,11 +1026,9 @@ fn read_queues(project: &Map<String, Value>) -> anyhow::Result<QueueDeclarations
         if !valid_binding(binding) {
             bail!("invalid queue binding name: {binding:?}");
         }
-        let config = celld_logic::queue::resolve_producer(
-            celld_logic::queue::ProducerOptions {
-                delivery_delay: queue_integer(producer, "delivery_delay", "producer", index)?,
-            },
-        )
+        let config = celld_logic::queue::resolve_producer(celld_logic::queue::ProducerOptions {
+            delivery_delay: queue_integer(producer, "delivery_delay", "producer", index)?,
+        })
         .map_err(|error| anyhow!("queue producer {queue_name:?}: {error}"))?;
         producer_bindings.push(json!({
             "type": "queue",
@@ -1049,19 +1049,12 @@ fn read_queues(project: &Map<String, Value>) -> anyhow::Result<QueueDeclarations
         if !consumed_queues.insert(queue_name.to_string()) {
             bail!("queue {queue_name:?} has more than one consumer");
         }
-        let config = celld_logic::queue::resolve_consumer(
-            celld_logic::queue::ConsumerOptions {
-                max_batch_size: queue_integer(consumer, "max_batch_size", "consumer", index)?,
-                max_batch_timeout: queue_integer(
-                    consumer,
-                    "max_batch_timeout",
-                    "consumer",
-                    index,
-                )?,
-                max_retries: queue_integer(consumer, "max_retries", "consumer", index)?,
-                retry_delay: queue_integer(consumer, "retry_delay", "consumer", index)?,
-            },
-        )
+        let config = celld_logic::queue::resolve_consumer(celld_logic::queue::ConsumerOptions {
+            max_batch_size: queue_integer(consumer, "max_batch_size", "consumer", index)?,
+            max_batch_timeout: queue_integer(consumer, "max_batch_timeout", "consumer", index)?,
+            max_retries: queue_integer(consumer, "max_retries", "consumer", index)?,
+            retry_delay: queue_integer(consumer, "retry_delay", "consumer", index)?,
+        })
         .map_err(|error| anyhow!("queue consumer {queue_name:?}: {error}"))?;
         consumers.push(QueueConsumer {
             queue_name: queue_name.to_string(),
@@ -1079,10 +1072,7 @@ fn read_queues(project: &Map<String, Value>) -> anyhow::Result<QueueDeclarations
     })
 }
 
-fn queue_entries<'a>(
-    queues: &'a Map<String, Value>,
-    section: &str,
-) -> anyhow::Result<&'a [Value]> {
+fn queue_entries<'a>(queues: &'a Map<String, Value>, section: &str) -> anyhow::Result<&'a [Value]> {
     match queues.get(section) {
         None => Ok(&[]),
         Some(Value::Array(entries)) => Ok(entries),
@@ -1887,7 +1877,10 @@ mod tests {
         let invalid_name = error_for(json!({
             "producers": [{ "binding": "EVENTS", "queue": "Invalid" }],
         }));
-        assert!(invalid_name.contains("invalid queue name"), "{invalid_name}");
+        assert!(
+            invalid_name.contains("invalid queue name"),
+            "{invalid_name}"
+        );
 
         // One Wrangler config names one script. An attempted owner selector
         // would make the pair cross-script, and the strict logic allowlist

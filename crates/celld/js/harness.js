@@ -3962,7 +3962,7 @@ class DurableObjectNamespace {
       if (__cell.owned[scope])
         return async (...args) => invoke(
           async () => __rpcDes(await __dispatchRpc(
-            scope, prop, __rpcOut(args, true))),
+            scope, prop, __rpcOut(args, true), true)),
         );
       // The routed channel also lifts: same-process dispatch
       // re-enters this isolate, where the markers revive; bytes
@@ -4131,8 +4131,9 @@ const __rpcTargetMethod = async (scope, method) => {
 // isolate (the owned fast path and same-process routed dispatch)
 // and fail loudly on use anywhere else. Callee exceptions cross in
 // the error envelope on every flavor.
-globalThis.__dispatchRpc = async (scope, method, args) => {
+globalThis.__dispatchRpc = async (scope, method, args, inline = false) => {
   __actorEventStack.push(scope);
+  const gateBefore = inline ? __writePosition(scope) : null;
   try {
     // A string is the legacy JSON flavor (test harness, old cross-node
     // envelope); bytes are V8 structured clone. Answer in kind.
@@ -4159,6 +4160,11 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
       }
     })());
   } finally {
+    if (inline) {
+      const after = __writePosition(scope);
+      const wrote = after !== null && after > (gateBefore ?? 0);
+      await __gateWrite(scope, wrote ? after : null);
+    }
     if (__actorEventStack[__actorEventStack.length - 1] === scope)
       __actorEventStack.pop();
   }
@@ -4555,6 +4561,176 @@ globalThis.__cell = {
   makeNamespace,
   release: __cellRelease,
 };
+// ---- Queues -------------------------------------------------------------
+// A producer binding serializes and validates before crossing the RPC seam,
+// matching workerd's Queue implementation. The reserved cell receives only an
+// opaque byte payload, its canonical content type, and one resolved delay.
+const __QUEUE_MAX_MESSAGE_BYTES = 128000;
+const __QUEUE_MAX_BATCH_BYTES = 256000;
+const __QUEUE_MAX_BATCH_MESSAGES = 100;
+const __QUEUE_MAX_DELAY_SECONDS = 86400;
+const __QUEUE_CLASS = ".queue";
+
+const __queueDelay = (value, fallback) => {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) ||
+      value < 0 || value > __QUEUE_MAX_DELAY_SECONDS) {
+    throw new TypeError(
+      `Queue delaySeconds must be an integer between 0 and ` +
+        `${__QUEUE_MAX_DELAY_SECONDS}, but received: ${value}`,
+    );
+  }
+  return value;
+};
+
+const __queueSerialize = (body, contentType) => {
+  if (body === undefined) throw new TypeError("Message body cannot be undefined");
+  contentType = contentType === undefined
+    ? "json" : String(contentType).toLowerCase();
+  let bytes;
+  if (contentType === "text") {
+    if (typeof body !== "string") {
+      throw new TypeError(
+        `Content Type "text" requires a value of type string, but received: ` +
+          `${typeof body}`,
+      );
+    }
+    bytes = new TextEncoder().encode(body);
+  } else if (contentType === "bytes") {
+    if (!ArrayBuffer.isView(body)) {
+      throw new TypeError(
+        `Content Type "bytes" requires a value of type ArrayBufferView, ` +
+          `but received: ${typeof body}`,
+      );
+    }
+    bytes = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  } else if (contentType === "json") {
+    const encoded = JSON.stringify(body);
+    if (encoded === undefined)
+      throw new TypeError("Queue message body is not JSON serializable");
+    bytes = new TextEncoder().encode(encoded);
+  } else if (contentType === "v8") {
+    bytes = __sc_encode(body);
+  } else {
+    throw new TypeError(
+      `Unsupported queue message content type: ${contentType}`,
+    );
+  }
+  if (bytes.byteLength > __QUEUE_MAX_MESSAGE_BYTES) {
+    throw new TypeError(
+      `Queue message body exceeds the ${__QUEUE_MAX_MESSAGE_BYTES} byte limit`,
+    );
+  }
+  return { body: Array.from(bytes), contentType };
+};
+
+const __queuePrepare = (body, options, fallbackDelay) => {
+  const encoded = __queueSerialize(body, options?.contentType);
+  encoded.delaySeconds = __queueDelay(options?.delaySeconds, fallbackDelay);
+  return encoded;
+};
+
+const __queueRun = (scope, request) => {
+  const response = JSON.parse(__queue_run(scope, JSON.stringify(request)));
+  if (response.error) throw new Error(response.error.message);
+  return response.ok;
+};
+
+class __QueueCell {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+  __queueSend(messages) {
+    return __queueRun(this.ctx.storage.sql._scope, { mode: "send", messages });
+  }
+  __queueMetrics() {
+    return __queueRun(this.ctx.storage.sql._scope, { mode: "metrics" });
+  }
+}
+
+__cell.classes[__QUEUE_CLASS] = __QueueCell;
+// The runtime owns this reserved class, so native RPC is always enabled just
+// like the runtime-supplied D1 class.
+__cell.doExports[__QUEUE_CLASS] = true;
+
+const __queueFailure = (operation, error) => {
+  const message = String(error && error.message || error);
+  const wrapped = new Error(`Queue ${operation} failed: ${message}`);
+  wrapped.cause = error;
+  return wrapped;
+};
+
+// Named so SDKs that sniff a binding by `constructor.name` recognise it.
+class Queue {
+  constructor(queueName, deliveryDelay) {
+    Object.defineProperties(this, {
+      _queueName: { value: queueName },
+      _deliveryDelay: { value: deliveryDelay },
+    });
+  }
+  // A queue is fleet-global. Construct the reserved ID literally instead of
+  // getByName(), whose HMAC intentionally folds in the Worker script.
+  get _stub() {
+    const namespace = new DurableObjectNamespace(__QUEUE_CLASS, "");
+    const id = new DurableObjectId(
+      __QUEUE_CLASS, this._queueName, this._queueName,
+    );
+    return namespace.get(id);
+  }
+  async send(body, options) {
+    const message = __queuePrepare(body, options, this._deliveryDelay);
+    try {
+      return await this._stub.__queueSend([message]);
+    } catch (error) {
+      throw __queueFailure("send", error);
+    }
+  }
+  async sendBatch(messages, options) {
+    const batch = Array.from(messages);
+    if (batch.length === 0)
+      throw new TypeError("sendBatch() requires at least one message");
+    if (batch.length > __QUEUE_MAX_BATCH_MESSAGES) {
+      throw new TypeError(
+        `sendBatch() cannot send more than ` +
+          `${__QUEUE_MAX_BATCH_MESSAGES} messages`,
+      );
+    }
+    const callDelay = __queueDelay(
+      options?.delaySeconds, this._deliveryDelay,
+    );
+    const encoded = batch.map((message) => __queuePrepare(
+      message.body,
+      {
+        contentType: message.contentType,
+        delaySeconds: message.delaySeconds,
+      },
+      callDelay,
+    ));
+    const totalBytes = encoded.reduce(
+      (total, message) => total + message.body.length, 0,
+    );
+    if (totalBytes > __QUEUE_MAX_BATCH_BYTES) {
+      throw new TypeError(
+        `sendBatch() exceeds the ${__QUEUE_MAX_BATCH_BYTES} byte limit`,
+      );
+    }
+    try {
+      return await this._stub.__queueSend(encoded);
+    } catch (error) {
+      throw __queueFailure("sendBatch", error);
+    }
+  }
+  async metrics() {
+    try {
+      return await this._stub.__queueMetrics();
+    } catch (error) {
+      throw __queueFailure("metrics", error);
+    }
+  }
+}
+
+globalThis.__makeQueue = (queueName, deliveryDelay) =>
+  new Queue(queueName, deliveryDelay);
 // ---- D1 -----------------------------------------------------------------
 // A D1 database is a cell of a runtime-supplied Durable Object class, so it
 // inherits ownership, fencing, LTX replication, RPO=0 acknowledgement and

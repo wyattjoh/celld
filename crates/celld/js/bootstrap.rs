@@ -310,6 +310,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let bindings = config.bindings.as_slice();
     let r2_bindings = config.r2_bindings.as_slice();
     let d1_bindings = config.d1_bindings.as_slice();
+    let queue_bindings = config.queue_bindings.as_slice();
     let ai_binding = config.ai_binding.as_deref();
     let vars = config.vars.as_slice();
     let services = config.services.as_slice();
@@ -330,6 +331,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             lines.push_str(&format!(
                 "e[{:?}] = __makeD1Database({:?});\n",
                 name, database
+            ));
+        }
+        for (name, queue_name, delivery_delay) in queue_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __makeQueue({:?}, {});\n",
+                name, queue_name, delivery_delay
             ));
         }
         if let Some(name) = ai_binding {

@@ -1350,6 +1350,8 @@ pub struct WorkerConfig {
     /// `d1_databases`: (environment name, stable database identity). The
     /// identity addresses the cell that holds the database; see [[d1]].
     d1_bindings: Vec<(String, String)>,
+    /// Queue producers: (environment name, fleet-global queue name, default delay).
+    queue_bindings: Vec<(String, String, u32)>,
     ai_binding: Option<String>,
     vars: Vec<(String, String)>,
     node: String,
@@ -1390,6 +1392,7 @@ pub struct WorkerConfigOptions {
     pub bindings: Vec<(String, String)>,
     pub r2_bindings: Vec<String>,
     pub d1_bindings: Vec<(String, String)>,
+    pub queue_bindings: Vec<(String, String, u32)>,
     pub ai_binding: Option<String>,
     pub vars: Vec<(String, String)>,
     pub node: String,
@@ -1406,6 +1409,7 @@ impl WorkerConfig {
             bindings,
             r2_bindings,
             d1_bindings,
+            queue_bindings,
             ai_binding,
             vars,
             node,
@@ -1420,6 +1424,7 @@ impl WorkerConfig {
             bindings,
             r2_bindings,
             d1_bindings,
+            queue_bindings,
             ai_binding,
             vars,
             node,
@@ -3600,6 +3605,16 @@ impl Worker {
         adopt_cell(tc, cell, db_path, owned, compat)
     }
 
+    #[cfg(test)]
+    fn mark_owned_for_test(&mut self, cells: &[String]) -> Result<()> {
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        inject_routing(cs, cells, "test-node")
+    }
+
     /// Drain the alarm moves the last turn committed in this isolate.
     ///
     /// An alarm move is a turn output, exactly like the ops a turn starts:
@@ -3762,6 +3777,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>, loaded
         "__sql_cursor_close" => storage_ops::op_sql_cursor_close,
         "__sql_database_size" => storage_ops::op_sql_database_size,
         "__d1_run" => storage_ops::op_d1_run,
+        "__queue_run" => storage_ops::op_queue_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
         "__log" => op_log,
         "__storage_put" => storage_ops::op_storage_put,
@@ -3907,6 +3923,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>, loaded
             "__sql_cursor_next",
             "__sql_cursor_close",
             "__sql_database_size",
+            "__queue_run",
             "__storage_transaction_control",
             "__storage_put",
             "__storage_put_many",
@@ -4434,6 +4451,7 @@ mod loader_capability_tests {
             bindings: Vec::new(),
             r2_bindings: Vec::new(),
             d1_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -4444,6 +4462,49 @@ mod loader_capability_tests {
         config.loader_worker_id = worker_id;
         config.loader_agent_scope = worker_id.map(|_| "Agent:test".into());
         Worker::load_config(Arc::new(config), &[]).expect("behavior test worker")
+    }
+
+    fn load_queue_test_worker(source: &str) -> Worker {
+        init_v8();
+        Worker::load(
+            WorkerConfigOptions {
+                src: source.into(),
+                script_name: "__queue-binding-test".into(),
+                do_classes: Vec::new(),
+                bindings: Vec::new(),
+                r2_bindings: Vec::new(),
+                d1_bindings: Vec::new(),
+                queue_bindings: vec![
+                    ("Q".into(), "events".into(), 7),
+                    ("UNREACHABLE".into(), "unreachable".into(), 0),
+                ],
+                ai_binding: None,
+                vars: Vec::new(),
+                node: String::new(),
+                modules: Vec::new(),
+                compat: Compat::default(),
+            },
+            &[],
+        )
+        .expect("queue binding test worker")
+    }
+
+    static QUEUE_WRITE_GATES: AtomicU64 = AtomicU64::new(0);
+
+    fn init_queue_gate() {
+        static GATE: std::sync::Once = std::sync::Once::new();
+        GATE.call_once(|| {
+            let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+            set_gate_tx(send);
+            std::thread::spawn(move || {
+                while let Some(request) = receive.blocking_recv() {
+                    if request.scope == ".queue:events" && request.position.is_some() {
+                        QUEUE_WRITE_GATES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = request.reply.send(Ok(()));
+                }
+            });
+        });
     }
 
     async fn fetch_with_worker(worker: Worker) -> HttpResponse {
@@ -4467,6 +4528,256 @@ mod loader_capability_tests {
             .await
             .expect("behavior worker reply")
             .expect("behavior worker result")
+    }
+
+    #[tokio::test]
+    async fn queue_binding_enforces_boundaries_and_serializes_before_rpc() {
+        init_queue_gate();
+        let root = std::env::temp_dir().join(format!(
+            "celld-queue-binding-{}-{}",
+            std::process::id(),
+            NEXT_HTTP_STREAM_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create queue test directory");
+        let queue_path = root.join("events.sqlite");
+        let unreachable_path = root.join("unreachable.sqlite");
+        let source = r#"
+            const capture = async (fn) => {
+              try { return { ok: true, value: await fn() }; }
+              catch (error) {
+                return {
+                  ok: false,
+                  name: error.name,
+                  message: error.message,
+                  causeName: error.cause?.name,
+                  causeCode: error.cause?.code,
+                };
+              }
+            };
+            export default {
+              async fetch(_request, env) {
+                const results = { brand: env.Q.constructor.name };
+                const cases = [
+                  ["json", () => env.Q.send({ answer: 42 })],
+                  ["text", () => env.Q.send("hé", { contentType: "text" })],
+                  ["bytes", () => env.Q.send(
+                    new Uint8Array([0, 1, 2, 3]).subarray(1),
+                    { contentType: "bytes", delaySeconds: 0 },
+                  )],
+                  ["v8", () => env.Q.send(
+                    new Date("2026-01-02T03:04:05Z"), { contentType: "v8" },
+                  )],
+                  ["batchDelayPrecedence", () => env.Q.sendBatch([
+                    { body: "batch-default", contentType: "text" },
+                    {
+                      body: "batch-message", contentType: "text",
+                      delaySeconds: 2,
+                    },
+                    {
+                      body: "batch-zero", contentType: "text",
+                      delaySeconds: 0,
+                    },
+                  ], { delaySeconds: 5 })],
+                  ["messageAtLimit", () => env.Q.send(
+                    "x".repeat(128000), { contentType: "text" },
+                  )],
+                  ["messageOverLimit", () => env.Q.send(
+                    "x".repeat(128001), { contentType: "text" },
+                  )],
+                  ["batchCountAtLimit", () => env.Q.sendBatch(
+                    Array.from({ length: 100 }, () => ({
+                      body: "", contentType: "text",
+                    })),
+                  )],
+                  ["batchCountOverLimit", () => env.Q.sendBatch(
+                    Array.from({ length: 101 }, () => ({
+                      body: "", contentType: "text",
+                    })),
+                  )],
+                  ["batchBytesAtLimit", () => env.Q.sendBatch([
+                    { body: "x".repeat(128000), contentType: "text" },
+                    { body: "x".repeat(128000), contentType: "text" },
+                  ])],
+                  ["batchBytesOverLimit", () => env.Q.sendBatch([
+                    { body: "x".repeat(128000), contentType: "text" },
+                    { body: "x".repeat(128000), contentType: "text" },
+                    { body: "x", contentType: "text" },
+                  ])],
+                  ["delayAtLimit", () => env.Q.send("delay", {
+                    contentType: "text", delaySeconds: 86400,
+                  })],
+                  ["delayOverLimit", () => env.Q.send("delay", {
+                    contentType: "text", delaySeconds: 86401,
+                  })],
+                  ["undefinedBody", () => env.Q.send(undefined)],
+                  ["textMismatch", () => env.Q.send(1, { contentType: "text" })],
+                  ["bytesMismatch", () => env.Q.send(
+                    new ArrayBuffer(1), { contentType: "bytes" },
+                  )],
+                  ["unknownContentType", () => env.Q.send("x", {
+                    contentType: "xml",
+                  })],
+                  ["emptyBatch", () => env.Q.sendBatch([])],
+                ];
+                for (const [name, run] of cases) results[name] = await capture(run);
+                results.metrics = await env.Q.metrics();
+
+                // The cached `events` instance keeps the real queue cell. A new
+                // queue scope sees this throwing class, exercising the CF-shaped
+                // client wrapper while preserving celld's typed routing cause.
+                __cell.classes[".queue"] = class {
+                  __queueSend() {
+                    throw new DurableObjectRoutingError({
+                      scope: ".queue:unreachable", owner: "node-a",
+                    });
+                  }
+                };
+                results.unreachable = await capture(() =>
+                  env.UNREACHABLE.send("x", { contentType: "text" }));
+                return Response.json(results);
+              },
+            };
+        "#;
+        let mut worker = load_queue_test_worker(source);
+        worker
+            .own_cell(
+                ".queue:events",
+                Some(queue_path.to_str().expect("queue sqlite path")),
+                true,
+            )
+            .expect("own queue cell");
+        worker
+            .own_cell(
+                ".queue:unreachable",
+                Some(unreachable_path.to_str().expect("unreachable sqlite path")),
+                true,
+            )
+            .expect("own unreachable queue cell");
+        worker
+            .mark_owned_for_test(&[
+                ".queue:events".to_string(),
+                ".queue:unreachable".to_string(),
+            ])
+            .expect("mark queue cells local for boundary test");
+
+        let response = fetch_with_worker(worker).await;
+        assert_eq!(response.status, 200);
+        let results: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("queue test response JSON");
+        assert_eq!(results["brand"], "Queue");
+        for name in [
+            "json",
+            "text",
+            "bytes",
+            "v8",
+            "batchDelayPrecedence",
+            "messageAtLimit",
+            "batchCountAtLimit",
+            "batchBytesAtLimit",
+            "delayAtLimit",
+        ] {
+            assert_eq!(results[name]["ok"], true, "{name}: {}", results[name]);
+        }
+        for name in [
+            "messageOverLimit",
+            "batchCountOverLimit",
+            "batchBytesOverLimit",
+            "delayOverLimit",
+            "undefinedBody",
+            "textMismatch",
+            "bytesMismatch",
+            "unknownContentType",
+            "emptyBatch",
+        ] {
+            assert_eq!(results[name]["ok"], false, "{name}: {}", results[name]);
+            assert_eq!(
+                results[name]["name"], "TypeError",
+                "{name}: {}",
+                results[name]
+            );
+        }
+        assert_eq!(
+            results["json"]["value"]["metadata"]["metrics"]["backlogCount"],
+            1
+        );
+        assert_eq!(results["metrics"]["backlogCount"], 111);
+        assert!(
+            QUEUE_WRITE_GATES.load(Ordering::Relaxed) > 0,
+            "same-isolate sends must wait on the queue cell output gate"
+        );
+        assert!(results["metrics"]["backlogBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 384_024));
+        assert!(results["metrics"]["oldestMessageTimestamp"].is_i64());
+        assert_eq!(results["unreachable"]["ok"], false);
+        assert!(results["unreachable"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("Queue send failed: ")));
+        assert_eq!(
+            results["unreachable"]["causeName"],
+            "DurableObjectRoutingError"
+        );
+        assert_eq!(results["unreachable"]["causeCode"], "owner_unreachable");
+
+        let connection = rusqlite::Connection::open(&queue_path).expect("open queue database");
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT body, content_type, visible_at_ms-enqueued_ms \
+                     FROM _cf_QUEUE WHERE scope='.queue:events' ORDER BY seq LIMIT 4",
+                )
+                .expect("prepare queue rows");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .expect("query queue rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect queue rows")
+        };
+        assert_eq!(
+            rows[0],
+            (br#"{"answer":42}"#.to_vec(), "json".into(), 7_000)
+        );
+        assert_eq!(rows[1], ("hé".as_bytes().to_vec(), "text".into(), 7_000));
+        assert_eq!(rows[2], (vec![1, 2, 3], "bytes".into(), 0));
+        assert_eq!(rows[3].1, "v8");
+        assert!(!rows[3].0.is_empty());
+        assert_eq!(rows[3].2, 7_000);
+
+        let batch_delays = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT CAST(body AS TEXT), visible_at_ms-enqueued_ms \
+                     FROM _cf_QUEUE WHERE scope='.queue:events' \
+                     AND CAST(body AS TEXT) IN \
+                       ('batch-default', 'batch-message', 'batch-zero') \
+                     ORDER BY seq",
+                )
+                .expect("prepare batch delay rows");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .expect("query batch delay rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect batch delay rows")
+        };
+        assert_eq!(
+            batch_delays,
+            vec![
+                ("batch-default".into(), 5_000),
+                ("batch-message".into(), 2_000),
+                ("batch-zero".into(), 0),
+            ]
+        );
+
+        drop(connection);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4552,6 +4863,7 @@ mod loader_capability_tests {
                       storage: attempt(() => __storage_get("Agent:alpha", "secret")),
                       sql: attempt(() => __sql_exec()),
                       alarm: attempt(() => __alarm_set()),
+                      queue: attempt(() => __queue_run()),
                       durableObject: attempt(() => __do_call()),
                       service: attempt(() => __svc_call()),
                       serviceRpc: attempt(() => __svc_rpc()),
@@ -4578,6 +4890,7 @@ mod loader_capability_tests {
             bindings: Vec::new(),
             r2_bindings: Vec::new(),
             d1_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),
@@ -4614,6 +4927,7 @@ mod loader_capability_tests {
             "storage",
             "sql",
             "alarm",
+            "queue",
             "durableObject",
             "service",
             "serviceRpc",
@@ -5775,6 +6089,7 @@ fn op_loader_load(
             // A loaded worker reaches D1 only if its parent injects a stub;
             // ambient bindings are exactly what Code Mode withholds.
             d1_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
             node: String::new(),

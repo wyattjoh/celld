@@ -546,6 +546,7 @@ async fn load_worker_from_pointer(
             ))
         })
         .collect();
+    let queue_bindings = queue_bindings(&manifest)?;
     let ai_binding = configured_ai_binding(
         bindings(&manifest, "ai")
             .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
@@ -579,6 +580,7 @@ async fn load_worker_from_pointer(
             bindings: do_bindings,
             r2_bindings,
             d1_bindings,
+            queue_bindings,
             ai_binding,
             vars,
             node,
@@ -623,6 +625,28 @@ fn bindings<'a>(
         .filter(move |binding| {
             binding.get("type").and_then(serde_json::Value::as_str) == Some(kind)
         })
+}
+
+fn queue_bindings(manifest: &Manifest) -> anyhow::Result<Vec<(String, String, u32)>> {
+    bindings(manifest, "queue")
+        .map(|binding| {
+            let name = binding
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .context("queue binding is missing its environment name")?;
+            let queue_name = binding
+                .get("queue_name")
+                .and_then(serde_json::Value::as_str)
+                .context("queue binding is missing its queue name")?;
+            let delivery_delay = binding
+                .get("delivery_delay")
+                .and_then(serde_json::Value::as_u64)
+                .context("queue binding is missing its delivery delay")?
+                .try_into()
+                .context("queue binding delivery delay exceeds u32")?;
+            Ok((name.to_string(), queue_name.to_string(), delivery_delay))
+        })
+        .collect()
 }
 
 fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)> {
@@ -685,4 +709,83 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
         }
     }
     Ok(vars.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(raw_metadata: serde_json::Value) -> Manifest {
+        Manifest {
+            schema_version: 1,
+            version: String::new(),
+            script_name: String::new(),
+            main_module: None,
+            do_classes: Vec::new(),
+            sqlite_classes: Vec::new(),
+            modules: Vec::new(),
+            assets: None,
+            crons: Vec::new(),
+            queue_consumers: Vec::new(),
+            required_features: Vec::new(),
+            raw_metadata,
+        }
+    }
+
+    #[test]
+    fn queue_bindings_parse_normalized_manifest_and_reject_malformed_entries() {
+        let parsed = queue_bindings(&manifest(serde_json::json!({
+            "bindings": [
+                { "type": "plain_text", "name": "IGNORED", "text": "value" },
+                {
+                    "type": "queue",
+                    "name": "EVENTS",
+                    "queue_name": "events",
+                    "delivery_delay": 0,
+                },
+                {
+                    "type": "queue",
+                    "name": "AUDIT",
+                    "queue_name": "audit",
+                    "delivery_delay": 86400,
+                },
+            ],
+        })))
+        .expect("parse queue bindings");
+        assert_eq!(
+            parsed,
+            vec![
+                ("EVENTS".into(), "events".into(), 0),
+                ("AUDIT".into(), "audit".into(), 86_400),
+            ]
+        );
+
+        for (binding, expected) in [
+            (
+                serde_json::json!({
+                    "type": "queue", "queue_name": "events", "delivery_delay": 0,
+                }),
+                "missing its environment name",
+            ),
+            (
+                serde_json::json!({
+                    "type": "queue", "name": "EVENTS", "delivery_delay": 0,
+                }),
+                "missing its queue name",
+            ),
+            (
+                serde_json::json!({
+                    "type": "queue", "name": "EVENTS", "queue_name": "events",
+                    "delivery_delay": -1,
+                }),
+                "missing its delivery delay",
+            ),
+        ] {
+            let error = queue_bindings(&manifest(serde_json::json!({
+                "bindings": [binding],
+            })))
+            .expect_err("malformed queue binding must fail closed");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
 }

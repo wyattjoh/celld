@@ -2396,6 +2396,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             bindings,
             r2_bindings: Vec::new(),
             d1_bindings,
+            queue_bindings: Vec::new(),
             ai_binding: fleet::configured_ai_binding(None),
             vars: Vec::new(),
             node: node.clone(),

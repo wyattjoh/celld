@@ -12,6 +12,7 @@
 //! `scope -> Connection` map: `open` on activate, `close` on evict. The
 //! `scope` column survives from the single-db era and still keys rows, but a
 //! db now holds exactly one cell.
+use rand::RngCore as _;
 use rusqlite::{Connection, OptionalExtension};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -2510,6 +2511,190 @@ pub fn d1_run_json(scope: &str, request: &str) -> String {
     }
 }
 
+const QUEUE_MAX_MESSAGE_BYTES: usize = 128_000;
+const QUEUE_MAX_BATCH_BYTES: usize = 256_000;
+const QUEUE_MAX_BATCH_MESSAGES: usize = 100;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueEnqueueMessage {
+    body: Vec<u8>,
+    content_type: String,
+    delay_seconds: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum QueueRequest {
+    Send { messages: Vec<QueueEnqueueMessage> },
+    Metrics,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueMetrics {
+    backlog_count: u64,
+    backlog_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oldest_message_timestamp: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct QueueMetadata {
+    metrics: QueueMetrics,
+}
+
+#[derive(serde::Serialize)]
+struct QueueSendResult {
+    metadata: QueueMetadata,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum QueueResponse {
+    Send(QueueSendResult),
+    Metrics(QueueMetrics),
+}
+
+fn queue_scope_name(scope: &str) -> anyhow::Result<&str> {
+    let name = scope
+        .strip_prefix(".queue:")
+        .ok_or_else(|| anyhow::anyhow!("invalid queue cell scope {scope:?}"))?;
+    celld_logic::queue::validate_name(name)
+        .map_err(|error| anyhow::anyhow!("invalid queue cell scope {scope:?}: {error}"))?;
+    Ok(name)
+}
+
+fn queue_metrics(connection: &Connection, scope: &str) -> anyhow::Result<QueueMetrics> {
+    connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(body)), 0), MIN(enqueued_ms) \
+             FROM _cf_QUEUE WHERE scope=?1",
+            [scope],
+            |row| {
+                Ok(QueueMetrics {
+                    backlog_count: row.get(0)?,
+                    backlog_bytes: row.get(1)?,
+                    oldest_message_timestamp: row.get(2)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn queue_message_id() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut id = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    id
+}
+
+fn queue_send(scope: &str, messages: &[QueueEnqueueMessage]) -> anyhow::Result<QueueSendResult> {
+    queue_scope_name(scope)?;
+    anyhow::ensure!(
+        !messages.is_empty(),
+        "a queue send needs at least one message"
+    );
+    anyhow::ensure!(
+        messages.len() <= QUEUE_MAX_BATCH_MESSAGES,
+        "a queue batch cannot contain more than {QUEUE_MAX_BATCH_MESSAGES} messages"
+    );
+    let mut batch_bytes = 0_usize;
+    for message in messages {
+        anyhow::ensure!(
+            matches!(
+                message.content_type.as_str(),
+                "json" | "text" | "bytes" | "v8"
+            ),
+            "unsupported queue message content type {:?}",
+            message.content_type
+        );
+        anyhow::ensure!(
+            message.delay_seconds <= celld_logic::queue::MAX_DELAY_SECONDS,
+            "queue message delay exceeds {} seconds",
+            celld_logic::queue::MAX_DELAY_SECONDS
+        );
+        anyhow::ensure!(
+            message.body.len() <= QUEUE_MAX_MESSAGE_BYTES,
+            "queue message exceeds {QUEUE_MAX_MESSAGE_BYTES} bytes"
+        );
+        batch_bytes = batch_bytes
+            .checked_add(message.body.len())
+            .ok_or_else(|| anyhow::anyhow!("queue batch byte count overflow"))?;
+    }
+    anyhow::ensure!(
+        batch_bytes <= QUEUE_MAX_BATCH_BYTES,
+        "queue batch exceeds {QUEUE_MAX_BATCH_BYTES} bytes"
+    );
+
+    let enqueued_ms: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system clock is before Unix epoch: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("queue enqueue timestamp exceeds i64"))?;
+
+    with_mut(scope, |connection| {
+        without_sql_authorizer_mut(connection, |connection| {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for message in messages {
+                let visible_at_ms = enqueued_ms
+                    .checked_add(i64::from(message.delay_seconds) * 1_000)
+                    .ok_or_else(|| anyhow::anyhow!("queue visibility timestamp overflow"))?;
+                transaction.execute(
+                    "INSERT INTO _cf_QUEUE \
+                     (scope, id, enqueued_ms, visible_at_ms, body, content_type) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        scope,
+                        queue_message_id(),
+                        enqueued_ms,
+                        visible_at_ms,
+                        message.body,
+                        message.content_type,
+                    ],
+                )?;
+            }
+            let metrics = queue_metrics(&transaction, scope)?;
+            transaction.commit()?;
+            Ok(QueueSendResult {
+                metadata: QueueMetadata { metrics },
+            })
+        })
+    })
+    .ok_or_else(|| anyhow::anyhow!("no db for {scope}"))?
+}
+
+fn queue_run(scope: &str, request: QueueRequest) -> anyhow::Result<QueueResponse> {
+    queue_scope_name(scope)?;
+    match request {
+        QueueRequest::Send { messages } => queue_send(scope, &messages).map(QueueResponse::Send),
+        QueueRequest::Metrics => with(scope, |connection| queue_metrics(connection, scope))
+            .ok_or_else(|| anyhow::anyhow!("no db for {scope}"))?
+            .map(QueueResponse::Metrics),
+    }
+}
+
+/// The string-in, string-out wrapper used by the reserved queue cell.
+pub fn queue_run_json(scope: &str, request: &str) -> String {
+    let response = serde_json::from_str::<QueueRequest>(request)
+        .map_err(|error| anyhow::anyhow!("invalid queue request: {error}"))
+        .and_then(|request| queue_run(scope, request));
+    match response {
+        Ok(response) => serde_json::json!({ "ok": response }).to_string(),
+        Err(error) => serde_json::json!({
+            "error": { "message": error.to_string() },
+        })
+        .to_string(),
+    }
+}
+
 /// `Ok(Some(at_ms))` when an outermost commit published a dirty committed
 /// alarm: the caller performs the arm-time wake-entry gate before acking the
 /// transaction. Rollbacks restore previously committed (already covered)
@@ -3864,6 +4049,102 @@ mod queue_backlog_storage {
                 "json".to_string(),
                 0,
             )
+        );
+
+        close(scope);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn producer_send_is_atomic_and_returns_backlog_metrics() {
+        install_for_test();
+        let root = std::env::temp_dir().join(format!(
+            "celld-queue-send-{}-{}",
+            std::process::id(),
+            NEXT_BATCH_SAVEPOINT.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&root).expect("create test directory");
+        let scope = ".queue:events";
+        let path = root.join("events.sqlite");
+        open(scope, path.to_str().expect("sqlite path")).expect("open queue cell");
+
+        let response: serde_json::Value = serde_json::from_str(&queue_run_json(
+            scope,
+            r#"{"mode":"send","messages":[
+                {"body":[123,125],"contentType":"json","delaySeconds":0},
+                {"body":[111,107],"contentType":"text","delaySeconds":5}
+            ]}"#,
+        ))
+        .expect("queue response JSON");
+        assert_eq!(response["ok"]["metadata"]["metrics"]["backlogCount"], 2);
+        assert_eq!(response["ok"]["metadata"]["metrics"]["backlogBytes"], 4);
+        assert!(response["ok"]["metadata"]["metrics"]["oldestMessageTimestamp"].is_i64());
+
+        let rows = with(scope, |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, visible_at_ms-enqueued_ms, body, content_type \
+                 FROM _cf_QUEUE WHERE scope=?1 ORDER BY seq",
+            )?;
+            let rows = statement
+                .query_map([scope], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        })
+        .expect("queue cell is open")
+        .expect("read queue rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| {
+            row.0.len() == 32
+                && row
+                    .0
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }));
+        assert_eq!(rows[0].1, 0);
+        assert_eq!(rows[0].2, b"{}".to_vec());
+        assert_eq!(rows[0].3, "json");
+        assert_eq!(rows[1].1, 5_000);
+        assert_eq!(rows[1].2, b"ok".to_vec());
+        assert_eq!(rows[1].3, "text");
+
+        let metrics: serde_json::Value =
+            serde_json::from_str(&queue_run_json(scope, r#"{"mode":"metrics"}"#))
+                .expect("metrics response JSON");
+        assert_eq!(metrics["ok"]["backlogCount"], 2);
+        assert_eq!(metrics["ok"]["backlogBytes"], 4);
+
+        let refused: serde_json::Value = serde_json::from_str(&queue_run_json(
+            scope,
+            &serde_json::json!({
+                "mode": "send",
+                "messages": [{
+                    "body": vec![0_u8; QUEUE_MAX_MESSAGE_BYTES + 1],
+                    "contentType": "bytes",
+                    "delaySeconds": 0,
+                }],
+            })
+            .to_string(),
+        ))
+        .expect("refusal response JSON");
+        assert!(refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exceeds 128000 bytes")));
+        assert_eq!(
+            with(scope, |connection| connection.query_row(
+                "SELECT COUNT(*) FROM _cf_QUEUE WHERE scope=?1",
+                [scope],
+                |row| row.get::<_, u64>(0),
+            ))
+            .expect("queue cell is open")
+            .expect("count queue rows"),
+            2,
         );
 
         close(scope);
