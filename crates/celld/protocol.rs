@@ -31,6 +31,11 @@ pub struct Manifest {
     /// needs no migration of an already-armed alarm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crons: Vec<String>,
+    /// Push consumers with every delivery default resolved at deploy time.
+    /// Keeping these typed prevents a future runtime default from changing an
+    /// already-published deployment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_consumers: Vec<QueueConsumer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
@@ -49,6 +54,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
+    FEATURE_QUEUES_V1,
     FEATURE_SQLITE_VEC_V1,
     FEATURE_WASM_V1,
 ];
@@ -63,6 +69,9 @@ pub const FEATURE_D1_V1: &str = "d1-v1";
 /// reserved cron cell would load the manifest, ignore `crons`, and silently
 /// never fire — the quiet failure the gate exists to prevent.
 pub const FEATURE_CRON_V1: &str = "cron-v1";
+/// A deployment with queue producer bindings or push consumers. Older nodes
+/// must reject it rather than silently omit queue delivery.
+pub const FEATURE_QUEUES_V1: &str = "queues-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
 
@@ -78,6 +87,17 @@ pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One push consumer in a deploy manifest. Queue identity is fleet-global;
+/// `script_name` on the containing manifest is the consumer's initial owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueConsumer {
+    pub queue_name: String,
+    pub max_batch_size: u16,
+    pub max_batch_timeout: u32,
+    pub max_retries: u16,
+    pub retry_delay: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,13 +213,13 @@ pub struct Rollout {
     pub percent: u8,
 }
 
-/// Deployment identity: sorted module contents plus the serialized metadata,
-/// never the raw upload framing (which is not deterministic). Every sender
-/// must agree on this or identical code deploys as two versions depending on
-/// the path used.
+/// Deployment identity: sorted module contents plus the canonical serialized
+/// deployment config, never the raw upload framing (which is not
+/// deterministic). Every sender must agree on this or identical code deploys
+/// as two versions depending on the path used. For legacy manifests the config
+/// bytes are exactly `Manifest::raw_metadata`; typed manifest fields which
+/// alter runtime behavior, such as queue consumers, join that canonical input.
 ///
-/// `metadata_json` is the exact byte serialization the sender stores as
-/// `Manifest::raw_metadata`; callers pass the same bytes to both.
 /// Cron trigger expressions are deliberately NOT an input. A version names
 /// the code and its bindings; a schedule is configuration layered on top,
 /// which is also how Cloudflare models it — schedules are their own resource,
@@ -207,7 +227,7 @@ pub struct Rollout {
 /// the native and managed paths disagree about what a version is.
 pub fn deployment_version(
     modules: &[(String, Vec<u8>)],
-    metadata_json: &[u8],
+    deployment_config_json: &[u8],
     asset_index: Option<&[u8]>,
 ) -> String {
     let mut sorted = modules.iter().collect::<Vec<_>>();
@@ -218,7 +238,7 @@ pub fn deployment_version(
         hasher.update([0]);
         hasher.update(bytes);
     }
-    hasher.update(metadata_json);
+    hasher.update(deployment_config_json);
     if let Some(index) = asset_index {
         hasher.update([0]);
         hasher.update(b"assets.json");

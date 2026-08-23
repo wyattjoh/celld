@@ -12,8 +12,9 @@
 use crate::bucket::Bucket;
 use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
+    ModuleKind, ModuleRef, QueueConsumer, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_QUEUES_V1, FEATURE_SQLITE_VEC_V1,
+    FEATURE_WASM_V1,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -44,6 +45,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "triggers",
     "vars",
     "d1_databases",
+    "queues",
     "no_bundle",
 ];
 
@@ -152,6 +154,8 @@ struct Project {
     do_classes: Vec<String>,
     sqlite_classes: Vec<String>,
     crons: Vec<String>,
+    queue_consumers: Vec<QueueConsumer>,
+    queues_declared: bool,
 }
 
 struct ProjectAssets {
@@ -268,6 +272,10 @@ impl Built {
                         let database = binding.get("database_name").and_then(Value::as_str)?;
                         Some((format!("env.{name} (D1)"), database.to_string()))
                     }
+                    Some("queue") => {
+                        let queue = binding.get("queue_name").and_then(Value::as_str)?;
+                        Some((format!("env.{name} (Queue)"), queue.to_string()))
+                    }
                     Some("plain_text") => Some((
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
@@ -338,12 +346,21 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     };
     let wasm_names: BTreeSet<String> = wasm_modules.iter().map(|(name, _)| name.clone()).collect();
     modules.extend(wasm_modules);
-    // Identity is over the exact metadata bytes the manifest retains, so the
-    // serialization happens once and is reused for both.
+    // Producer bindings are already in raw metadata. Typed consumer settings
+    // also participate in deployment identity: changing delivery policy must
+    // not overwrite an immutable manifest at an existing version path.
     let metadata_json = serde_json::to_vec(&project.metadata)?;
+    let identity_json = if !project.queues_declared {
+        metadata_json
+    } else {
+        serde_json::to_vec(&json!({
+            "raw_metadata": &project.metadata,
+            "queue_consumers": &project.queue_consumers,
+        }))?
+    };
     let version = crate::protocol::deployment_version(
         &modules,
-        &metadata_json,
+        &identity_json,
         built_assets.as_ref().map(|assets| assets.index.as_slice()),
     );
     let prefix = format!("deploy/{}/{}", project.script_name, version);
@@ -359,6 +376,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .and_then(Value::as_array)
         .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
+    let uses_queues = project.queues_declared;
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -377,6 +395,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             .collect(),
         assets: asset_reference,
         crons: project.crons.clone(),
+        queue_consumers: project.queue_consumers,
         // Each capability the manifest depends on is named here, so a node
         // that predates it rejects the deployment up front instead of
         // partially deserializing the manifest and failing at worker load.
@@ -390,6 +409,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if uses_d1 {
                 features.push(FEATURE_D1_V1.to_string());
+            }
+            if uses_queues {
+                features.push(FEATURE_QUEUES_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -886,12 +908,17 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         }));
         var_count += 1;
     }
+    let queues = read_queues(object)?;
+    let queue_binding_count = queues.producer_bindings.len();
+    bindings.extend(queues.producer_bindings);
     if main.is_none()
         && (!do_classes.is_empty()
             || !sqlite_classes.is_empty()
             || ai_binding.is_some()
             || service_count > 0
-            || var_count > 0)
+            || var_count > 0
+            || queue_binding_count > 0
+            || !queues.consumers.is_empty())
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }
@@ -904,19 +931,22 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             "name": binding,
         }));
     }
-    // A name declared as a D1 binding and as anything else would deploy
-    // cleanly and then resolve to whichever `env` assignment ran last, so a
-    // Worker reading `env.DB` could get a service stub where it expected a
-    // database. Collisions between the other binding types are still not
-    // refused here — a known gap, left for a check over every binding type.
+    // Queue bindings, like D1 bindings, must never be shadowed by any other
+    // env assignment. Preserve the existing behavior for unrelated binding
+    // kinds while enforcing queues' all-kinds collision contract.
+    let mut protected_bindings = BTreeMap::<String, String>::new();
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind != "d1" && d1_binding_names.contains(name) {
-            bail!(
-                "binding name {name:?} is declared both in `d1_databases` and as a \
-                 {kind} binding; every binding needs its own name"
-            );
+        if let Some(previous) = protected_bindings.get(name) {
+            if matches!(kind, "d1" | "queue") || matches!(previous.as_str(), "d1" | "queue") {
+                bail!(
+                    "binding name {name:?} is declared as both {previous} and {kind}; \
+                     every binding needs its own name"
+                );
+            }
+        } else {
+            protected_bindings.insert(name.to_string(), kind.to_string());
         }
     }
     let mut metadata = Map::new();
@@ -949,7 +979,170 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         do_classes,
         sqlite_classes,
         crons,
+        queue_consumers: queues.consumers,
+        queues_declared: queues.declared,
     })
+}
+
+struct QueueDeclarations {
+    producer_bindings: Vec<Value>,
+    consumers: Vec<QueueConsumer>,
+    declared: bool,
+}
+
+/// Parse the strict Wrangler queues subset. A config names one Worker script,
+/// so every accepted producer/consumer pair is same-script by construction;
+/// attempted owner selectors are unknown keys and are refused here.
+fn read_queues(project: &Map<String, Value>) -> anyhow::Result<QueueDeclarations> {
+    let Some(value) = project.get("queues") else {
+        return Ok(QueueDeclarations {
+            producer_bindings: Vec::new(),
+            consumers: Vec::new(),
+            declared: false,
+        });
+    };
+    let queues = value
+        .as_object()
+        .ok_or_else(|| anyhow!("config `queues` must be an object"))?;
+    let unsupported = queues
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "producers" | "consumers"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        bail!("unknown config keys under `queues`: {}", unsupported.join(", "));
+    }
+
+    let producers = queue_entries(queues, "producers")?;
+    let mut producer_bindings = Vec::with_capacity(producers.len());
+    for (index, producer) in producers.iter().enumerate() {
+        let producer = queue_entry(producer, "producers", index)?;
+        validate_queue_keys(celld_logic::queue::QueueConfigSection::Producer, producer)?;
+        let queue_name = queue_string(producer, "queue", "producer", index)?;
+        validate_queue_name(queue_name)?;
+        let binding = queue_string(producer, "binding", "producer", index)?;
+        if !valid_binding(binding) {
+            bail!("invalid queue binding name: {binding:?}");
+        }
+        let config = celld_logic::queue::resolve_producer(
+            celld_logic::queue::ProducerOptions {
+                delivery_delay: queue_integer(producer, "delivery_delay", "producer", index)?,
+            },
+        )
+        .map_err(|error| anyhow!("queue producer {queue_name:?}: {error}"))?;
+        producer_bindings.push(json!({
+            "type": "queue",
+            "name": binding,
+            "queue_name": queue_name,
+            "delivery_delay": config.delivery_delay,
+        }));
+    }
+
+    let consumer_entries = queue_entries(queues, "consumers")?;
+    let mut consumers = Vec::with_capacity(consumer_entries.len());
+    let mut consumed_queues = BTreeSet::new();
+    for (index, consumer) in consumer_entries.iter().enumerate() {
+        let consumer = queue_entry(consumer, "consumers", index)?;
+        validate_queue_keys(celld_logic::queue::QueueConfigSection::Consumer, consumer)?;
+        let queue_name = queue_string(consumer, "queue", "consumer", index)?;
+        validate_queue_name(queue_name)?;
+        if !consumed_queues.insert(queue_name.to_string()) {
+            bail!("queue {queue_name:?} has more than one consumer");
+        }
+        let config = celld_logic::queue::resolve_consumer(
+            celld_logic::queue::ConsumerOptions {
+                max_batch_size: queue_integer(consumer, "max_batch_size", "consumer", index)?,
+                max_batch_timeout: queue_integer(
+                    consumer,
+                    "max_batch_timeout",
+                    "consumer",
+                    index,
+                )?,
+                max_retries: queue_integer(consumer, "max_retries", "consumer", index)?,
+                retry_delay: queue_integer(consumer, "retry_delay", "consumer", index)?,
+            },
+        )
+        .map_err(|error| anyhow!("queue consumer {queue_name:?}: {error}"))?;
+        consumers.push(QueueConsumer {
+            queue_name: queue_name.to_string(),
+            max_batch_size: config.max_batch_size,
+            max_batch_timeout: config.max_batch_timeout,
+            max_retries: config.max_retries,
+            retry_delay: config.retry_delay,
+        });
+    }
+
+    Ok(QueueDeclarations {
+        producer_bindings,
+        consumers,
+        declared: true,
+    })
+}
+
+fn queue_entries<'a>(
+    queues: &'a Map<String, Value>,
+    section: &str,
+) -> anyhow::Result<&'a [Value]> {
+    match queues.get(section) {
+        None => Ok(&[]),
+        Some(Value::Array(entries)) => Ok(entries),
+        Some(_) => Err(anyhow!("config `queues.{section}` must be an array")),
+    }
+}
+
+fn queue_entry<'a>(
+    value: &'a Value,
+    section: &str,
+    index: usize,
+) -> anyhow::Result<&'a Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| anyhow!("config `queues.{section}[{index}]` must be an object"))
+}
+
+fn validate_queue_keys(
+    section: celld_logic::queue::QueueConfigSection,
+    entry: &Map<String, Value>,
+) -> anyhow::Result<()> {
+    for key in entry.keys() {
+        celld_logic::queue::validate_config_key(section, key)
+            .map_err(|error| anyhow!("{error}"))?;
+    }
+    Ok(())
+}
+
+fn queue_string<'a>(
+    entry: &'a Map<String, Value>,
+    key: &str,
+    kind: &str,
+    index: usize,
+) -> anyhow::Result<&'a str> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("queue {kind} {index} `{key}` must be a non-empty string"))
+}
+
+fn queue_integer(
+    entry: &Map<String, Value>,
+    key: &str,
+    kind: &str,
+    index: usize,
+) -> anyhow::Result<Option<i64>> {
+    entry
+        .get(key)
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| anyhow!("queue {kind} {index} `{key}` must be an integer"))
+        })
+        .transpose()
+}
+
+fn validate_queue_name(name: &str) -> anyhow::Result<()> {
+    celld_logic::queue::validate_name(name)
+        .map_err(|error| anyhow!("invalid queue name {name:?}: {error}"))
 }
 
 /// `triggers.crons`, validated here so a malformed expression stops the deploy
@@ -1556,4 +1749,187 @@ fn strip_jsonc(source: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_config(queues: Value) -> anyhow::Result<Built> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("index.js"), "export default {};")?;
+        std::fs::write(
+            root.path().join("wrangler.json"),
+            serde_json::to_vec(&json!({
+                "name": "queue-test",
+                "main": "index.js",
+                "no_bundle": true,
+                "queues": queues,
+            }))?,
+        )?;
+        build(&Options {
+            config: Some(root.path().to_path_buf()),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: true,
+        })
+    }
+
+    fn error_for(queues: Value) -> String {
+        match build_config(queues) {
+            Ok(_) => panic!("queue config unexpectedly deployed"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    #[test]
+    fn queue_config_reaches_the_manifest_with_deploy_time_defaults() {
+        let built = build_config(json!({
+            "producers": [{
+                "binding": "EVENTS",
+                "queue": "project-events",
+            }],
+            "consumers": [{
+                "queue": "project-events",
+                "max_batch_size": 42,
+                "retry_delay": 7,
+            }],
+        }))
+        .unwrap();
+
+        assert!(built
+            .manifest
+            .required_features
+            .iter()
+            .any(|feature| feature == FEATURE_QUEUES_V1));
+        assert_eq!(
+            built.manifest.queue_consumers,
+            vec![QueueConsumer {
+                queue_name: "project-events".to_string(),
+                max_batch_size: 42,
+                max_batch_timeout: celld_logic::queue::DEFAULT_MAX_BATCH_TIMEOUT,
+                max_retries: celld_logic::queue::DEFAULT_MAX_RETRIES,
+                retry_delay: 7,
+            }]
+        );
+        let producer = built.manifest.raw_metadata["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|binding| binding["type"] == "queue")
+            .unwrap();
+        assert_eq!(
+            producer,
+            &json!({
+                "type": "queue",
+                "name": "EVENTS",
+                "queue_name": "project-events",
+                "delivery_delay": celld_logic::queue::DEFAULT_DELIVERY_DELAY,
+            })
+        );
+    }
+
+    #[test]
+    fn dangling_queue_producers_and_consumers_are_allowed() {
+        assert!(build_config(json!({
+            "producers": [{ "binding": "EVENTS", "queue": "producer-only" }],
+        }))
+        .is_ok());
+        assert!(build_config(json!({
+            "consumers": [{ "queue": "consumer-only" }],
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn consumer_policy_changes_deployment_identity() {
+        let first = build_config(json!({
+            "consumers": [{ "queue": "events", "max_batch_size": 10 }],
+        }))
+        .unwrap();
+        let second = build_config(json!({
+            "consumers": [{ "queue": "events", "max_batch_size": 11 }],
+        }))
+        .unwrap();
+        assert_ne!(first.version, second.version);
+    }
+
+    #[test]
+    fn queue_refusals_reach_the_deploy_path_and_name_the_key() {
+        let cases = [
+            (
+                "dead_letter_queue",
+                json!({ "consumers": [{ "queue": "events", "dead_letter_queue": "dlq" }] }),
+            ),
+            (
+                "max_concurrency",
+                json!({ "consumers": [{ "queue": "events", "max_concurrency": 2 }] }),
+            ),
+            (
+                "type",
+                json!({ "consumers": [{ "queue": "events", "type": "http_pull" }] }),
+            ),
+            (
+                "visibility_timeout_ms",
+                json!({ "consumers": [{ "queue": "events", "visibility_timeout_ms": 1_000 }] }),
+            ),
+        ];
+        for (key, queues) in cases {
+            let error = error_for(queues);
+            assert!(error.contains(key), "{key}: {error}");
+            assert!(error.contains("not supported"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn invalid_names_cross_script_selectors_and_binding_collisions_are_refused() {
+        let invalid_name = error_for(json!({
+            "producers": [{ "binding": "EVENTS", "queue": "Invalid" }],
+        }));
+        assert!(invalid_name.contains("invalid queue name"), "{invalid_name}");
+
+        // One Wrangler config names one script. An attempted owner selector
+        // would make the pair cross-script, and the strict logic allowlist
+        // refuses that selector instead of silently discarding it.
+        let cross_script = error_for(json!({
+            "producers": [{
+                "binding": "EVENTS",
+                "queue": "events",
+                "script_name": "another-worker",
+            }],
+            "consumers": [{ "queue": "events" }],
+        }));
+        assert!(cross_script.contains("script_name"), "{cross_script}");
+        assert!(cross_script.contains("unknown"), "{cross_script}");
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("index.js"), "export default {};").unwrap();
+        std::fs::write(
+            root.path().join("wrangler.json"),
+            serde_json::to_vec(&json!({
+                "name": "queue-test",
+                "main": "index.js",
+                "no_bundle": true,
+                "vars": { "EVENTS": "shadow" },
+                "queues": {
+                    "producers": [{ "binding": "EVENTS", "queue": "events" }],
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let collision = match build(&Options {
+            config: Some(root.path().to_path_buf()),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: true,
+        }) {
+            Ok(_) => panic!("colliding queue binding unexpectedly deployed"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(collision.contains("EVENTS"), "{collision}");
+        assert!(collision.contains("both"), "{collision}");
+    }
 }
