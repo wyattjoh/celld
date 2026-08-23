@@ -35,6 +35,13 @@ The boundaries of the current alpha:
   celld runs of the Workers platform: the available APIs, the deploy
   contract, and what is out of scope (KV, R2, `wrangler.toml`, routes).
   An unknown key or API causes a loud failure; a silent gap is a bug.
+- Queues deliberately differ from Cloudflare in four baseline limits: celld
+  has no 5,000 messages-per-second throughput ceiling, no 25 GB backlog
+  ceiling, and no automatic message retention (Cloudflare defaults to four
+  days and allows up to fourteen). Producer acknowledgement is also stronger:
+  `send()` and `sendBatch()` resolve only after the enqueue is proved durable,
+  rather than after Cloudflare's fire-and-forget handoff. Applications tuned to
+  Cloudflare's acknowledgement latency should account for that durable wait.
 - Each node can be the WebSocket ingress for each cell through the signed
   peer tunnel, but the test coverage for close codes and reconnections
   across nodes is thinner than for one node. If latency is important,

@@ -25,9 +25,9 @@ gaps have marks below.
 | **Static assets** | Immutable files, served from the fleet bucket: `assets.directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first`, plus `_headers` and `_redirects`. An asset-only project deploys without a Worker. |
 | **Worker Loader (Code Mode)** | Experimental. Bind a loader with `CELLD_WORKER_LOADER`. A Worker can then start sandboxed isolates at runtime. See [Dynamic Worker loading](#dynamic-worker-loading-code-mode). |
 | **D1** | Partial. `d1_databases` bindings give `prepare`, `bind`, `all`, `first`, `run`, `raw` and `exec`. The `celld d1` command runs SQL and migrations. See [D1](#d1). |
+| **Queues** | **Partial.** Producer bindings and same-script push consumers provide durable at-least-once delivery with configurable batching, retries, and delays. Dead letter queues, pull consumers, and consumer concurrency greater than one are not available. See [Queues](#queues). |
 
-Planned: **Workflows** (durable execution over cells and alarms),
-**Queues** (a Durable Object shape; if demand appears).
+Planned: **Workflows** (durable execution over cells and alarms).
 
 A note on durable execution, because the two terms are close. A
 durable-execution engine (Temporal, Restate, Azure Durable Functions)
@@ -58,9 +58,9 @@ by category:
 | API | status |
 | --- | --- |
 | Fetch, Request, Response, Headers | **Yes.** Gaps: `Response.redirect()`, `Response.error()`, and the `cache` request option are missing. |
-| Bindings (`env`) | **Yes** for Durable Objects, service bindings, `vars`, assets, D1, and the adapted HTTP AI binding. Other binding types are out of scope (see Services). A declared AI binding without `CELLD_AI_URL` fails clearly on first use. |
+| Bindings (`env`) | **Yes** for Durable Objects, service bindings, `vars`, assets, D1, Queues producers, and the adapted HTTP AI binding. Other binding types are out of scope (see Services). A declared AI binding without `CELLD_AI_URL` fails clearly on first use. |
 | Context (`ctx`) | **Yes**: `waitUntil`, `props`, `exports`. `passThroughOnException()` is accepted but has no effect. There is no CDN behind it. `ctx.facets` is absent (see Facets). |
-| Handlers | `fetch`, `alarm`, `scheduled` (cron), `webSocketMessage`/`Close`/`Error`, RPC methods. **No** `queue`, `tail`, or `email` handlers. See [cron triggers](#cron-triggers). |
+| Handlers | `fetch`, `alarm`, `scheduled` (cron), `queue`, `webSocketMessage`/`Close`/`Error`, RPC methods. **No** `tail` or `email` handlers. See [cron triggers](#cron-triggers) and [Queues](#queues). |
 | RPC | **Yes**, for most of the surface. See [RPC](#rpc). |
 | Streams | **Yes.** This includes byte streams, BYOB readers, `tee`/`pipeTo`/`pipeThrough`, `IdentityTransformStream`, `FixedLengthStream`, and `CompressionStream`/`DecompressionStream`. Gap: `ReadableStream.from()`. |
 | Encoding | **Yes**: `TextEncoder`/`TextDecoder` (legacy encodings included), encoder and decoder streams, `atob`/`btoa`. |
@@ -251,6 +251,58 @@ rolls back whole. celld refuses SQL that ends in an incomplete statement
 the engine does not run such a statement. A complete final statement does
 not need a semicolon, and a comment after the last statement is
 permitted.
+
+## Queues
+
+A queue is a fleet-global durable backlog owned by the reserved
+`.queue:<name>` cell. The baseline resolves producer and consumer declarations
+inside one Worker deployment; cross-script producer/consumer resolution is not
+available.
+
+Declare producer bindings and push consumers with the `queues` key:
+
+```jsonc
+{
+  "queues": {
+    "producers": [{
+      "binding": "EVENTS",
+      "queue": "project-events",
+      "delivery_delay": 0
+    }],
+    "consumers": [{
+      "queue": "project-events",
+      "max_batch_size": 10,
+      "max_batch_timeout": 1,
+      "max_retries": 2,
+      "retry_delay": 1
+    }]
+  }
+}
+```
+
+Queue names contain 1–63 lowercase ASCII letters, digits, or hyphens and must
+start and end with a letter or digit. A producer exposes `send()` and
+`sendBatch()` with Cloudflare's `json`, `text`, `bytes`, and `v8` content types.
+celld also exposes `metrics()` for the durable backlog. One message is limited
+to 128,000 bytes; a batch is limited to 100 messages and 256,000 total bytes;
+producer, batch, and retry delays are integer seconds from 0 through 86,400.
+Invalid input is rejected before enqueue.
+
+Delivery is durable and at least once, with one in-flight batch per queue. A
+handler receives a `MessageBatch`; `ack()`/`ackAll()` settle messages and
+`retry()`/`retryAll()` schedule another attempt. Attempts are counted before
+the handler runs, so a crash consumes retry budget. A handler exception retries
+unacknowledged messages. After the initial delivery and `max_retries` further
+attempts, another retry request drops the message and emits structured drop
+telemetry. Retry delays are flat rather than automatic backoff. A queue with no
+exported `queue()` handler retains its backlog.
+
+Unlike Cloudflare's fire-and-forget producer acknowledgement, `send()` and
+`sendBatch()` resolve only after celld has proved the enqueue durable. celld
+does not impose Cloudflare's account throughput or backlog-capacity ceilings,
+and messages do not expire automatically. Dead letter queues, pull consumers,
+and concurrency greater than one are rejected at deploy rather than silently
+ignored.
 
 ## Dynamic Worker loading (Code Mode)
 
@@ -521,8 +573,8 @@ rather than reported as enabled, and celld accepts it without effect.
 and accepts `wrangler.jsonc` or `wrangler.json`, not `wrangler.toml`.
 The available config keys are `name`, `main`,
 `compatibility_date`, `compatibility_flags`, `durable_objects`,
-`migrations`, `assets`, `ai`, `services`, `triggers`, `vars`, and
-`d1_databases`. The `ai.binding` key creates the adapted HTTP AI binding;
+`migrations`, `assets`, `ai`, `services`, `triggers`, `vars`, `d1_databases`,
+and `queues`. The `ai.binding` key creates the adapted HTTP AI binding;
 set `CELLD_AI_URL` on the node or the binding fails clearly on first use.
 An asset-only project can omit `main`. celld refuses symlinks and special
 files in the asset directory, and `.assetsignore` still needs Wrangler.

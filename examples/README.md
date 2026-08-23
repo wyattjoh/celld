@@ -15,6 +15,8 @@ Durable Object surface supported by `celld`:
 - `wsclient/` — outbound WebSocket client from a Durable Object
 - `alarm/` — a Durable Object alarm handler
 - `cron/` — a cron trigger that writes each tick into a Durable Object
+- `queues/` — a Queue producer and same-script push consumer demonstrating
+  batching, selective retry, poison-message drop, and Durable Object delivery logs
 - `rpc/` — JS RPC: Durable Object methods, a named entrypoint, callbacks,
   `RpcTarget`, and promise pipelining
 - `agents-conformance/` — pinned, source-unmodified legacy Cloudflare Agents

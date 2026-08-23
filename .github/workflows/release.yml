@@ -74,6 +74,21 @@ jobs:
           path: out/celld-${{ matrix.target }}.gz
           if-no-files-found: error
 
+  rust-tests:
+    name: Workspace Rust tests
+    if: github.event_name != 'release'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run workspace tests
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          cargo test --workspace
+
   agents-conformance:
     name: Agents conformance fixture
     if: github.event_name != 'release'
@@ -99,6 +114,10 @@ jobs:
       - name: Enforce pinned compatibility target
         working-directory: examples/agents-conformance
         run: npm run check:compatibility
+
+      - name: Run dependency-free queues fixture tests
+        working-directory: examples/queues
+        run: npm test
 
   # The Dockerfile must build and its test stage pass before anything can
   # be published; nothing is pushed at candidate time.

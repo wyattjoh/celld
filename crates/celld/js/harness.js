@@ -4812,9 +4812,7 @@ class Queue {
   // getByName(), whose HMAC intentionally folds in the Worker script.
   get _stub() {
     const namespace = new DurableObjectNamespace(__QUEUE_CLASS, "");
-    const id = new DurableObjectId(
-      __QUEUE_CLASS, this._queueName, this._queueName,
-    );
+    const id = new DurableObjectId(__QUEUE_CLASS, this._queueName);
     return namespace.get(id);
   }
   async send(body, options) {
