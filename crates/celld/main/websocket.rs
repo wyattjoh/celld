@@ -987,7 +987,7 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     let (url, method, body, headers) =
         match request_payload(request, app.trust_forwarded_headers).await {
             Ok(payload) => payload,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
     let body_read_us = body_started.elapsed().as_micros() as u64;
     let worker_started = Instant::now();

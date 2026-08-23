@@ -771,13 +771,13 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
 async fn request_payload(
     request: Request<Incoming>,
     trust_forwarded_headers: bool,
-) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), HttpReply> {
+) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), Box<HttpReply>> {
     let (parts, body) = request.into_parts();
     let body = body.collect().await.map_err(|error| {
-        response(
+        Box::new(response(
             StatusCode::BAD_REQUEST,
             format!("request body failed: {error}"),
-        )
+        ))
     })?;
     let headers = parts
         .headers
@@ -1821,7 +1821,7 @@ async fn handle_internal(
             let (url, method, body, headers) =
                 match request_payload(request, app.trust_forwarded_headers).await {
                     Ok(payload) => payload,
-                    Err(response) => return Ok(response),
+                    Err(response) => return Ok(*response),
                 };
             dispatch_cell_fetch(cell, url, method, body, headers).await
         }
