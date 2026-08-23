@@ -21,6 +21,7 @@ pub mod log_evict;
 pub mod log_tier;
 pub mod peer;
 pub mod pressure;
+pub mod queue;
 pub mod restore;
 pub mod routing;
 pub mod schedule;
